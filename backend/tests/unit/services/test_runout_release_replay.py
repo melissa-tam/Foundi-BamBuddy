@@ -739,7 +739,23 @@ async def test_a_refill_inside_the_gap_never_takes_the_drained_rolls_spent_stamp
     possible) and the drained row is left with nothing but its ``last_location_*`` residue to
     speak for it.
     """
+    from backend.app.models.archive import PrintArchive
+
     printer = await printer_factory()
+    # The job the roll runs dry in: its ``printing`` archive (``print_binding``'s durable record of
+    # the live job), begun before the bay cleared — the event that says WHICH clear the runout
+    # explains, read the same by the process the deploy brings up (2026-10-11).
+    db_session.add(
+        PrintArchive(
+            printer_id=printer.id,
+            filename="job.3mf",
+            file_path="/tmp/job.3mf",
+            file_size=1,
+            status="printing",
+            started_at=datetime.utcnow() - timedelta(minutes=60),
+        )
+    )
+    await db_session.commit()
     exhausted = await _bind(db_session, printer.id, 0, 3, weight_used=900.0)
     await _release(db_session, exhausted)
     # The bay cleared ~3 minutes before the firmware admits why (shape 31's three timed

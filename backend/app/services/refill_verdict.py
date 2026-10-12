@@ -5,7 +5,8 @@ resume there MUST be filament loaded. It's not the users job to know whether or 
 filament in there, the fact that it's unloaded is the farms POOR auto recovery mechanics".
 
 Its readers: the resume verb (T3), the refill driver at its publish, the give-up, the restart
-re-entry and the per-push detectors (T2 / T4) — all in ``spool_recovery`` — and the status frame's
+re-entry, the per-push detectors (T2 / T4) and the air stop's re-read at its send (T4: is this print on
+air the farm acts on) — all in ``spool_recovery`` — and the status frame's
 ``toolhead.refill_reason`` (``printer_manager.toolhead_payload``, T3: what a Resume would do about
 an empty toolhead, so the card never re-derives K7). ``spool_recovery`` imports
 ``printer_manager``, and the status frame is built inside ``printer_manager`` too (its own
@@ -14,9 +15,9 @@ reaches nothing above the client registry (``test_import_graph.TestTheRefillVerd
 
 * the toolhead's FEED STATE comes in as an argument (``reading``, ``BambuMQTTClient.feed()`` — the
   registry's caller reads it); ``feed_state`` is a leaf too, imported for its types;
-* the one pure reader it composed from a module above the registry, :func:`ran` (it lived in
-  ``ams_command``, which imports ``printer_manager`` to publish), lives here with the settle rule
-  it feeds (:func:`pending_settles`);
+* "did the farm's pending command run" is ``command_outcome.pending_settles`` (a leaf — the record's
+  outcome tables, 2026-10-11) over the open-row projection's pending command (the RECORD's
+  outstanding farm AMS motion action);
 * session freshness is ``live_reading``'s.
 """
 
@@ -26,64 +27,11 @@ from dataclasses import dataclass
 from typing import Literal, get_args
 
 from backend.app.models.printer_incident import KIND_PHYSICAL, KIND_RUNOUT
-from backend.app.models.printer_incident_step import STEP_KIND_COMMAND
-from backend.app.schemas.printer import AmsMotionCommand
-from backend.app.services import printer_incidents, tray_fields
+from backend.app.services import command_outcome, printer_incidents, tray_fields
 from backend.app.services.feed_state import FeedPhase, FeedReading
 from backend.app.services.hms_errors import power_loss_prompt_standing
 from backend.app.services.live_reading import reads_live
 from backend.app.services.plate_occupancy import plate_occupancy
-
-# --- did a recorded motion command run -------------------------------------------------
-
-#: The feeder-position kinds a recovery driver RECORDS at a send that name a real AMS feeder
-#: at the extruder — the jammed tray, or another one (``spool_recovery.FeederKind``, written
-#: on ``printer_incident_step.feeder``). Read here, never re-spelled there: the vocabulary is
-#: the driver's (its module imports this one, so the reverse import would be a cycle), and
-#: ``test_ams_command.TestRan`` pins this subset against it.
-_RECORDED_LOADED_FEEDERS: frozenset[str] = frozenset({"jammed", "other"})
-
-#: The motion commands a ledger step can name — the ones ``ams_command`` publishes
-#: (``schemas.printer.AmsMotionCommand``, pinned equal to ``ams_command.Command``).
-_COMMANDS: frozenset[str] = frozenset(get_args(AmsMotionCommand))
-
-
-def ran(step: printer_incidents.StepEntry, live: tray_fields.ToolheadFeed) -> bool | None:
-    """Did this RECORDED motion command run? Read off the step's own ledger columns
-    (``printer_incidents.StepEntry``: the command ``name``, the load's ``target``, the
-    feeder-position kind read at the send) and the LIVE toolhead feed
-    (``tray_fields.toolhead_feed`` — the ACTIVE extruder). Pure and DB-free.
-
-    Its readers ask it about a command that may still run after nobody watched it answer:
-    the recovery driver's round top after a restart (never send behind a pending command)
-    and the settle rule (:func:`pending_settles`) of the per-push detector and the verdict. The
-    measured reason: an accepted pull-back ran ON ITS OWN ~4.5 min after the send (011-H2S
-    2026-10-09 04:31:27 → 04:36:01; 014-H2S 2026-10-10 02:45:58 → 02:50:38).
-
-    * unload — ran ⇔ the recorded entry feeder was LOADED (:data:`_RECORDED_LOADED_FEEDERS`)
-      and the active extruder now reads empty. Sent with nothing loaded, or with no
-      reading of what was: ``None`` (nothing physical can answer it).
-    * load — ran ⇔ the active feeder now IS the target. A target that is no AMS feeder
-      (the external spool, Ext-R, none): ``None`` — the feed reading cannot attribute it.
-    * a live reading of ``unknown``: ``None`` (nothing was read).
-
-    Motion-only: a step that is not a ``command``, or names a command ``ams_command`` does not
-    publish, RAISES ``LookupError`` — a ledger token nobody can read back is drift, never a
-    skipped row (``printer_incidents.EvidenceLog``'s rule).
-    """
-    if step.kind != STEP_KIND_COMMAND or step.name not in _COMMANDS:
-        raise LookupError(f"refill_verdict.ran: not a motion command step (kind={step.kind!r}, name={step.name!r})")
-    if live.active.kind == "unknown":
-        return None
-    if step.name == "unload":
-        if step.feeder not in _RECORDED_LOADED_FEEDERS:
-            return None
-        return live.active.kind == "empty"
-    target = tray_fields.valid_feeder(step.target)
-    if target is None:
-        return None
-    return live.active.kind == "fed" and live.active.tray == target
-
 
 # --- K7: is a toolhead refill OWED here? -----------------------------------------------
 #
@@ -99,9 +47,12 @@ def ran(step: printer_incidents.StepEntry, live: tray_fields.ToolheadFeed) -> bo
 #   air;
 # * ``T4`` — a print RUNNING on AIR (a screen resume onto an empty toolhead, or a pending pull-back
 #   that drained under a running print): the feed state's ``AIR`` phase, a LEVEL — a layer printed
-#   while empty, or ``feed_state._AIR_CONFIRM_FRAMES`` quiet reports — never the first empty frame,
+#   while empty — never the first empty frame,
 #   which is also the first frame of the firmware's runout auto-switch (005/015/001-H2S 2026-10-10,
-#   invariant 16).
+#   invariant 16). T4's ``owed`` is PROOF of air, and the farm STOPS that print — never a refill of a
+#   ruined print (operator ruling 2026-10-12, ``spool_recovery._stop_printing_on_air``); the policy guards
+#   below still hold it off (a runout row — invariant 9 —, maintenance mode, a queued command, the reboot
+#   prompt, an eject).
 
 RefillTrigger = Literal["T2", "T3", "T4"]
 
@@ -128,8 +79,8 @@ RefillTrigger = Literal["T2", "T3", "T4"]
 #                            answering, after it cleared off the wire): invariant 9 — a runout is a
 #                            same-slot refill, never a swap, and a load during the hold LATCHES in
 #                            firmware (006-H2S 2026-07-26). The refill LANE owns it.
-# * ``command_pending``    — a farm motion command on an open row is still QUEUED (the ledger holds it
-#                            pending and the wire does not show it ran): nothing goes behind it — a
+# * ``command_pending``    — a farm motion command on an open row is still QUEUED (the record holds it
+#                            outstanding and the wire does not show it ran): nothing goes behind it — a
 #                            second command behind a queued one runs too — and when it runs, its
 #                            consequence is T2's.
 # * ``power_loss_prompt``  — the firmware's post-reboot prompt stands (``0300_8007``): the reboot's own
@@ -139,8 +90,8 @@ RefillTrigger = Literal["T2", "T3", "T4"]
 #                            nothing on a printer with hands in it.
 # * ``physical``           — an open PHYSICAL hold — T2 ONLY: its exit is the operator's own load, so
 #                            the farm's command running after the hand-over does not reach for the
-#                            path; a person's Resume (T3) and a print on air (T4) still try the
-#                            refill and report a failure.
+#                            path; a person's Resume (T3) still tries the refill and reports a
+#                            failure, and a print on air (T4) is still stopped.
 # * ``before_first_layer`` — ``START_BLOCK``: the job has not printed layer 1, so the start block's own
 #                            load is still to come and a 255 there is not air (012-H2S 2026-10-10:
 #                            paused at layer 0 at the plate-marker dialog).
@@ -151,7 +102,8 @@ RefillTrigger = Literal["T2", "T3", "T4"]
 #                            farm acts on nothing until the phase moves on (to ``CHANGING``, or to
 #                            ``AIR``).
 # * ``owed``               — ``AIR`` (RUNNING, printing on nothing) or ``EMPTY_PAUSED`` (PAUSEd empty,
-#                            no demand, no change), and no policy above holds: refill it.
+#                            no demand, no change), and no policy above holds: refill it — or, for
+#                            T4 (AIR), stop the ruined print (the trigger's own rule, above).
 RefillReason = Literal[
     "owed",
     "fed",
@@ -228,34 +180,6 @@ class RefillOwed:
         return self.reason == "owed"
 
 
-# What settles a farm command the step ledger still holds pending, read off the live toolhead —
-# ``complete`` (:func:`ran` says it ran) or ``undecidable`` (an unload sent with NOTHING loaded, or
-# with no reading of what was, while the toolhead reads empty: no wire reading can say it ran, and
-# its running pulls nothing back). ``None``: still queued.
-PendingSettle = Literal["complete", "undecidable"]
-
-
-def pending_settles(step: printer_incidents.StepEntry, live: tray_fields.ToolheadFeed) -> PendingSettle | None:
-    """Has the farm's pending motion command ``step`` (its ledger columns) stopped being a queue?
-    THE one rule, read by the driver's own waits (``spool_recovery._await_pending_command`` /
-    ``_settle_pending``), the refill verdict (:func:`refill_owed`) and the per-push detectors
-    (``spool_recovery._sample_toolhead``). Pure."""
-    answer = ran(step, live)
-    if answer is True:
-        return "complete"
-    if answer is None and step.name == "unload" and live.active.kind == "empty":
-        return "undecidable"
-    return None
-
-
-def pending_entry(pending: printer_incidents.PendingCommand) -> printer_incidents.StepEntry:
-    """The ledger columns of the open-row projection's pending command, as :func:`ran` reads a
-    step."""
-    return printer_incidents.StepEntry(
-        kind=STEP_KIND_COMMAND, name=pending.name, target=pending.target, feeder=pending.feeder
-    )
-
-
 def refill_owed(printer_id: int, state, *, trigger: RefillTrigger, reading: FeedReading | None) -> RefillOwed:
     """Is a toolhead refill OWED on this printer now, for ``trigger``? THE one owner of the
     exclusions (K7) — no other function composes these predicates for a refill decision
@@ -279,7 +203,13 @@ def refill_owed(printer_id: int, state, *, trigger: RefillTrigger, reading: Feed
     if answer in _BEFORE_POLICY:
         return RefillOwed(trigger, answer)
     pending = printer_incidents.pending_command(printer_id)
-    if pending is not None and pending_settles(pending_entry(pending), tray_fields.toolhead_feed(state)) is None:
+    if (
+        pending is not None
+        and command_outcome.pending_settles(
+            pending.name, pending.target, pending.loaded_at_send, tray_fields.toolhead_feed(state).active
+        )
+        is None
+    ):
         return RefillOwed(trigger, "command_pending")
     if power_loss_prompt_standing(getattr(state, "hms_errors", None) or []):
         return RefillOwed(trigger, "power_loss_prompt")

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
+from datetime import datetime
 
 import pytest
 from sqlalchemy import event, text
@@ -52,6 +53,7 @@ _SEED_MAX_ID = {
     "sku_files": 6,
     "print_batches": 8,
     "print_queue": 12,
+    "printer_action": 27,
 }
 
 
@@ -92,6 +94,7 @@ _MINIMAL_ROW: dict[str, dict] = {
     "sku_files": {"sku_id": 4, "library_file_id": 5, "plate_index": 9},
     "print_batches": {"name": "probe-run"},
     "print_queue": {"plate_id": 1},
+    "printer_action": {"printer_id": 1, "actor": "farm", "command": "resume", "sent_at": datetime(2026, 10, 11)},
 }
 
 
@@ -166,6 +169,9 @@ async def _seed(conn):
     common = {"printer_id": 1, "archive_id": 3, "library_file_id": 5, "batch_id": 8, "plate_id": 3}
     await _insert(conn, "print_queue", id=11, retry_of_id=None, **common)
     await _insert(conn, "print_queue", id=12, retry_of_id=11, **common)
+    await _insert(
+        conn, "printer_action", id=27, printer_id=1, actor="farm", command="resume", sent_at=datetime(2026, 10, 11)
+    )
 
     await conn.execute(text(f"CREATE TABLE {_PROBE_LOG} (note TEXT)"))
     await conn.execute(text(f"CREATE INDEX {_PROBE_INDEX} ON print_archives (filename)"))

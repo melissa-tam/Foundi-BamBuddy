@@ -29,6 +29,7 @@ from backend.app.schemas.settings import AppSettings
 from backend.app.services.eject import cooldown_prep, generator
 from backend.app.services.eject.cooldown_prep import AIRDUCT_COOLING_GCODE, CooldownFanSettings, FanRequest
 from backend.app.services.eject.geometry import GeometryUnavailable
+from backend.tests._fixtures.printer_action import publish_at_once
 
 from .geometry_fixtures import H2S_GEOMETRY
 
@@ -154,7 +155,7 @@ class _SpyClient:
         """Just the duct-to-cooling preludes."""
         return [text for text in self.gcode if text == AIRDUCT_COOLING_GCODE]
 
-    def send_gcode(self, text: str) -> bool:
+    def send_gcode(self, text: str, *, sequence_id=None) -> bool:
         self.gcode.append(text)
         if text == AIRDUCT_COOLING_GCODE:
             self.calls.append("gcode:M145 P0")
@@ -162,7 +163,7 @@ class _SpyClient:
         self.calls.append("hold")
         return self.gcode_ok
 
-    def set_fan_percent(self, fan: int, percent: int) -> bool:
+    def set_fan_percent(self, fan: int, percent: int, *, sequence_id=None) -> bool:
         self.fans.append((fan, percent))
         self.calls.append(f"fan:{fan}")
         return False if fan in self.refuse_fans else self.fan_ok
@@ -265,6 +266,8 @@ class _Env:
         import backend.app.services.farm_correlation as farm_correlation
 
         monkeypatch.setattr("backend.app.core.database.async_session", fake_session, raising=False)
+        # The record (``printer_action``) is a collaborator here, tested on its own.
+        publish_at_once(monkeypatch, self.manager.get_client)
         monkeypatch.setattr(cooldown_prep, "printer_manager", self.manager)
         monkeypatch.setattr(cooldown_prep, "get_geometry_required", fake_geometry)
         monkeypatch.setattr(cooldown_prep.donor, "read_max_z", fake_max_z)
@@ -1146,7 +1149,7 @@ class TestEnd:
         with caplog.at_level(logging.INFO, logger=cooldown_prep.__name__):
             prep = await env.begin()
 
-            def boom(fan, percent):
+            def boom(fan, percent, *, sequence_id=None):
                 if fan == 2:
                     raise RuntimeError("MQTT down")
                 env.client.fans.append((fan, percent))

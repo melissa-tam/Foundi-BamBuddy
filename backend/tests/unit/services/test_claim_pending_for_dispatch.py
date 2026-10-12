@@ -39,6 +39,7 @@ from backend.app.services.print_scheduler import scheduler
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.queue_transitions import cancel_pending_items
 from backend.app.utils.filename import derive_remote_filename
+from backend.tests._fixtures.printer_action import route_verbs
 
 pytestmark = pytest.mark.asyncio
 
@@ -84,7 +85,7 @@ def _dispatch_env(*, upload=None, delete=None):
     ``upload`` overrides the FTPS upload coroutine — the hook the cancel test uses
     to move the row while the dispatcher is "uploading". ``delete`` overrides the
     FTPS delete, so a test can make the post-refusal cleanup fail. Yields the mocks
-    worth asserting on; ``start`` is ``printer_manager.start_print``, i.e. the print
+    worth asserting on; ``start`` is the record's start (``route_verbs``), i.e. the print
     command itself, and ``delete`` is the USB delete — ONE mock behind both the
     scheduler's pre-upload clear and the abandoned-upload helper
     (``bambu_ftp.remove_abandoned_upload``) the refusal paths remove their upload with.
@@ -94,7 +95,7 @@ def _dispatch_env(*, upload=None, delete=None):
     delete_mock = AsyncMock(return_value=DeleteResult.DELETED) if delete is None else AsyncMock(side_effect=delete)
     with contextlib.ExitStack() as stack:
         stack.enter_context(patch.object(printer_manager, "is_connected", return_value=True))
-        # No ``state`` attribute → pre_state is None → no start watchdog task.
+        # No ``state`` attribute: the start's watch shows no phase and decides nothing.
         stack.enter_context(
             patch.object(printer_manager, "get_status", MagicMock(return_value=SimpleNamespace(sdcard=True)))
         )
@@ -104,7 +105,7 @@ def _dispatch_env(*, upload=None, delete=None):
         # ``set_awaiting_plate_clear(False)`` is gone (2026-08-30). ``_start_print``
         # commits a LEASE on the occupancy authority instead, which the autouse
         # fixture above keeps clean between cases.
-        stack.enter_context(patch.object(printer_manager, "start_print", start))
+        stack.enter_context(route_verbs(start=start))
         stack.enter_context(
             patch.object(ps_module, "get_ftp_retry_settings", AsyncMock(return_value=(False, 3, 1.0, 30.0)))
         )
@@ -294,7 +295,7 @@ class TestFailedPrintCommand:
         with (
             _dispatch_env() as m,
             patch.object(ps_module, "remove_abandoned_upload", helper),
-            patch.object(printer_manager, "start_print", MagicMock(return_value=False)),
+            route_verbs(start=MagicMock(return_value=False)),
         ):
             await scheduler._start_print(db_session, item, ams_mapping=[1, -1])
 
@@ -304,3 +305,143 @@ class TestFailedPrintCommand:
         assert helper.await_args.kwargs["why"] == f"queue item {item_id}: the print command failed"
         # Only the routine pre-upload clear went through the raw delete.
         assert m.delete.await_count == 1
+
+    async def test_a_start_that_never_left_returns_the_unit_to_the_queue(self, db_session, tmp_path):
+        """The printer never saw the job (2026-10-11, owner 9): the unit goes back next in line — not
+        ``failed``, no retry spent — and the printer claim is dropped with it."""
+        printer, item, _remote_path = await _seed_dispatchable(db_session, tmp_path, name="DCNS")
+        item_id = item.id
+
+        with (
+            _dispatch_env(),
+            patch.object(ps_module, "remove_abandoned_upload", AsyncMock(return_value=True)),
+            route_verbs(start=MagicMock(return_value=False)),
+        ):
+            await scheduler._start_print(db_session, item, ams_mapping=[1, -1])
+
+        db_session.expunge_all()
+        row = (await db_session.execute(select(PrintQueueItem).where(PrintQueueItem.id == item_id))).scalar_one()
+        assert row.status == "pending"
+        assert row.error_message is None
+        assert plate_occupancy.snapshot(printer.id).lease_unit_id is None
+
+
+class TestTheUploadsAnswer:
+    """An FTPS upload that did not land (2026-10-11, owner 9): the server's refusal fails the unit as it
+    always has; a TRANSPORT stall never spends the unit's retry, but since R19 (2026-10-12) it is a strike
+    against the PRINTER (``farm_policy.record_upload_stall``: the escalation row naming the unit). A PINNED
+    unit is held on its pin; a POOLED unit is not held — the next tick's pool search skips that printer."""
+
+    async def test_a_transport_stall_holds_a_pinned_unit_spends_no_retry_and_strikes_the_printer(
+        self, db_session, tmp_path
+    ):
+        from backend.app.models.recovery_escalation import RecoveryEscalation
+        from backend.app.services.bambu_ftp import UploadResult
+
+        printer, item, _remote_path = await _seed_dispatchable(db_session, tmp_path, name="DCST")
+        item_id, printer_id = item.id, printer.id
+        on_terminal = AsyncMock()
+
+        with (
+            _dispatch_env(upload=lambda *a, **k: UploadResult(ok=False, failure="stall", detail="timed out")) as m,
+            patch("backend.app.services.farm_policy.on_terminal", on_terminal),
+            patch.object(ps_module.notification_service, "on_queue_job_waiting", AsyncMock()),
+        ):
+            await scheduler._start_print(db_session, item, ams_mapping=[1, -1])
+
+        m.start.assert_not_called()
+        on_terminal.assert_not_awaited()
+        db_session.expunge_all()
+        row = (await db_session.execute(select(PrintQueueItem).where(PrintQueueItem.id == item_id))).scalar_one()
+        assert row.status == "pending"
+        assert row.waiting_reason == ps_module.WAITING_REASON_UPLOAD_STALLED
+        assert row.error_message is None
+        assert row.retry_count == 0 and row.retry_of_id is None  # no retry spent, no lineage minted
+        strikes = (
+            await db_session.execute(
+                select(RecoveryEscalation.reason, RecoveryEscalation.queue_item_id).where(
+                    RecoveryEscalation.printer_id == printer_id
+                )
+            )
+        ).all()
+        assert strikes == [("upload_stalled", item_id)]
+
+    async def test_a_transport_stall_leaves_a_pooled_unit_unheld_for_the_pool(self, db_session, tmp_path):
+        from backend.app.services.bambu_ftp import UploadResult
+
+        printer, item, _remote_path = await _seed_dispatchable(db_session, tmp_path, name="DCSP")
+        item.printer_id = None
+        item.target_model = "H2S"
+        await db_session.commit()
+        item_id, printer_id = item.id, printer.id
+
+        with (
+            _dispatch_env(upload=lambda *a, **k: UploadResult(ok=False, failure="stall", detail="timed out")) as m,
+            patch.object(ps_module.notification_service, "on_queue_job_waiting", AsyncMock()) as waiting,
+        ):
+            await scheduler._start_print(db_session, item, printer_id=printer_id, ams_mapping=[1, -1])
+
+        m.start.assert_not_called()
+        waiting.assert_not_awaited()
+        db_session.expunge_all()
+        row = (await db_session.execute(select(PrintQueueItem).where(PrintQueueItem.id == item_id))).scalar_one()
+        assert (row.status, row.printer_id, row.waiting_reason, row.retry_count) == ("pending", None, None, 0)
+        from backend.app.services import farm_policy
+
+        assert await farm_policy.upload_stalled_printers(db_session) == {item_id: frozenset({printer_id})}
+
+    async def test_the_servers_refusal_still_fails_the_unit(self, db_session, tmp_path):
+        from backend.app.services.bambu_ftp import UploadResult
+
+        printer, item, _remote_path = await _seed_dispatchable(db_session, tmp_path, name="DCPM")
+        item_id = item.id
+
+        with _dispatch_env(upload=lambda *a, **k: UploadResult(ok=False, failure="permanent", detail="553")) as m:
+            await scheduler._start_print(db_session, item, ams_mapping=[1, -1])
+
+        m.start.assert_not_called()
+        db_session.expunge_all()
+        row = (await db_session.execute(select(PrintQueueItem).where(PrintQueueItem.id == item_id))).scalar_one()
+        assert row.status == "failed"
+
+
+class TestADisconnectedPrinterAtStart:
+    """The printer's MQTT session dropped between the pick and the start (2026-10-11, owner 9): a transport
+    condition — the unit is HELD, never failed (no retry spent, nothing terminal, no power-off), and it
+    dispatches once the printer is back."""
+
+    async def test_it_is_held_and_dispatches_once_connected(self, db_session, tmp_path):
+        printer, item, _remote_path = await _seed_dispatchable(db_session, tmp_path, name="DCNC")
+        item_id = item.id
+        on_terminal = AsyncMock()
+        power_off = AsyncMock()
+
+        with (
+            _dispatch_env() as m,
+            patch.object(printer_manager, "is_connected", return_value=False),
+            patch("backend.app.services.farm_policy.on_terminal", on_terminal),
+            patch.object(scheduler, "_power_off_if_needed", power_off),
+            patch.object(ps_module.notification_service, "on_queue_job_waiting", AsyncMock()),
+        ):
+            await scheduler._start_print(db_session, item, ams_mapping=[1, -1])
+
+        m.start.assert_not_called()
+        m.upload.assert_not_awaited()
+        on_terminal.assert_not_awaited()
+        power_off.assert_not_awaited()
+        db_session.expunge_all()
+        row = (await db_session.execute(select(PrintQueueItem).where(PrintQueueItem.id == item_id))).scalar_one()
+        assert row.status == "pending"
+        assert row.waiting_reason == ps_module.WAITING_REASON_PRINTER_NOT_CONNECTED
+        assert row.retry_count == 0
+        assert row.error_message is None
+
+        # Back online: the next dispatch starts it, and the hold token clears with the claim.
+        with _dispatch_env() as m:
+            await scheduler._start_print(db_session, row, ams_mapping=[1, -1])
+
+        m.start.assert_called_once()
+        db_session.expunge_all()
+        row = (await db_session.execute(select(PrintQueueItem).where(PrintQueueItem.id == item_id))).scalar_one()
+        assert row.status == "printing"
+        assert row.waiting_reason is None

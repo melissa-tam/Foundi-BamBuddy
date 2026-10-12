@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from backend.app.services.bambu_mqtt import BambuMQTTClient, SentCommand
+from backend.app.services.bambu_mqtt import BambuMQTTClient
 from backend.app.services.hms_actions import (
     HMSAction,
     get_actions_for_error_code,
@@ -111,7 +111,7 @@ class TestExecuteHmsActionDispatch:
             client = BambuMQTTClient(ip_address="192.168.1.100", serial_number="03W-TEST", access_code="12345678")
             client._client = MagicMock()
             client.state.connected = True
-            client.execute_hms_action(_PLATE_ERR_HEX, action, "task-1")
+            client.execute_hms_action(_PLATE_ERR_HEX, action, "task-1", sequence_id="1")
             commands = {
                 json.loads(call.args[1]).get("print", {}).get("command")
                 for call in client._client.publish.call_args_list
@@ -125,11 +125,11 @@ class TestExecuteHmsActionDispatch:
 
     def test_returns_none_when_disconnected(self, client):
         client.state.connected = False
-        assert client.execute_hms_action(_PLATE_ERR_HEX, HMSAction.PROBLEM_SOLVED_RESUME, "") is None
+        assert client.execute_hms_action(_PLATE_ERR_HEX, HMSAction.PROBLEM_SOLVED_RESUME, "", sequence_id="1") is False
         client._client.publish.assert_not_called()
 
     def test_returns_none_on_unknown_action(self, client):
-        assert client.execute_hms_action("03008070", "DOES_NOT_EXIST", "") is None
+        assert client.execute_hms_action("03008070", "DOES_NOT_EXIST", "", sequence_id="1") is False
         client._client.publish.assert_not_called()
 
     # -- "Problem solved, resume": the vendor resume+err frame -------------------------
@@ -138,7 +138,7 @@ class TestExecuteHmsActionDispatch:
     def test_problem_solved_sends_the_vendor_resume_frame(self, client, action):
         """``command_hms_resume``: decimal ``err``, ``param: "reserve"``, the pressed job's
         subtask id as ``job_id``, and a REAL sequence id recorded for the ACK read."""
-        sent = client.execute_hms_action(_PLATE_ERR_HEX, action, "771234")
+        sent = client.execute_hms_action(_PLATE_ERR_HEX, action, "771234", sequence_id="1")
 
         assert self._published_commands(client) == [
             {
@@ -151,8 +151,7 @@ class TestExecuteHmsActionDispatch:
                 }
             }
         ]
-        assert sent == SentCommand(command="resume", sequence_id="1")
-        assert client.last_sent_sequence_id("resume") == "1"
+        assert sent is True
 
     def test_job_id_is_the_callers_and_nothing_else(self, client):
         """ONE rule: the caller names the pressed job's subtask id. The live state is not
@@ -160,28 +159,28 @@ class TestExecuteHmsActionDispatch:
         id to the frame."""
         client.state.subtask_id = "live-other-job"
 
-        client.execute_hms_action(_PLATE_ERR_HEX, HMSAction.PROBLEM_SOLVED_RESUME, "task-42")
+        client.execute_hms_action(_PLATE_ERR_HEX, HMSAction.PROBLEM_SOLVED_RESUME, "task-42", sequence_id="1")
 
         assert self._published_commands(client)[0]["print"]["job_id"] == "task-42"
 
     def test_an_empty_job_id_is_sent_empty(self, client):
         """Studio's ``std::string`` default: a job with no id sends ``""``, never omits it."""
-        client.execute_hms_action(_PLATE_ERR_HEX, HMSAction.PROBLEM_SOLVED_RESUME, "")
+        client.execute_hms_action(_PLATE_ERR_HEX, HMSAction.PROBLEM_SOLVED_RESUME, "", sequence_id="1")
 
         assert self._published_commands(client)[0]["print"]["job_id"] == ""
 
     def test_job_id_is_required(self, client):
         with pytest.raises(TypeError):
-            client.execute_hms_action(_PLATE_ERR_HEX, HMSAction.PROBLEM_SOLVED_RESUME)  # type: ignore[call-arg]
+            client.execute_hms_action(_PLATE_ERR_HEX, HMSAction.PROBLEM_SOLVED_RESUME, sequence_id="1")  # type: ignore[call-arg]
         client._client.publish.assert_not_called()
 
     def test_lowercase_hex_converts_to_the_same_decimal(self, client):
-        client.execute_hms_action(_PLATE_ERR_HEX.lower(), HMSAction.PROBLEM_SOLVED_RESUME, "")
+        client.execute_hms_action(_PLATE_ERR_HEX.lower(), HMSAction.PROBLEM_SOLVED_RESUME, "", sequence_id="1")
 
         assert self._published_commands(client)[0]["print"]["err"] == _PLATE_ERR_DECIMAL
 
     def test_the_foreign_objects_code_converts_too(self, client):
-        client.execute_hms_action("0500806E", HMSAction.PROBLEM_SOLVED_RESUME, "")
+        client.execute_hms_action("0500806E", HMSAction.PROBLEM_SOLVED_RESUME, "", sequence_id="1")
 
         assert self._published_commands(client)[0]["print"]["err"] == "83918958"
 
@@ -197,7 +196,7 @@ class TestExecuteHmsActionDispatch:
         the opposite of what the button says."""
         client.state.state = "PAUSE"
 
-        sent = client.execute_hms_action(_PLATE_ERR_HEX, action, "771234")
+        sent = client.execute_hms_action(_PLATE_ERR_HEX, action, "771234", sequence_id="1")
 
         assert self._published_commands(client) == [
             {
@@ -210,27 +209,25 @@ class TestExecuteHmsActionDispatch:
                 }
             }
         ]
-        assert sent == SentCommand(command="ignore", sequence_id="1")
-        assert client.last_sent_sequence_id("ignore") == "1"
+        assert sent is True
 
     @pytest.mark.parametrize("gcode_state", ["PAUSE", "RUNNING", "IDLE"])
     def test_ignore_never_publishes_a_resume(self, client, gcode_state):
         client.state.state = gcode_state
 
-        client.execute_hms_action(_PLATE_ERR_HEX, HMSAction.IGNORE_RESUME, "")
+        client.execute_hms_action(_PLATE_ERR_HEX, HMSAction.IGNORE_RESUME, "", sequence_id="1")
 
         commands = [p["print"]["command"] for p in self._published_commands(client)]
         assert commands == ["ignore"]
-        assert client.last_sent_sequence_id("resume") is None
 
     def test_no_reminder_sends_idle_ignore_type_zero(self, client):
         """``command_hms_idle_ignore(err, 0)`` — dismiss without resuming; no param, no job id."""
-        sent = client.execute_hms_action(_PLATE_ERR_HEX, HMSAction.NO_REMINDER_NEXT_TIME, "")
+        sent = client.execute_hms_action(_PLATE_ERR_HEX, HMSAction.NO_REMINDER_NEXT_TIME, "", sequence_id="1")
 
         assert self._published_commands(client) == [
             {"print": {"command": "idle_ignore", "err": _PLATE_ERR_DECIMAL, "type": 0, "sequence_id": "1"}}
         ]
-        assert sent == SentCommand(command="idle_ignore", sequence_id="1")
+        assert sent is True
 
     # -- The err form: only the 8-hex print_error is accepted ---------------------------
 
@@ -258,12 +255,9 @@ class TestExecuteHmsActionDispatch:
     def test_an_err_frame_refuses_anything_but_the_8_hex_code(self, client, caplog, action, bad_err):
         caplog.set_level(logging.WARNING, logger="backend.app.services.bambu_mqtt")
 
-        assert client.execute_hms_action(bad_err, action, "") is None
+        assert client.execute_hms_action(bad_err, action, "", sequence_id="1") is False
 
         client._client.publish.assert_not_called()
-        assert client.last_sent_sequence_id("resume") is None
-        assert client.last_sent_sequence_id("ignore") is None
-        assert client.last_sent_sequence_id("idle_ignore") is None
         assert any("refused" in r.getMessage() and "8-hex" in r.getMessage() for r in caplog.records)
 
     # -- The plain resume: resume_print, the one publisher of that frame ---------------
@@ -281,19 +275,19 @@ class TestExecuteHmsActionDispatch:
     def test_the_plain_resume_is_resume_prints_frame(self, client, action):
         """No err, no job id — and the 16-char code is harmless here, because this frame
         carries no ``err`` at all."""
-        sent = client.execute_hms_action("0C00030000020010", action, "task-42")
+        sent = client.execute_hms_action("0C00030000020010", action, "task-42", sequence_id="1")
 
         assert self._all_payloads(client) == [
             {"print": {"command": "resume", "sequence_id": "1"}},
             {"pushing": {"command": "pushall", "sequence_id": "0"}},
         ]
-        assert sent == SentCommand(command="resume", sequence_id="1")
+        assert sent is True
 
     def test_the_plain_resume_goes_through_resume_print(self, client):
         with patch.object(BambuMQTTClient, "resume_print", return_value=True) as publisher:
-            client.execute_hms_action("03008007", HMSAction.RESUME_PRINTING, "")
+            client.execute_hms_action("03008007", HMSAction.RESUME_PRINTING, "", sequence_id="1")
 
-        publisher.assert_called_once_with()
+        publisher.assert_called_once_with(sequence_id="1")
 
     # -- Stop is not this dispatcher's -----------------------------------------------
 
@@ -303,48 +297,48 @@ class TestExecuteHmsActionDispatch:
         durable stop request AND the stop). The route sends it there; this dispatcher owns
         no stop and sends nothing for it — sending one here went out WITHOUT the request,
         so the terminal read as a failure."""
-        assert client.execute_hms_action("03008070", HMSAction.STOP_PRINTING, "task-1") is None
+        assert client.execute_hms_action("03008070", HMSAction.STOP_PRINTING, "task-1", sequence_id="1") is False
         assert self._published_commands(client) == []
 
     def test_the_one_stop_publisher_is_plain_no_err_no_job_id(self, client):
         # The stop the operator verb sends. Same firmware silent-rejection class as
         # resume — the `err` variant was confirmed broken on H2D-1 (PAUSE → PAUSE); the
         # plain shape transitions to FAILED within ~2s.
-        assert client.stop_print() is True
+        assert client.stop_print(sequence_id="1") is True
         cmds = self._published_commands(client)
-        assert cmds == [{"print": {"command": "stop", "sequence_id": "0"}}]
+        assert cmds == [{"print": {"command": "stop", "sequence_id": "1"}}]
         assert "err" not in cmds[0]["print"]
         assert "job_id" not in cmds[0]["print"]
 
     # -- The other buttons ------------------------------------------------------------
 
     def test_filament_extruded_sends_ams_done(self, client):
-        sent = client.execute_hms_action("07008029", HMSAction.FILAMENT_EXTRUDED, "")
+        sent = client.execute_hms_action("07008029", HMSAction.FILAMENT_EXTRUDED, "", sequence_id="1")
         cmds = self._published_commands(client)
         assert cmds[0] == {"print": {"command": "ams_control", "param": "done", "sequence_id": "1"}}
-        assert sent == SentCommand(command="ams_control", sequence_id="1")
+        assert sent is True
 
     def test_retry_sends_ams_resume(self, client):
-        client.execute_hms_action("07008029", HMSAction.RETRY_FILAMENT_EXTRUDED, "")
+        client.execute_hms_action("07008029", HMSAction.RETRY_FILAMENT_EXTRUDED, "", sequence_id="1")
         cmds = self._published_commands(client)
         assert cmds[0]["print"]["param"] == "resume"
         assert cmds[0]["print"]["command"] == "ams_control"
 
     def test_abort_sends_ams_abort(self, client):
-        client.execute_hms_action("07008029", HMSAction.ABORT, "")
+        client.execute_hms_action("07008029", HMSAction.ABORT, "", sequence_id="1")
         cmds = self._published_commands(client)
         assert cmds[0]["print"]["param"] == "abort"
 
     def test_ok_button_sends_bare_clean_print_error(self, client):
         # Matches the existing `clear_hms_errors` shape — no `print_error` body
         # field, which the original PR mistakenly added.
-        sent = client.execute_hms_action("03008070", HMSAction.OK_BUTTON, "")
+        sent = client.execute_hms_action("03008070", HMSAction.OK_BUTTON, "", sequence_id="1")
         cmds = self._published_commands(client)
         assert cmds[0] == {"print": {"command": "clean_print_error", "sequence_id": "1"}}
-        assert sent == SentCommand(command="clean_print_error", sequence_id="1")
+        assert sent is True
 
     def test_dbl_check_ok_sends_clean_then_uiop_close_and_answers_sent(self, client):
-        sent = client.execute_hms_action("03008070", HMSAction.DBL_CHECK_OK, "")
+        sent = client.execute_hms_action("03008070", HMSAction.DBL_CHECK_OK, "", sequence_id="1")
         cmds = self._published_commands(client)
         assert len(cmds) == 2
         assert cmds[0]["print"]["command"] == "clean_print_error"
@@ -353,11 +347,11 @@ class TestExecuteHmsActionDispatch:
         # str (which would TypeError on the old code path).
         assert cmds[1]["system"]["err"] == "03008070"
         # The close rides the SYSTEM topic, whose echo is never recorded as an ACK.
-        assert sent == SentCommand(command="uiop", sequence_id=None)
+        assert sent is True
 
     def test_uiop_close_uppercases_lowercase_input(self, client):
         # Frontend may send the short code in either case; we normalise.
-        client.execute_hms_action("0300abcd", HMSAction.DBL_CHECK_OK, "")
+        client.execute_hms_action("0300abcd", HMSAction.DBL_CHECK_OK, "", sequence_id="1")
         cmds = self._published_commands(client)
         assert cmds[1]["system"]["err"] == "0300ABCD"
 
@@ -372,11 +366,10 @@ class TestExecuteHmsActionDispatch:
     )
     def test_the_device_buttons_send_a_sequenced_frame(self, client, action, frame):
         """A real id on every print-topic frame, so the route can read THIS send's ACK."""
-        sent = client.execute_hms_action("03008070", action, "")
+        sent = client.execute_hms_action("03008070", action, "", sequence_id="1")
 
         assert self._published_commands(client) == [{"print": {**frame, "sequence_id": "1"}}]
-        assert sent == SentCommand(command=frame["command"], sequence_id="1")
-        assert client.last_sent_sequence_id(frame["command"]) == "1"
+        assert sent is True
 
     @pytest.mark.parametrize(
         "action",
@@ -394,7 +387,7 @@ class TestExecuteHmsActionDispatch:
         # These actions exist for parity with BambuStudio's modal but have no
         # MQTT counterpart — the printer's own screen drives them. Nothing went out,
         # so there is nothing to answer.
-        assert client.execute_hms_action("03008070", action, "") is None
+        assert client.execute_hms_action("03008070", action, "", sequence_id="1") is False
         client._client.publish.assert_not_called()
 
     @pytest.mark.parametrize(
@@ -412,7 +405,7 @@ class TestExecuteHmsActionDispatch:
     def test_every_command_is_followed_by_a_pushall(self, client, action):
         # The dispatcher pairs every command with a `pushing.pushall` echo so
         # the state stream refreshes on the next tick. Regression guard.
-        client.execute_hms_action(_PLATE_ERR_HEX, action, "")
+        client.execute_hms_action(_PLATE_ERR_HEX, action, "", sequence_id="1")
         payloads = self._all_payloads(client)
         assert "print" in payloads[0]
         assert payloads[-1] == {"pushing": {"command": "pushall", "sequence_id": "0"}}
@@ -420,16 +413,20 @@ class TestExecuteHmsActionDispatch:
     def test_no_print_frame_is_numbered_zero(self, client):
         """Invariant 14: with every send numbered ``"0"`` no ACK could name the send it
         answers."""
-        for action in (
-            HMSAction.PROBLEM_SOLVED_RESUME,
-            HMSAction.IGNORE_RESUME,
-            HMSAction.NO_REMINDER_NEXT_TIME,
-            HMSAction.RESUME_PRINTING,
-            HMSAction.OK_BUTTON,
-            HMSAction.ABORT,
-            HMSAction.REFRESH_NOZZLE,
+        for number, action in enumerate(
+            (
+                HMSAction.PROBLEM_SOLVED_RESUME,
+                HMSAction.IGNORE_RESUME,
+                HMSAction.NO_REMINDER_NEXT_TIME,
+                HMSAction.RESUME_PRINTING,
+                HMSAction.OK_BUTTON,
+                HMSAction.ABORT,
+                HMSAction.REFRESH_NOZZLE,
+            ),
+            start=1,
         ):
-            client.execute_hms_action(_PLATE_ERR_HEX, action, "")
+            # Each press carries its action's id (``printer_action``) — never ``"0"``.
+            client.execute_hms_action(_PLATE_ERR_HEX, action, "", sequence_id=str(number))
 
         ids = [p["print"]["sequence_id"] for p in self._published_commands(client) if "print" in p]
         assert ids == ["1", "2", "3", "4", "5", "6", "7"]
@@ -459,7 +456,7 @@ class TestAmsControlBranchesDelegateToTheOnePublisher:
         ],
     )
     def test_the_published_bytes_are_unchanged(self, client, action, param):
-        client.execute_hms_action("07008029", action, "")
+        client.execute_hms_action("07008029", action, "", sequence_id="1")
         expected = json.dumps({"print": {"command": "ams_control", "param": param, "sequence_id": "1"}})
         assert self._raw(client)[0] == expected
 
@@ -475,5 +472,5 @@ class TestAmsControlBranchesDelegateToTheOnePublisher:
         """The modal's underlying status query refreshes off that full report — which
         is why the branch asks for one where a bare ``ams_control`` does not."""
         with patch.object(BambuMQTTClient, "ams_control", return_value=True) as pub:
-            client.execute_hms_action("07008029", action, "")
-        pub.assert_called_once_with(param, request_pushall=True)
+            client.execute_hms_action("07008029", action, "", sequence_id="1")
+        pub.assert_called_once_with(param, request_pushall=True, sequence_id="1")

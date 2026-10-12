@@ -205,9 +205,7 @@ class TestBusyDiagnostic:
         """The old "post-dispatch hold" line, re-pinned onto the lease that replaced
         it — and it now names the UNIT the printer is being held for, which the
         boolean set could never do."""
-        lease = plate_occupancy.claim_for_dispatch(
-            7, 1010, pre_state="FINISH", pre_subtask="t-1", min_hold_s=60.0, max_hold_s=180.0, ev=_evidence()
-        )
+        lease = plate_occupancy.claim_for_dispatch(7, 1010, ev=_evidence())
         assert plate_occupancy.commit_dispatch(7, lease) is None
 
         cause = sched_mod._busy_cause(7, {}, None)

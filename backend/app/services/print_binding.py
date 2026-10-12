@@ -184,16 +184,28 @@ async def completed_since(db: AsyncSession, printer_id: int, since: datetime) ->
     after ``since``. An eject sweep creates no archive, so a filament-less sweep is never
     one; a screen-started (foreign) print is archived like any other, and it counts — the
     path is the printer's. Read by the recovery driver's printer bound
-    (``spool_recovery._restart_refault``).
+    (``spool_recovery._restart_refault``), the quarantine rule (``farm_policy``) and the plate-check
+    ladder's repeat rule (``pause_recovery._decide``: a refused plate on a printer whose last plate-check
+    stop has no completed print after it is held for a person).
     """
-    found = await db.scalar(
+    return bool(await db.scalar(select(completed_after(printer_id, since))))
+
+
+def completed_after(
+    printer_id: int | ColumnElement[int | None], since: datetime | ColumnElement[datetime]
+) -> ColumnElement[bool]:
+    """THE "a print completed on this printer after ``since``" predicate, query-ready: an EXISTS over a
+    ``completed`` archive of ``printer_id`` closed after ``since`` — each argument a value or a column. A
+    column is correlated to the enclosing query's row (``farm_policy.upload_stalled_printers``' one bulk
+    read: per upload-stall row, a completed print on its printer after the row), a value asks one printer
+    (:func:`completed_since`). The one spelling of the predicate; no caller re-spells it."""
+    return (
         select(PrintArchive.id)
         .where(PrintArchive.printer_id == printer_id)
         .where(PrintArchive.status == "completed")
         .where(PrintArchive.completed_at > since)
-        .limit(1)
+        .exists()
     )
-    return found is not None
 
 
 async def printers_with_live_print(db: AsyncSession) -> set[int]:

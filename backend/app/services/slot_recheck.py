@@ -89,8 +89,8 @@ ORIGIN_RECHECK_UNDO = "recheck_undo"
 #: This paces a RETRY, never an identity decision — the same job
 #: ``spool_tagless._AUTOCONFIG_RETRY_S`` and ``_RECONCILE_MIN_INTERVAL_S`` do, and expressly
 #: not the kind of duration doctrine rule 7 forbids. A successful command self-paces
-#: (``ams_presence.identify_in_flight`` holds for ``_IDENTIFY_ACTIVE_S`` and the answer lands
-#: inside it); this window only bounds the case where the client REFUSES — drying, an engaged
+#: (``ams_presence.identify_in_flight`` holds until the read ANSWERS — the unit's own identify cycle
+#: ending); this window only bounds the case where the client REFUSES — drying, an engaged
 #: extruder, a disconnect — which stamps nothing and would otherwise re-publish at the ~1 Hz
 #: push cadence. Aligned with the identify gate so a refused ask costs at most one publish per
 #: gate period.

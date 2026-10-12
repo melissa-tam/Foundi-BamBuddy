@@ -575,7 +575,7 @@ class TestRow2IdentityLane:
         assert decision == Decision(DecisionKind.KEEP, spool_id=37, reason="identity_matches_bound")
 
     def test_a_spent_tagged_row_whose_presence_is_UNKNOWN_keeps_its_latch(self):
-        """"The tray reads loaded" is the tri-state True (invariant 3), not "not empty".
+        """ "The tray reads loaded" is the tri-state True (invariant 3), not "not empty".
 
         A push that asserts the tag but says nothing about presence is no evidence a fresh
         roll is seated, and retiring a row on it would be acting on an unknown. Erring LATE

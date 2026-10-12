@@ -186,7 +186,7 @@ class TestSmartPlugManager:
 
         with (
             patch.object(manager, "_get_plugs_for_printer", new_callable=AsyncMock) as mock_get_plug,
-            patch.object(manager, "_schedule_temp_based_off") as mock_schedule,
+            patch.object(manager, "schedule_temp_based_off") as mock_schedule,
         ):
             mock_get_plug.return_value = [mock_plug]
 
@@ -205,7 +205,7 @@ class TestSmartPlugManager:
         with (
             patch.object(manager, "_get_plugs_for_printer", new_callable=AsyncMock) as mock_get_plug,
             patch.object(manager, "_schedule_delayed_off") as mock_schedule,
-            patch.object(manager, "_schedule_temp_based_off") as mock_temp,
+            patch.object(manager, "schedule_temp_based_off") as mock_temp,
         ):
             mock_get_plug.return_value = [mock_plug]
 
@@ -390,7 +390,10 @@ class TestSmartPlugManager:
         assert manager._scheduler_task is None
 
         # Mock _schedule_loop to return a mock coroutine to avoid unawaited coroutine warning
-        with patch.object(manager, "_schedule_loop") as mock_loop, patch("asyncio.create_task") as mock_create:
+        with (
+            patch.object(manager, "_schedule_loop") as mock_loop,
+            patch("backend.app.services.smart_plug_manager.spawn_background_task") as mock_create,
+        ):
             mock_create.return_value = MagicMock()
             manager.start_scheduler()
 
@@ -418,7 +421,7 @@ class TestSmartPlugManager:
         with (
             patch.object(manager, "_schedule_loop") as mock_loop,
             patch.object(manager, "_snapshot_loop") as mock_snapshot,
-            patch("asyncio.create_task") as mock_create,
+            patch("backend.app.services.smart_plug_manager.spawn_background_task") as mock_create,
         ):
             manager.start_scheduler()
 
@@ -783,7 +786,7 @@ class TestPendingAutoOffPersistence:
 
         with (
             patch("backend.app.core.database.async_session") as mock_session_ctx,
-            patch.object(manager, "_schedule_temp_based_off") as mock_schedule,
+            patch.object(manager, "schedule_temp_based_off") as mock_schedule,
         ):
             mock_db = AsyncMock()
             mock_result = MagicMock()
@@ -797,37 +800,223 @@ class TestPendingAutoOffPersistence:
 
             mock_schedule.assert_called_once_with(mock_plug, 1, 70)
 
-    @pytest.mark.asyncio
-    async def test_resume_pending_auto_offs_time_mode_immediate_off(self, manager):
-        """Verify time-based pending auto-offs turn off immediately on resume."""
+    @staticmethod
+    async def _resume_time_mode_pending(manager, nozzle: float):
+        """A time-mode plug with a cut pending across a restart, resumed over a printer whose
+        nozzle reads ``nozzle`` on every poll (threshold 70). Runs the real resume and the real
+        temperature watch it schedules; sleeps advance instantly. Returns (turn_off, mark)."""
         mock_plug = MagicMock()
         mock_plug.id = 1
         mock_plug.name = "Test Plug"
+        mock_plug.plug_type = "tasmota"
         mock_plug.ip_address = "192.168.1.100"
+        mock_plug.ha_entity_id = None
         mock_plug.username = None
         mock_plug.password = None
         mock_plug.printer_id = 1
         mock_plug.auto_off_pending = True
         mock_plug.auto_off_pending_since = datetime.now(timezone.utc)
         mock_plug.off_delay_mode = "time"
+        mock_plug.off_temp_threshold = 70
 
+        spawned = {}
+
+        def capture(coro, *, name=None):
+            spawned[name] = coro
+            return MagicMock()
+
+        status = MagicMock()
+        status.temperatures = {"nozzle": nozzle}
         with (
             patch("backend.app.core.database.async_session") as mock_session_ctx,
+            patch("backend.app.services.smart_plug_manager.spawn_background_task", side_effect=capture),
             patch("backend.app.services.smart_plug_manager.tasmota_service") as mock_tasmota,
+            patch("backend.app.services.smart_plug_manager.printer_manager") as pm,
+            patch("backend.app.services.smart_plug_manager.asyncio.sleep", new_callable=AsyncMock),
             patch.object(manager, "_mark_auto_off_executed", new_callable=AsyncMock) as mock_mark,
-            patch("backend.app.services.smart_plug_manager.printer_manager"),
         ):
             mock_db = AsyncMock()
             mock_result = MagicMock()
             mock_result.scalars.return_value.all.return_value = [mock_plug]
             mock_db.execute = AsyncMock(return_value=mock_result)
-
             mock_session_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_db)
             mock_session_ctx.return_value.__aexit__ = AsyncMock()
-
             mock_tasmota.turn_off = AsyncMock(return_value=True)
+            pm.get_status.return_value = status
 
             await manager.resume_pending_auto_offs()
 
-            mock_tasmota.turn_off.assert_called_once()
-            mock_mark.assert_called_once_with(1)
+            # Nothing is cut at resume time: the cut is the temperature watch's alone.
+            mock_tasmota.turn_off.assert_not_awaited()
+            spawned.pop("plug-auto-off-pending-1").close()
+            await spawned.pop("plug-temp-off-1")
+            assert spawned == {}
+        return mock_tasmota.turn_off, mock_mark
+
+    @pytest.mark.asyncio
+    async def test_resume_time_mode_pending_cut_keeps_power_on_a_hot_printer(self, manager):
+        """A time-mode delay's progress before the restart is unknowable, so the resumed cut is
+        temperature-gated: a printer above the plug's threshold is never cut."""
+        turn_off, mark = await self._resume_time_mode_pending(manager, nozzle=200.0)
+
+        turn_off.assert_not_awaited()
+        mark.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_resume_time_mode_pending_cut_fires_below_the_threshold(self, manager):
+        turn_off, mark = await self._resume_time_mode_pending(manager, nozzle=40.0)
+
+        turn_off.assert_awaited_once()
+        mark.assert_awaited_once_with(1)
+
+
+class TestTemperatureGatedOff:
+    """The ONE power-off-after-a-print path cuts on temperature, never on a timeout (S1).
+
+    The three queue copies used to wait at most 10 minutes for 50 °C and then cut the
+    plug whatever that wait answered. ``schedule_temp_based_off`` is the path every caller
+    takes now: the plug is cut only once every nozzle reads below the plug's threshold.
+    """
+
+    @pytest.fixture
+    def manager(self):
+        return SmartPlugManager()
+
+    @staticmethod
+    def _status(nozzle: float, nozzle_2: float | None = None):
+        temps = {"nozzle": nozzle}
+        if nozzle_2 is not None:
+            temps["nozzle_2"] = nozzle_2
+        status = MagicMock()
+        status.temperatures = temps
+        return status
+
+    @staticmethod
+    async def _run(manager, threshold: int, statuses):
+        """Drive ``_temp_based_off`` over a status sequence; sleeps advance instantly.
+
+        Returns the turn_off mock, the executed-mark mock, the printer_manager mock and
+        the number of polls taken. The last status repeats once the sequence runs out."""
+        polls = {"n": 0}
+        sequence = list(statuses)
+
+        def get_status(_printer_id):
+            polls["n"] += 1
+            return sequence[min(polls["n"] - 1, len(sequence) - 1)]
+
+        service = MagicMock()
+        service.turn_off = AsyncMock(return_value=True)
+        with (
+            patch("backend.app.services.smart_plug_manager.printer_manager") as pm,
+            patch("backend.app.services.smart_plug_manager.asyncio.sleep", new_callable=AsyncMock),
+            patch.object(manager, "get_service_for_plug", new_callable=AsyncMock, return_value=service),
+            patch.object(manager, "_mark_auto_off_executed", new_callable=AsyncMock) as mark,
+        ):
+            pm.get_status.side_effect = get_status
+            await manager._temp_based_off(1, "tasmota", "192.168.1.100", None, None, None, 7, threshold)
+        return service.turn_off, mark, pm, polls["n"]
+
+    @pytest.mark.asyncio
+    async def test_a_hot_printer_is_never_cut_at_ten_minutes(self, manager):
+        # 200 °C on every poll: the old copies cut at 600 s; the one path never cuts.
+        turn_off, mark, pm, polls = await self._run(manager, 70, [self._status(200.0)])
+
+        turn_off.assert_not_awaited()
+        mark.assert_not_awaited()
+        pm.mark_printer_offline.assert_not_called()
+        assert polls > 600 // 10  # it kept watching well past the old 10-minute cut
+
+    @pytest.mark.asyncio
+    async def test_a_second_nozzle_still_hot_keeps_the_power(self, manager):
+        turn_off, _mark, _pm, _polls = await self._run(manager, 70, [self._status(40.0, nozzle_2=180.0)])
+
+        turn_off.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_printer_below_the_threshold_is_cut(self, manager):
+        # Hot for three polls, then below the plug's 70 °C threshold: cut on that poll.
+        statuses = [self._status(200.0), self._status(120.0), self._status(75.0), self._status(65.0, nozzle_2=60.0)]
+        turn_off, mark, pm, polls = await self._run(manager, 70, statuses)
+
+        turn_off.assert_awaited_once()
+        mark.assert_awaited_once_with(1)
+        pm.mark_printer_offline.assert_called_once_with(7)
+        assert polls == 4
+
+    def test_schedule_uses_the_threshold_and_keeps_the_task(self, manager):
+        """The task is spawned through ``spawn_background_task`` and stored for cancellation."""
+        plug = MagicMock()
+        plug.id = 3
+        plug.name = "P"
+        plug.plug_type = "tasmota"
+        task = MagicMock()
+        with (
+            patch("backend.app.services.smart_plug_manager.spawn_background_task", return_value=task) as spawn,
+            patch.object(manager, "_temp_based_off", new=MagicMock(return_value="coro")) as body,
+            patch.object(manager, "_mark_auto_off_pending", new=MagicMock(return_value="pending-coro")),
+        ):
+            manager.schedule_temp_based_off(plug, 7, 45)
+
+        body.assert_called_once()
+        assert body.call_args.args[6:8] == (7, 45)
+        names = [c.kwargs.get("name") for c in spawn.call_args_list]
+        assert "plug-temp-off-3" in names
+        assert manager._pending_off[3] is task
+
+
+class TestPowerOffCallersDelegate:
+    """Every "power off after a print" caller routes to ``schedule_temp_based_off``.
+
+    The print_queue stop route and the ``main`` terminal are pinned beside their own tests
+    (``test_queue_stop_route.py``, ``test_print_queue_api.py``)."""
+
+    def test_no_module_keeps_its_own_cooldown_wait(self):
+        """Source pin: the deleted fixed-timeout wait has no caller and no definition left."""
+        import pathlib
+
+        app = pathlib.Path(__file__).resolve().parents[3] / "app"
+        offenders = [
+            str(path.relative_to(app)) for path in app.rglob("*.py") if "wait_for_cooldown" in path.read_text("utf-8")
+        ]
+        assert offenders == []
+
+    def test_the_manager_spawns_no_raw_task(self):
+        """Background work goes through ``core.tasks.spawn_background_task`` (the convention)."""
+        import ast
+        import pathlib
+
+        source = pathlib.Path(__file__).resolve().parents[3] / "app" / "services" / "smart_plug_manager.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        raw = [node.lineno for node in ast.walk(tree) if isinstance(node, ast.Attribute) and node.attr == "create_task"]
+        assert raw == []
+
+    @pytest.mark.asyncio
+    async def test_the_scheduler_routes_each_enabled_plug(self):
+        from backend.app.services.print_scheduler import PrintScheduler
+
+        scheduler = PrintScheduler()
+        on = MagicMock(enabled=True, off_temp_threshold=45)
+        off = MagicMock(enabled=False, off_temp_threshold=45)
+        item = MagicMock(auto_off_after=True, printer_id=7)
+        with (
+            patch.object(scheduler, "_get_smart_plugs", new_callable=AsyncMock, return_value=[on, off]),
+            patch("backend.app.services.print_scheduler.smart_plug_manager") as spm,
+        ):
+            await scheduler._power_off_if_needed(AsyncMock(), item)
+
+        spm.schedule_temp_based_off.assert_called_once_with(on, 7, 45)
+
+    @pytest.mark.asyncio
+    async def test_the_scheduler_routes_nothing_without_auto_off_after(self):
+        from backend.app.services.print_scheduler import PrintScheduler
+
+        scheduler = PrintScheduler()
+        item = MagicMock(auto_off_after=False, printer_id=7)
+        with (
+            patch.object(scheduler, "_get_smart_plugs", new_callable=AsyncMock) as plugs,
+            patch("backend.app.services.print_scheduler.smart_plug_manager") as spm,
+        ):
+            await scheduler._power_off_if_needed(AsyncMock(), item)
+
+        plugs.assert_not_awaited()
+        spm.schedule_temp_based_off.assert_not_called()

@@ -711,6 +711,14 @@ describe('PrintersPage', () => {
     it('still renders the chip for a fault kind', async () => {
       serveOne(heldPrinter, {
         open_incident: { id: 42, kind: 'jam', status: 'escalated', slot_desc: null, created_at: null, operator_exits: false, printer_messages: [] },
+        // The backend's chip verdict for that row (`services/hold_chip`).
+        hold_chip: {
+          variant: 'incident',
+          tone: 'held',
+          label: { key: 'printers.incident.jam', values: {} },
+          tooltip: [{ key: 'printers.incidentAction.jam', values: {} }],
+          qualifier: null,
+        },
       });
       render(<PrintersPage />);
 
@@ -967,122 +975,95 @@ describe('PrintersPage', () => {
     });
 
     /*
-     * The chip's tooltip names a person's exits only once they exist. While the
-     * farm still answers a plate check (re-check, stop-and-retry) there is no
-     * "Ignore and resume" on the card and the backend answers a press with 409,
-     * so the amber chip says what the farm is doing instead. The tooltip rides
-     * the chip's focusable InfoHint trigger (its accessible name is the
-     * tooltip), never a native `title` a keyboard user cannot reach.
+     * The hold chip is the BACKEND's verdict (`PrinterStatus.hold_chip`,
+     * `services/hold_chip`): which hold, its tone and its words — the card renders
+     * it and decides nothing (pinned in `test_hold_chip.py`). The tooltip rides the
+     * chip's focusable InfoHint trigger (its accessible name is the tooltip), never a
+     * native `title` a keyboard user cannot reach.
      */
-    it('names no exit on the plate-check chip while the farm is still acting', async () => {
-      serveStatus({ state: 'PAUSE', hms_errors: [], open_incident: heldBy('plate_vision', [], { status: 'recovering' }) });
+    const holdChipOf = (
+      label: string,
+      tooltip: Array<[string, Record<string, string>?]>,
+      overrides: { tone?: 'acting' | 'held'; variant?: 'incident' | 'toolhead'; qualifier?: string | null } = {},
+    ) => ({
+      variant: overrides.variant ?? 'incident',
+      tone: overrides.tone ?? 'held',
+      label: { key: label, values: {} },
+      tooltip: tooltip.map(([key, values]) => ({ key, values: values ?? {} })),
+      qualifier: overrides.qualifier ?? null,
+    });
+
+    it('renders the chip the backend decided: the noun on the pill, the tooltip on its trigger', async () => {
+      serveStatus({
+        state: 'PAUSE',
+        hms_errors: [],
+        open_incident: heldBy('plate_vision', [], { status: 'recovering' }),
+        hold_chip: holdChipOf('printers.incident.recovering', [['printers.incidentRecoveringAction.plate_vision']], {
+          tone: 'acting',
+        }),
+      });
       render(<PrintersPage />);
 
       expect(
         await screen.findByRole('button', { name: en.printers.incidentRecoveringAction.plate_vision }),
       ).toBeInTheDocument();
       expect(screen.getByText(en.printers.incident.recovering)).toBeInTheDocument();
-      expect(screen.queryByRole('button', { name: en.printers.incidentAction.plate_vision })).not.toBeInTheDocument();
     });
 
-    it("names the exits on the plate-check chip on the person's turn", async () => {
-      serveStatus({ state: 'PAUSE', hms_errors: [], open_incident: heldBy('plate_vision', [], { status: 'escalated' }) });
-      render(<PrintersPage />);
-
-      expect(
-        await screen.findByRole('button', { name: en.printers.incidentAction.plate_vision }),
-      ).toBeInTheDocument();
-      expect(screen.getByText(en.printers.incident.plate_vision)).toBeInTheDocument();
-      expect(
-        screen.queryByRole('button', { name: en.printers.incidentRecoveringAction.plate_vision }),
-      ).not.toBeInTheDocument();
-    });
-
-    // A runout row is `recovering` while it waits for the operator's refill, so
-    // its instruction is the point in both states, slot-qualified as before.
-    it.each(['recovering', 'escalated'] as const)(
-      "keeps a runout's slot-qualified instruction on the chip while %s",
-      async (status) => {
-        serveStatus({
-          state: 'PAUSE',
-          hms_errors: [],
-          open_incident: heldBy('runout', [], { status, slot_desc: 'AMS A slot 2' }),
-        });
-        render(<PrintersPage />);
-
-        expect(
-          await screen.findByRole('button', { name: `${en.printers.incidentAction.runout} — AMS A slot 2` }),
-        ).toBeInTheDocument();
-      },
-    );
-
-    /*
-     * The empty toolhead (operator requirement 2026-10-10: "when i click resume
-     * there MUST be filament loaded"). The card says "Toolhead empty" while the
-     * farm loads it, when a load failed — even under the jam row it ran on —
-     * and when a paused print sits on it with nothing open.
-     */
-    it('shows "Toolhead empty" with the slot the farm is loading', async () => {
+    it("ends the chip's tooltip with the slot qualifier the backend sent", async () => {
       serveStatus({
         state: 'PAUSE',
         hms_errors: [],
-        open_incident: heldBy('toolhead_refill', [], { status: 'recovering' }),
-        toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: { phase: 'loading', slot: 'AMS A slot 1', answer: null } },
+        open_incident: heldBy('runout', [], { status: 'recovering', slot_desc: 'AMS A slot 2' }),
+        hold_chip: holdChipOf('printers.incident.recovering', [['printers.incidentAction.runout']], {
+          tone: 'acting',
+          qualifier: 'AMS A slot 2',
+        }),
       });
       render(<PrintersPage />);
 
       expect(
-        await screen.findByRole('button', { name: en.printers.toolhead.loading.replace('{{slot}}', 'AMS A slot 1') }),
+        await screen.findByRole('button', { name: `${en.printers.incidentAction.runout} — AMS A slot 2` }),
       ).toBeInTheDocument();
-      expect(screen.getByText(en.printers.incident.toolhead_refill)).toBeInTheDocument();
     });
 
-    it('surfaces a failed refill under a jam row as "Toolhead empty"', async () => {
+    /*
+     * 001-H2S incident 574: a toolhead hold over a toolhead the wire reports FED
+     * reads "Resuming" while the farm resumes it — never "Toolhead empty".
+     */
+    it('renders "Resuming" with the feeding slot and the time the resume went out', async () => {
       serveStatus({
         state: 'PAUSE',
         hms_errors: [],
-        open_incident: heldBy('jam', [], { status: 'escalated', slot_desc: 'AMS A slot 3' }),
-        toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: { phase: 'failed', slot: 'AMS A slot 1', answer: 'no_movement' } },
+        open_incident: heldBy('toolhead_refill', [], { status: 'escalated' }),
+        toolhead: { feed: 'fed', active_tray: 1, was_feeding_tray: null },
+        hold_chip: holdChipOf(
+          'printers.toolhead.label.resuming',
+          [
+            ['printers.toolhead.fedFrom', { slot: 'AMS A slot 2' }],
+            ['printers.toolhead.resumeSent', { time: '23:43' }],
+          ],
+          { tone: 'acting' },
+        ),
       });
       render(<PrintersPage />);
 
       const tooltip = [
-        en.printers.toolhead.loadFailed.replace('{{slot}}', 'AMS A slot 1'),
-        en.printers.toolhead.answer.no_movement,
-        en.printers.incidentAction.toolhead_refill,
+        en.printers.toolhead.fedFrom.replace('{{slot}}', 'AMS A slot 2'),
+        en.printers.toolhead.resumeSent.replace('{{time}}', '23:43'),
       ].join(' ');
       expect(await screen.findByRole('button', { name: tooltip })).toBeInTheDocument();
-      expect(screen.getByText(en.printers.incident.toolhead_refill)).toBeInTheDocument();
-      expect(screen.queryByText(en.printers.incident.jam)).not.toBeInTheDocument();
+      expect(screen.getByText(en.printers.toolhead.label.resuming)).toBeInTheDocument();
+      expect(screen.queryByText(en.printers.incident.toolhead_refill)).not.toBeInTheDocument();
     });
 
-    it('shows "Toolhead empty" on a paused print when the resume verdict is owed', async () => {
-      serveStatus({
-        state: 'PAUSE',
-        hms_errors: [],
-        toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: null, refill_reason: 'owed' },
-      });
-      render(<PrintersPage />);
-
-      expect(await screen.findByRole('button', { name: en.printers.toolhead.reason.owed })).toBeInTheDocument();
-      expect(screen.getByText(en.printers.incident.toolhead_refill)).toBeInTheDocument();
-    });
-
-    /*
-     * 012-H2S 2026-10-10: PAUSEd at layer 0 at the plate-marker dialog, `tray_now`
-     * 255, no row — before the first layer the printer loads filament itself, so
-     * the card must not tell anyone to load a slot. Same for an older backend
-     * that sends no verdict.
-     */
-    it.each([
-      ['before the first layer (the 012-H2S shape)', { refill_reason: 'before_first_layer' }],
-      ['with no verdict from an older backend', {}],
-    ])('shows no "Toolhead empty" chip on a paused print %s', async (_label, verdict) => {
+    it('renders no chip when the backend sends none', async () => {
       serveStatus({
         state: 'PAUSE',
         layer_num: 0,
         hms_errors: [],
-        toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: null, ...verdict },
+        toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null },
+        hold_chip: null,
       });
       render(<PrintersPage />);
 
@@ -1177,7 +1158,17 @@ describe('PrintersPage', () => {
     it('offers no Ignore and resume while the backend reports no human turn', async () => {
       // The same escalated hold on the same paused print, but no exit on the
       // wire (e.g. the farm's own stop is in flight): the chip, not the button.
-      serveStatus(pausedAtPlateCheck(null));
+      serveStatus({
+        ...pausedAtPlateCheck(null),
+        // The backend's chip verdict for the escalated plate-check row (`services/hold_chip`).
+        hold_chip: {
+          variant: 'incident',
+          tone: 'held',
+          label: { key: 'printers.incident.plate_vision', values: {} },
+          tooltip: [{ key: 'printers.incidentAction.plate_vision', values: {} }],
+          qualifier: null,
+        },
+      });
       render(<PrintersPage />);
 
       await screen.findByText(en.printers.incident.plate_vision);

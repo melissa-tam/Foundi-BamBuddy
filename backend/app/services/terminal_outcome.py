@@ -36,6 +36,7 @@ from backend.app.services.farm_correlation import (
     OPERATOR_STOP_VERDICTS,
     REQUEUE_VERDICTS,
     STOP_SOURCE_RECONCILE_UNKNOWN,
+    STOP_VERDICT_AIR_STOP,
     STOP_VERDICT_PLATE_REFUSED,
     StopVerdict,
 )
@@ -100,8 +101,9 @@ for _occupancy_code in PLATE_CHECK_HMS_CODES:
 # The category for a stop a HUMAN attributed and the printer explained nothing about.
 USER_CANCELLED_CATEGORY = "User cancelled"
 
-# The category of a FINISH the farm records ``failed`` because the job printed layers with NOTHING
-# fed (:func:`_printed_without_filament`). A KEY, not an English label like the printer's categories
+# The category of a terminal the farm records ``failed`` because the job printed layers with NOTHING
+# fed (:func:`_printed_without_filament`): a FINISH that ran on air, or the farm's own stop of a print
+# it found on air (the ``air_stop`` verdict, operator ruling 2026-10-12). A KEY, not an English label like the printer's categories
 # above: the archive's and print log's ``failure_reason`` renders through the frontend's
 # ``editArchive.failureReasons`` copy, with the stored value as its own fallback (which is how the
 # legacy English categories still render), so this one is worded once per locale there. The
@@ -120,36 +122,47 @@ _STOP_RAW_STATUSES: frozenset[str] = frozenset({"failed", "aborted"})
 # another job); ``none`` = nothing is charged.
 ChargeBasis = Literal["full", "partial", "none"]
 
-# How far back the plate-check ladder looks for the farm's OTHER failed-re-check stops on the same
-# printer (operator ruling 2026-09-29: "if the retry's re-check fails too, escalate"). Read at the
-# ladder's second rung, where the retry-or-escalate decision is made ONCE (``pause_recovery``),
-# never at the terminal. Derived on 2026-09-04 (the first self-heal lane's
-# ``farm_policy._VISION_RECHECK_WINDOW_S``, recovered from b85a5f25^) from what the two ends of the
-# window have to separate: a retry re-dispatches within minutes (the requeued unit takes the next
-# scheduler tick, and its own start G-code IS the re-check), so an hour comfortably contains two
-# genuine consecutive failures; and an unrelated trip a shift later must NOT count as the second,
-# because "twice in a row" is the whole evidence for calling a plate occupied.
-PLATE_RECHECK_WINDOW_S = 3600.0
-
 # The plate-check ladder's stop-step NAMES on the episode's ledger. The retry-or-escalate decision is
 # made ONCE, at the ladder's second rung (``pause_recovery``), and RECORDED as the name of the stop
-# the farm sends (operator ruling 2026-10-05): ``retry_stop`` — the printer's first farm stop in the
-# window, on a farm unit, with nothing deposited: the same print is retried; ``deadline_stop`` — the
-# decision hold's window ran out with nobody pressing Ignore and resume or Stop: the plate is a
-# human's. The terminal reads the name back (:func:`farm_retries`) and never re-decides, so a stop
-# whose terminal lands after the window has aged cannot change its meaning. Declared here, beside
-# their one reader, because the writer (``pause_recovery``) imports this module.
+# the farm sends (operator ruling 2026-10-05): ``retry_stop`` — a farm unit, with nothing deposited,
+# that is not itself the retry of a plate the farm already stopped and retried (the lineage —
+# ``requeue.retries_a_plate_check_retry``; ruling 2026-09-29: "if the retry's re-check fails too,
+# escalate"), on a printer whose last plate-check stop was followed by a completed print (the
+# operator's "2 failures between a successful print"): the same print is retried; ``deadline_stop`` — the decision hold's window ran out with
+# nobody pressing Ignore and resume or Stop: the plate is a human's. The terminal reads the name back
+# (:func:`farm_retries`) and never re-decides. Declared here, beside their one reader, because the
+# writer (``pause_recovery``) imports this module.
 PlateCheckStopName = Literal["retry_stop", "deadline_stop"]
 PLATE_CHECK_RETRY_STOP: PlateCheckStopName = "retry_stop"
 PLATE_CHECK_DEADLINE_STOP: PlateCheckStopName = "deadline_stop"
 PLATE_CHECK_STOP_NAMES: frozenset[str] = frozenset(get_args(PlateCheckStopName))
+# The name every farm stop carried before 2026-10-05, when the ladder sent one stop and the terminal
+# decided by counting. Each was the second rung's stop, so a row written then reads as the retry rung's
+# (``pause_recovery._PlateCheckEvidence``); nothing writes it any more.
+PLATE_CHECK_LEGACY_STOP = "stop"
+# The retry rung's stop under every name it was ever written with — what the lineage reads off an
+# ancestor's episode (``requeue.retries_a_plate_check_retry``).
+PLATE_CHECK_RETRY_STOP_NAMES: frozenset[str] = frozenset({PLATE_CHECK_RETRY_STOP, PLATE_CHECK_LEGACY_STOP})
 
 # What the READ of a plate-check stop answered when the stop did NOT end the job: ``not_taken`` —
-# the job was still PAUSEd when the confirm budget ran out; ``not_sent`` — the raw stop never went
-# out. Either way the driver handed the paused print to a human (the FALLBACK), so a later end of
-# that job is the human's, never the farm's stop (:attr:`PlateCheckFacts.farm_stopped`).
+# the record answered it without the job ending by it (the printer refused it with its reason, a
+# person's command took over, or a reboot voided it when it was no longer owed; written before
+# 2026-10-11: the job still PAUSEd when a confirm window ran out); ``not_sent`` — the frame never went
+# out and the stop was no longer owed when the next session came. Either way the farm's stop did not
+# end that job, so a later end of it is the human's, never the farm's stop
+# (:attr:`PlateCheckFacts.farm_stopped`).
 PlateCheckStopNotTaken = Literal["not_taken", "not_sent"]
 PLATE_CHECK_STOP_NOT_TAKEN: frozenset[str] = frozenset(get_args(PlateCheckStopNotTaken))
+
+# What the record (``printer_action``) holds for the ACTION the episode's last farm stop was sent as:
+# ``outstanding`` while no event has answered it, else the record's answer token
+# (``command_outcome.Answer``'s values, spelled here because this module sits below the record; pinned
+# equal in ``test_terminal_outcome``). The farm's stop is one the record still holds open — its
+# self-heal bound may have passed (the ledger's ``unconfirmed``) and the job's terminal is the late
+# answer — or answered ``reached``. ``taken_over`` (a person's own Stop or resume), ``refused`` and
+# ``void`` did not end the job by the farm's hand.
+PlateCheckStopAction = Literal["outstanding", "reached", "refused", "void", "taken_over"]
+_FARM_STOP_ACTIONS: frozenset[str] = frozenset({"outstanding", "reached"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,19 +182,35 @@ class PlateCheckFacts:
     ``item_id`` — the farm unit the episode's ROW bound at its trip (by job identity, farm units
     only; ``None`` for a foreign print). The row's binding, not the terminal's correlation
     verdict: the decision was made over this row, so the retry it recorded is this unit's.
+
+    ``stop_action`` — what the record holds for that last stop's ACTION (:data:`PlateCheckStopAction`);
+    ``None`` when the step names no action (a ledger written before the record) — then its ledger
+    outcome speaks.
     """
 
     last_stop: tuple[str, str | None] | None
     item_id: int | None
+    stop_action: PlateCheckStopAction | None = None
 
     @property
     def farm_stopped(self) -> bool:
-        """Did the FARM's last stop end this job? True for a stop answered ``taken`` OR still
-        unanswered (the job's terminal usually lands while the driver is still watching for its
-        answer); False for one answered as NOT having ended the job
-        (:data:`PlateCheckStopNotTaken` — the driver then handed the paused print to a human),
-        and with no farm stop at all."""
-        return self.last_stop is not None and self.last_stop[1] not in PLATE_CHECK_STOP_NOT_TAKEN
+        """Did the FARM's last stop end this job?
+
+        Read through the stop's ACTION when the step names one (:attr:`stop_action`): outstanding or
+        ``reached`` is the farm's stop — the job's terminal usually lands while the driver still waits
+        for its answer, and a terminal after the stop's self-heal bound passed (the FALLBACK paged a
+        person) is still the farm's stop landing late, so a retry still requeues silently;
+        ``taken_over`` / ``refused`` / ``void`` is not — a person's own Stop after the fallback takes
+        the farm's stop over (``command_outcome``), so that unit escalates, as production did.
+
+        A step with no action reads its ledger outcome: ``taken`` or unanswered is the farm's; one
+        answered as NOT having ended the job (:data:`PlateCheckStopNotTaken` — the driver then handed
+        the paused print to a human) is not. No farm stop at all: False."""
+        if self.last_stop is None:
+            return False
+        if self.stop_action is not None:
+            return self.stop_action in _FARM_STOP_ACTIONS
+        return self.last_stop[1] not in PLATE_CHECK_STOP_NOT_TAKEN
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,15 +233,15 @@ class TerminalOutcome:
     read after the terminal's own closers have emptied it.
 
     ``failure_category`` — the archive's / print log's ``failure_reason``:
-    :data:`PRINTED_WITHOUT_FILAMENT_CATEGORY` for a FINISH recorded failed because the job
-    printed on air, else the printer's mapped category for a non-completed terminal whose
+    :data:`PRINTED_WITHOUT_FILAMENT_CATEGORY` for a terminal recorded failed because the job
+    printed on air (a FINISH that ran on it, or the farm's air stop), else the printer's mapped category for a non-completed terminal whose
     evidence carries one, "User cancelled" for an operator-attributed stop the printer
     explained nothing about, else None.
 
     ``printer_message`` — why a non-completed terminal ended, for the operator (the queue
     row's ``error_message``, the notification's ``{reason}``): the farm's measured sentence
-    for a FINISH that printed without filament first ("Printed without filament from layer
-    93 of 167"), then the printer's own words, rendered by the one HMS renderer; None when
+    for a job that printed without filament first ("Printed without filament from layer
+    93 of 167" — a FINISH on air, or the farm's air stop), then the printer's own words, rendered by the one HMS renderer; None when
     neither has anything to say.
 
     ``plate_refusal`` — set when the verdict is ``plate_refused`` and the refusal is
@@ -257,20 +286,37 @@ def _recorded_messages(incident: Mapping[str, object]) -> tuple[PrinterMessage, 
     return tuple(messages)
 
 
-def _printed_without_filament(raw_status: str, evidence: DepositEvidence, *, is_eject: bool) -> bool:
-    """Did the printer say FINISH over layers it printed with NOTHING fed (``JobExtent.printed_unfed``)?
+def _printed_without_filament(
+    raw_status: str, verdict: StopVerdict | None, evidence: DepositEvidence, *, is_eject: bool
+) -> bool:
+    """Did this job end over layers it printed with NOTHING fed?
 
-    The FINISH is the firmware reaching the end of its G-code, not filament reaching the plate: a job
-    resumed onto an empty toolhead runs to the end on air (011-H2S from layer 93 of 167, 014-H2S from
-    layer 9, 2026-10-09; the firmware does not reload on resume). An eject sweep and a dry run are
-    motion-only files, which feed nothing by design, so an empty extruder under them proves nothing.
+    * a FINISH over layers printed on air (``JobExtent.printed_unfed``): the FINISH is the firmware
+      reaching the end of its G-code, not filament reaching the plate — a job resumed onto an empty
+      toolhead runs to the end on air (011-H2S from layer 93 of 167, 014-H2S from layer 9, 2026-10-09;
+      the firmware does not reload on resume);
+    * the farm's own AIR stop (the ``air_stop`` verdict, any non-FINISH word): on PROOF of air — a layer
+      printed with nothing fed, the feed state's AIR — the farm stopped the ruined print (operator
+      ruling 2026-10-12: "printing on air = ruined print already"); the proof is the ledger's, so it
+      needs no ``first_unfed_layer`` on the payload to stand.
+
+    An eject sweep and a dry run are motion-only files, which feed nothing by design, so an empty
+    extruder under them proves nothing.
     """
-    return raw_status == "completed" and evidence.printed_unfed and not is_eject and not evidence.is_dry_run
+    if is_eject or evidence.is_dry_run:
+        return False
+    if verdict == STOP_VERDICT_AIR_STOP and raw_status != "completed":
+        return True
+    return raw_status == "completed" and evidence.printed_unfed
 
 
 def _printed_without_filament_sentence(evidence: DepositEvidence) -> str:
-    """The operator's sentence for :func:`_printed_without_filament` — the measured layer, and the
-    job's layer count when the slicer stated one."""
+    """The operator's sentence for :func:`_printed_without_filament` — the measured layer
+    (``first_unfed_layer``, off the terminal payload's peaks), and the job's layer count when the slicer
+    stated one. A payload that carries no measured layer (an air stop whose terminal the downtime
+    reconcile synthesised: it never carries the layer) says so without a number."""
+    if evidence.first_unfed_layer is None:
+        return "Printed without filament"
     total = f" of {evidence.total_layers}" if evidence.total_layers else ""
     return f"Printed without filament from layer {evidence.first_unfed_layer}{total}"
 
@@ -285,12 +331,16 @@ def _recorded_status(
 ) -> str:
     """The farm's word for this terminal. Every rewrite, with its reason, in one place.
 
-    * a FINISH that printed layers with nothing fed (:func:`_printed_without_filament`) → ``failed``,
+    * a job that printed layers with nothing fed (:func:`_printed_without_filament`) → ``failed``,
       a first article included: the part was not made past the unfed layer, so it is not a produced
       unit. It takes the ordinary failed disposition — the plate's one retry, the printer's
       consecutive-failure count, the plate gate of a deposit — instead of completing a unit and
-      charging the whole plate (011-H2S / 014-H2S, 2026-10-09). The only rewrite of a FINISH, so
-      first; an eject sweep and a dry run are excluded (motion-only).
+      charging the whole plate (011-H2S / 014-H2S, 2026-10-09). Two shapes: a FINISH that ran on air
+      (the only rewrite of a FINISH), and the farm's own AIR stop (the ``air_stop`` verdict, operator
+      ruling 2026-10-12 — whatever the printer called the stop, and whatever its echo; it is not a
+      requeue verdict, so it is never ``cancelled``). First, ahead of the no-deposit rule: an air stop
+      is a failed print, never "nothing happened". An eject sweep and a dry run are excluded
+      (motion-only).
     * a requeue verdict (``farm_correlation.REQUEUE_VERDICTS``) → ``cancelled``, a FIRST
       ARTICLE included. ``plate_refused``: the printer refused the plate; nothing was
       printed and nothing failed. ``fault_restart``: the farm stopped a job that had
@@ -315,7 +365,7 @@ def _recorded_status(
       holds, a human is paged, RESUME tops the deficit back up), and ONE word describes
       the terminal in the queue row, the archive and the page alike.
     """
-    if _printed_without_filament(raw_status, evidence, is_eject=is_eject):
+    if _printed_without_filament(raw_status, verdict, evidence, is_eject=is_eject):
         return "failed"
     if verdict in REQUEUE_VERDICTS and raw_status != "completed":
         return "cancelled"
@@ -378,8 +428,8 @@ def farm_retries(plate_check: PlateCheckFacts | None, *, evidence: DepositEviden
 
     The plate-check ladder (operator rulings 2026-09-29 and 2026-10-05): the farm presses the
     printer's own "Problem solved, resume"; when that re-check fails the ladder decides ONCE —
-    the printer's first farm stop in :data:`PLATE_RECHECK_WINDOW_S`, on a farm unit, with
-    nothing deposited, is a retry, sent as :data:`PLATE_CHECK_RETRY_STOP`; anything else leaves
+    a farm unit with nothing deposited that is not itself the retry of a plate the farm already
+    stopped and retried is a retry, sent as :data:`PLATE_CHECK_RETRY_STOP`; anything else leaves
     the print paused for a human's decision, and a window that runs out ends it with
     :data:`PLATE_CHECK_DEADLINE_STOP`. This only reads the recorded decision back. A refused
     plate is retried only when every one of these holds:
@@ -389,8 +439,9 @@ def farm_retries(plate_check: PlateCheckFacts | None, *, evidence: DepositEviden
       (no farm stop at all) and a job the printer ended by itself ESCALATE: a human who stepped
       in owns the plate they stepped in on, and a window nobody answered is the ruling's
       escalation;
-    * that stop ENDED the job (:attr:`PlateCheckFacts.farm_stopped`: taken, or not yet
-      answered). A stop answered as not taken handed the print to a human;
+    * that stop ENDED the job (:attr:`PlateCheckFacts.farm_stopped`: its action reached, or still
+      outstanding — however late its terminal lands). A stop a person's command took over, or the
+      printer refused, handed the print to a human;
     * the episode's row bound a FARM unit (``item_id``): a foreign print has nothing to requeue;
     * nothing was deposited (``not evidence.deposited``): a stop that left material on the
       plate is a plate a human must clear, whatever the decision said.
@@ -453,9 +504,10 @@ def build_terminal_outcome(
 
     recorded_status = _recorded_status(raw_status, verdict, evidence, first_article=first_article, is_eject=is_eject)
     ended_without_part = recorded_status != "completed"
-    # A FINISH recorded failed for printing on air: the measured layer IS the failure's cause, ahead
-    # of whatever the printer's codes say (they describe the fault before the resume, not the air).
-    printed_without_filament = _printed_without_filament(raw_status, evidence, is_eject=is_eject)
+    # A job recorded failed for printing on air (a FINISH that ran on it, or the farm's air stop): the
+    # measured layer IS the failure's cause, ahead of whatever the printer's codes say (they describe
+    # the fault before the air, not the air).
+    printed_without_filament = _printed_without_filament(raw_status, verdict, evidence, is_eject=is_eject)
 
     category: str | None = None
     if printed_without_filament:

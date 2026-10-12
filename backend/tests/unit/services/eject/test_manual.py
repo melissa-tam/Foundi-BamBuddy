@@ -129,7 +129,7 @@ def _claim_eject(printer_id, pending):
 
 def _releasable():
     """The unit carries a usable eject profile — the monitor's eligibility read."""
-    return patch.object(manual, "_unit_releasable", AsyncMock(return_value=True))
+    return patch.object(manual.eject_remote, "unit_releasable", AsyncMock(return_value=True))
 
 
 def _line_at(line_c: float | None, *, margin_c: float = 2.0):
@@ -280,10 +280,6 @@ class TestManualEjectPreconditions:
         lease = plate_occupancy.claim_for_dispatch(
             printer.id,
             77,
-            pre_state="FINISH",
-            pre_subtask=None,
-            min_hold_s=600.0,
-            max_hold_s=900.0,
             ev=Evidence(live_state="FINISH"),
         )
         assert plate_occupancy.commit_dispatch(printer.id, lease) is None
@@ -1285,10 +1281,6 @@ class TestManualEjectDeclareOccupied:
             lease = plate_occupancy.claim_for_dispatch(
                 printer.id,
                 77,
-                pre_state="FINISH",
-                pre_subtask=None,
-                min_hold_s=60.0,
-                max_hold_s=180.0,
                 ev=Evidence(live_state="FINISH"),
             )
             c1, c2 = _connected(_state("FINISH", bed=25.0))

@@ -325,17 +325,27 @@ async def apply_spool_to_slot_via_mqtt(
             "printer" if printer_kp else "stored",
         )
 
-    setting_ok = client.ams_set_filament_setting(
-        ams_id=ams_id,
-        tray_id=tray_id,
-        tray_info_idx=effective_tray_info_idx,
-        tray_type=identity.tray_type,
-        tray_sub_brands=identity.tray_sub_brands,
-        tray_color=identity.tray_color,
-        nozzle_temp_min=identity.nozzle_temp_min,
-        nozzle_temp_max=identity.nozzle_temp_max,
-        setting_id=effective_setting_id,
-    )
+    from backend.app.services import printer_action
+
+    actor = printer_action.ACTOR_OPERATOR if current_user is not None else printer_action.ACTOR_FARM
+    setting_ok = (
+        await printer_action.send(
+            printer_id,
+            printer_action.filament_setting(
+                ams_id,
+                tray_id,
+                tray_info_idx=effective_tray_info_idx,
+                tray_type=identity.tray_type,
+                tray_sub_brands=identity.tray_sub_brands,
+                tray_color=identity.tray_color,
+                nozzle_temp_min=identity.nozzle_temp_min,
+                nozzle_temp_max=identity.nozzle_temp_max,
+                setting_id=effective_setting_id,
+            ),
+            actor=actor,
+            client=client,
+        )
+    ).published
     if not setting_ok:
         # The filament-setting write was refused (AMS identifying/drying, or offline).
         # Do NOT proceed to extrusion_cali_sel or persist a slot-preset row for a
@@ -365,12 +375,17 @@ async def apply_spool_to_slot_via_mqtt(
             cali_filament_id = normalize_slicer_filament(matching_kp.setting_id)[0] or matching_kp.setting_id
         else:
             cali_filament_id = spool.slicer_filament or effective_tray_info_idx
-        client.extrusion_cali_sel(
-            ams_id=ams_id,
-            tray_id=tray_id,
-            cali_idx=matching_kp.cali_idx,
-            filament_id=cali_filament_id,
-            nozzle_diameter=nozzle_diameter,
+        await printer_action.send(
+            printer_id,
+            printer_action.cali_sel(
+                ams_id,
+                tray_id,
+                cali_idx=matching_kp.cali_idx,
+                filament_id=cali_filament_id,
+                nozzle_diameter=nozzle_diameter,
+            ),
+            actor=actor,
+            client=client,
         )
     else:
         # No stored K-profile for this spool — always reset the slot to Default
@@ -380,12 +395,13 @@ async def apply_spool_to_slot_via_mqtt(
         # documented "no specific profile" value (see BambuClient.extrusion_cali_sel
         # docstring).
         cali_filament_id = spool.slicer_filament or effective_tray_info_idx
-        client.extrusion_cali_sel(
-            ams_id=ams_id,
-            tray_id=tray_id,
-            cali_idx=-1,
-            filament_id=cali_filament_id,
-            nozzle_diameter=nozzle_diameter,
+        await printer_action.send(
+            printer_id,
+            printer_action.cali_sel(
+                ams_id, tray_id, cali_idx=-1, filament_id=cali_filament_id, nozzle_diameter=nozzle_diameter
+            ),
+            actor=actor,
+            client=client,
         )
         logger.info(
             "No stored K-profile for spool %d — reset slot to Default K (cali_idx=-1)",

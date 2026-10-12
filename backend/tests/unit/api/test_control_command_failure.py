@@ -18,6 +18,7 @@ import backend.app.api.routes.webhook as webhook_mod
 from backend.app.api.routes.printers import pause_print, stop_print
 from backend.app.models.printer import Printer
 from backend.app.services.printer_manager import printer_manager
+from backend.tests._fixtures.printer_action import route_verbs
 
 pytestmark = pytest.mark.asyncio
 
@@ -65,7 +66,7 @@ class TestWebhookStop502:
             patch.object(webhook_mod, "check_permission", MagicMock()),
             patch.object(webhook_mod, "check_printer_access", MagicMock()),
             patch.object(printer_manager, "get_status", MagicMock(return_value=connected_running)),
-            patch.object(printer_manager, "stop_print", MagicMock(return_value=False)),
+            route_verbs(stop=MagicMock(return_value=False)),
             pytest.raises(HTTPException) as ei,
         ):
             await webhook_mod.webhook_stop_print(printer_id=1, api_key=MagicMock())
@@ -78,7 +79,7 @@ class TestWebhookStop502:
             patch.object(webhook_mod, "check_permission", MagicMock()),
             patch.object(webhook_mod, "check_printer_access", MagicMock()),
             patch.object(printer_manager, "get_status", MagicMock(return_value=connected_running)),
-            patch.object(printer_manager, "stop_print", MagicMock(return_value=True)),
+            route_verbs(stop=MagicMock(return_value=True)),
         ):
             result = await webhook_mod.webhook_stop_print(printer_id=1, api_key=MagicMock())
         assert result == {"message": "Print stopped"}

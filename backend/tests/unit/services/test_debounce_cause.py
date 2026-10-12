@@ -635,7 +635,9 @@ async def test_a_row_the_operator_lane_retired_is_never_de_bounced_onto_its_own_
     db_session.add(SpoolAssignment(spool_id=departed.id, printer_id=printer.id, ams_id=0, tray_id=3))
     await db_session.commit()
 
-    successor = await spool_tagless._replace_row_after_cycle(db_session, printer.id, 0, 3, {"id": 3, **_PETG}, departed)
+    successor = (
+        await spool_tagless._replace_row_after_cycle(db_session, printer.id, 0, 3, {"id": 3, **_PETG}, departed)
+    ).spool
     await db_session.refresh(departed)
 
     assert successor.id != departed.id

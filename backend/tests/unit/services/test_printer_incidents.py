@@ -1592,6 +1592,8 @@ class TestNoCloserEndsADeclaredHold:
         state.state = "IDLE"
         state.subtask_id = ""
         state.hms_errors = []
+        state.connected = True
+        state.report_epoch = state.connection_epoch  # the printer's live report
         monkeypatch.setattr(spool_recovery.printer_manager, "get_status", lambda _pid: state)
         monkeypatch.setattr(spool_recovery.printer_manager, "is_connected", lambda _pid: True)
         return state
@@ -1651,15 +1653,16 @@ class TestNoCloserEndsADeclaredHold:
 
     async def test_spool_recovery_wire_clear_sweep(self, db_session, printer_factory, monkeypatch):
         """Connected, positive, no actionable fault IS the normal reading of a printer
-        somebody is working on. Swept twice, past the dwell, so a survival cannot be a
-        close merely deferred."""
+        somebody is working on. Swept on the printer's LIVE report after its session start, twice,
+        so a survival cannot be a close merely deferred."""
         from backend.app.services import spool_recovery
 
         printer, _ = await self._held(db_session, printer_factory)
-        self._wire_idle(monkeypatch)
+        state = self._wire_idle(monkeypatch)
+        spool_recovery._session_evaluated[printer.id] = state.connection_epoch
 
-        assert await spool_recovery.sweep_open_incidents(now=0.0) == 0
-        assert await spool_recovery.sweep_open_incidents(now=spool_recovery._HOLD_OVER_DWELL_S + 1) == 0
+        assert await spool_recovery.sweep_open_incidents() == 0
+        assert await spool_recovery.sweep_open_incidents() == 0
 
         await self._still_open(db_session, printer.id)
 
@@ -1671,7 +1674,7 @@ class TestNoCloserEndsADeclaredHold:
         printer, _ = await self._held(db_session, printer_factory)
         self._wire_idle(monkeypatch)
 
-        assert await spool_recovery.rearm_incidents_on_startup() == 0
+        assert await spool_recovery.reevaluate_session(printer.id) == 0
 
         await self._still_open(db_session, printer.id)
 
@@ -2041,17 +2044,18 @@ class _PlateStep:
     name: str
     outcome: str | None
     at: datetime | None
+    action_id: int | None = None
 
     _OUTCOMES = frozenset({"success", "fail"})
 
     @classmethod
-    def draft(cls, kind: str, name: str) -> "_PlateStep":
-        return cls(seq=0, kind=kind, name=name, outcome=None, at=None)
+    def draft(cls, kind: str, name: str, *, action_id: int | None = None) -> "_PlateStep":
+        return cls(seq=0, kind=kind, name=name, outcome=None, at=None, action_id=action_id)
 
     def entry(self) -> printer_incidents.StepEntry:
-        return printer_incidents.StepEntry(kind=self.kind, name=self.name)
+        return printer_incidents.StepEntry(kind=self.kind, name=self.name, action_id=self.action_id)
 
-    def sent(self, seq: int, at: datetime) -> "_PlateStep":
+    def sent(self, seq: int, at: datetime | None) -> "_PlateStep":
         return replace(self, seq=seq, at=at)
 
     def answered(self, outcome: str) -> "_PlateStep":
@@ -2067,7 +2071,9 @@ class _PlateLog(printer_incidents.EvidenceLog[_PlateStep]):
     def _step_of(cls, row) -> _PlateStep:
         if row.kind not in ("dialog", "stop"):
             raise LookupError(f"not a plate-check step: {row.kind!r}")
-        return _PlateStep(seq=row.seq, kind=row.kind, name=row.name, outcome=row.outcome, at=row.sent_at)
+        return _PlateStep(
+            seq=row.seq, kind=row.kind, name=row.name, outcome=row.outcome, at=row.sent_at, action_id=row.action_id
+        )
 
 
 class TestEvidenceLog:
@@ -2092,9 +2098,11 @@ class TestEvidenceLog:
         log = await _PlateLog.from_row(db_session, incident_id)
         assert log.steps == [] and not log.has_step("dialog")
 
-        pressed = await log.note(_PlateStep.draft("dialog", "PROBLEM_SOLVED_RESUME"))
+        press = await _action(db_session, incident_id, "dialog_press")
+        stop = await _action(db_session, incident_id, "stop")
+        pressed = await log.note(_PlateStep.draft("dialog", "PROBLEM_SOLVED_RESUME", action_id=press))
         await log.answer(pressed, "fail")
-        stopped = await log.note(_PlateStep.draft("stop", "stop"))
+        stopped = await log.note(_PlateStep.draft("stop", "stop", action_id=stop))
 
         assert (pressed, stopped) == (1, 2)
         assert [(s.seq, s.kind, s.outcome) for s in log.steps] == [(1, "dialog", "fail"), (2, "stop", None)]
@@ -2151,79 +2159,57 @@ class TestEvidenceLog:
             printer_incidents.EvidenceLog(incident_id=1)
 
 
-class TestCountRowsWithStep:
-    """``count_rows_with_step`` — the store read behind the plate-check verdict's
-    "other episodes the farm already stopped in the window"."""
+class TestUnitStoppedWith:
+    """``unit_stopped_with`` — the store read behind the plate-check ladder's lineage question (2026-10-11,
+    replacing the 60-minute window's count): did the farm send a stop of these names on an episode bound
+    to this unit? Open and closed rows alike — an episode is read by what the farm SENT in it."""
 
     @staticmethod
-    async def _episode(db, printer_id, *, job_id, steps=(), created_at=None, kind=KIND_PLATE_VISION):
-        """One CLOSED row of ``kind`` carrying ``steps`` (closed, so the next can open)."""
-        row = await _open(db, printer_id, kind=kind, job_id=job_id, code="0500_808C", codes=f"{kind}:{job_id}")
-        for seq, step_kind in enumerate(steps, start=1):
-            await printer_incidents.note_step(db, row.id, seq=seq, kind=step_kind, name=step_kind)
-        if created_at is not None:
-            row.created_at = created_at
-            await db.commit()
-        await printer_incidents.close(db, row.id, status=STATUS_RESOLVED, source="terminal")
+    async def _episode(db, printer_id, *, item_id, steps=(), kind=KIND_PLATE_VISION, close=True):
+        row = await _open(
+            db,
+            printer_id,
+            kind=kind,
+            job_id=f"JOB-{item_id}",
+            item_id=item_id,
+            code="0500_808C",
+            codes=f"{kind}:{item_id}",
+        )
+        for seq, (step_kind, name) in enumerate(steps, start=1):
+            await printer_incidents.note_step(db, row.id, seq=seq, kind=step_kind, name=name)
+        if close:
+            await printer_incidents.close(db, row.id, status=STATUS_RESOLVED, source="terminal")
         return row
 
-    async def _count(self, db, printer_id, *, since, exclude_job_id="JOB-NOW", kind=KIND_PLATE_VISION):
-        return await printer_incidents.count_rows_with_step(
-            db, printer_id=printer_id, kind=kind, step_kind="stop", since=since, exclude_job_id=exclude_job_id
+    @staticmethod
+    async def _stopped(db, item_id, *, kind=KIND_PLATE_VISION, names=("retry_stop", "stop")):
+        return await printer_incidents.unit_stopped_with(db, item_id, kind=kind, step_kind="stop", names=names)
+
+    async def test_a_named_farm_stop_on_the_units_episode_counts(self, db_session, printer_factory):
+        printer = await printer_factory()
+        await self._episode(
+            db_session, printer.id, item_id=11, steps=(("dialog", "PROBLEM_SOLVED_RESUME"), ("stop", "retry_stop"))
         )
+        await self._episode(db_session, printer.id, item_id=12, steps=(("dialog", "PROBLEM_SOLVED_RESUME"),))
+        await self._episode(db_session, printer.id, item_id=13, steps=(("stop", "deadline_stop"),))
+        await self._episode(db_session, printer.id, item_id=14, steps=(("stop", "stop"),))  # pre-2026-10-05
 
-    async def test_counts_only_the_rows_holding_the_step(self, db_session, printer_factory):
-        from datetime import datetime, timedelta
+        assert await self._stopped(db_session, 11) is True
+        assert await self._stopped(db_session, 12) is False  # the re-check passed: no farm stop
+        assert await self._stopped(db_session, 13) is False  # the decision hold's stop is not the retry's
+        assert await self._stopped(db_session, 14) is True
+        assert await self._stopped(db_session, 99) is False  # no episode at all
+        assert await self._stopped(db_session, 11, names=()) is False
 
-        printer = await printer_factory()
-        since = datetime.utcnow() - timedelta(hours=1)
-        await self._episode(db_session, printer.id, job_id="JOB-1", steps=("dialog", "stop"))
-        await self._episode(db_session, printer.id, job_id="JOB-2", steps=("dialog",))  # the re-check passed
-        await self._episode(db_session, printer.id, job_id="JOB-3", steps=())  # an operator's own stop
-        await self._episode(db_session, printer.id, job_id="JOB-4", steps=("stop", "stop"))  # counted ONCE
-
-        assert await self._count(db_session, printer.id, since=since) == 2
-
-    async def test_excludes_the_given_job_by_the_held_job_rule(self, db_session, printer_factory):
-        from datetime import datetime, timedelta
-
-        printer = await printer_factory()
-        since = datetime.utcnow() - timedelta(hours=1)
-        await self._episode(db_session, printer.id, job_id="JOB-NOW", steps=("dialog", "stop"))
-        await self._episode(db_session, printer.id, job_id="", steps=("stop",))
-
-        assert await self._count(db_session, printer.id, since=since, exclude_job_id="JOB-NOW") == 1
-        # An id-less episode IS the id-less job, "" and "0" alike — never "another" one.
-        assert await self._count(db_session, printer.id, since=since, exclude_job_id="0") == 1
-        assert await self._count(db_session, printer.id, since=since, exclude_job_id=None) == 1
-        assert await self._count(db_session, printer.id, since=since, exclude_job_id="JOB-OTHER") == 2
-
-    async def test_respects_since_the_printer_and_the_kind(self, db_session, printer_factory):
-        from datetime import datetime, timedelta
-
+    async def test_it_reads_the_kind_and_open_rows_too(self, db_session, printer_factory):
         printer = await printer_factory()
         other = await printer_factory()
-        now = datetime.utcnow()
-        since = now - timedelta(hours=1)
-        await self._episode(
-            db_session, printer.id, job_id="JOB-OLD", steps=("stop",), created_at=now - timedelta(hours=2)
-        )
-        await self._episode(db_session, printer.id, job_id="JOB-EDGE", steps=("stop",), created_at=since)
-        await self._episode(db_session, other.id, job_id="JOB-ELSEWHERE", steps=("stop",))
-        await self._episode(db_session, printer.id, job_id="JOB-JAM", steps=("stop",), kind=KIND_JAM)
+        await self._episode(db_session, printer.id, item_id=21, steps=(("stop", "retry_stop"),), kind=KIND_JAM)
+        await self._episode(db_session, other.id, item_id=22, steps=(("stop", "retry_stop"),), close=False)
 
-        assert await self._count(db_session, printer.id, since=since) == 1  # the edge row: at-or-after
-        assert await self._count(db_session, printer.id, since=since, kind=KIND_JAM) == 1
-        assert await self._count(db_session, other.id, since=since) == 1
-
-    async def test_an_open_episode_counts_by_what_the_farm_sent(self, db_session, printer_factory):
-        from datetime import datetime, timedelta
-
-        printer = await printer_factory()
-        row = await _open(db_session, printer.id, kind=KIND_PLATE_VISION, job_id="JOB-OPEN", code="0500_808C")
-        await printer_incidents.note_step(db_session, row.id, seq=1, kind="stop", name="stop")
-
-        assert await self._count(db_session, printer.id, since=datetime.utcnow() - timedelta(hours=1)) == 1
+        assert await self._stopped(db_session, 21) is False
+        assert await self._stopped(db_session, 21, kind=KIND_JAM) is True
+        assert await self._stopped(db_session, 22) is True
 
 
 class TestTheRestartStopProjection:
@@ -2424,7 +2410,7 @@ class TestTheRefillProjection:
         row = await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:0700_8010", status=STATUS_ESCALATED)
         assert printer_incidents.snapshot(printer.id)["failed_command"] is None
 
-        await printer_incidents.note_step(db_session, row.id, seq=1, kind=STEP_KIND_COMMAND, name="load", target=1)
+        await _command(db_session, row.id, seq=1, name="load", target=1)
         await printer_incidents.answer_step(db_session, row.id, 1, outcome="no_movement")
         assert printer_incidents.snapshot(printer.id)["failed_command"] == {
             "incident_id": row.id,
@@ -2434,12 +2420,12 @@ class TestTheRefillProjection:
             "answer": "no_movement",
         }
 
-        await printer_incidents.note_step(db_session, row.id, seq=2, kind=STEP_KIND_COMMAND, name="load", target=1)
+        await _command(db_session, row.id, seq=2, name="load", target=1)
         await printer_incidents.answer_step(db_session, row.id, 2, outcome="complete")
         assert printer_incidents.snapshot(printer.id)["failed_command"] is None  # the last one reached it
 
         printer_incidents._reset_state()  # a restart re-derives it from the table
-        await printer_incidents.note_step(db_session, row.id, seq=3, kind=STEP_KIND_COMMAND, name="unload")
+        await _command(db_session, row.id, seq=3, name="unload")
         await printer_incidents.answer_step(db_session, row.id, 3, outcome="acted")
         await printer_incidents.rehydrate(db_session)
         assert printer_incidents.snapshot(printer.id)["failed_command"]["answer"] == "acted"
@@ -2464,7 +2450,7 @@ class TestTheRefillProjection:
     async def test_a_load_in_flight_on_an_ams_row_is_loading_that_slot(self, db_session, printer_factory):
         printer = await printer_factory()
         row = await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:0700_8010", status=STATUS_ESCALATED)
-        await printer_incidents.note_step(db_session, row.id, seq=1, kind=STEP_KIND_COMMAND, name="load", target=6)
+        await _command(db_session, row.id, seq=1, name="load", target=6)
         printer_incidents.register_driver(printer.id, _LiveTask(), incident_id=row.id)
 
         assert printer_incidents.refill_state(printer.id) == {
@@ -2477,7 +2463,7 @@ class TestTheRefillProjection:
     async def test_a_failed_refill_names_the_slot_and_the_answer(self, db_session, printer_factory):
         printer = await printer_factory()
         row = await self._refill_row(db_session, printer.id, status=STATUS_ESCALATED)
-        await printer_incidents.note_step(db_session, row.id, seq=1, kind=STEP_KIND_COMMAND, name="load", target=0)
+        await _command(db_session, row.id, seq=1, name="load", target=0)
         await printer_incidents.answer_step(db_session, row.id, 1, outcome="no_movement")
 
         assert printer_incidents.refill_state(printer.id) == {
@@ -2492,7 +2478,7 @@ class TestTheRefillProjection:
         the failed step's own name; an unload names no target, so the slot is the row's."""
         printer = await printer_factory()
         row = await self._refill_row(db_session, printer.id, status=STATUS_ESCALATED)
-        await printer_incidents.note_step(db_session, row.id, seq=1, kind=STEP_KIND_COMMAND, name="unload")
+        await _command(db_session, row.id, seq=1, name="unload")
         await printer_incidents.answer_step(db_session, row.id, 1, outcome="acted")
 
         assert printer_incidents.refill_state(printer.id) == {
@@ -2503,6 +2489,57 @@ class TestTheRefillProjection:
         }
 
 
+async def _action(db_session, incident_id, command, *, target=None, entry=None, actor="farm", answer=None) -> int:
+    """One ``printer_action`` row on ``incident_id`` (outstanding unless ``answer``), the projection
+    re-derived as the record's own write does (``printer_incidents.rederive_actions``)."""
+    from backend.app.models.printer_action import PrinterAction
+    from backend.app.models.printer_incident import PrinterIncident
+
+    incident = await db_session.get(PrinterIncident, incident_id)
+    now = datetime.utcnow()
+    row = PrinterAction(
+        printer_id=incident.printer_id,
+        actor=actor,
+        command=command,
+        target=target,
+        entry=entry,
+        incident_id=incident_id,
+        sent_at=now,
+        answer=answer,
+        answered_at=now if answer is not None else None,
+    )
+    db_session.add(row)
+    await db_session.commit()
+    await printer_incidents.rederive_actions(db_session, incident_id)
+    return row.id
+
+
+async def _answer_action(db_session, incident_id, action_id, answer) -> None:
+    from backend.app.models.printer_action import PrinterAction
+
+    row = await db_session.get(PrinterAction, action_id)
+    row.answer = answer
+    row.answered_at = datetime.utcnow()
+    await db_session.commit()
+    await printer_incidents.rederive_actions(db_session, incident_id)
+
+
+async def _command(db_session, incident_id, *, seq, name, target=None, feeder=None, entry=None) -> int:
+    """A farm motion command as the AMS driver sends it: the action first, then the step naming it."""
+    action_id = await _action(db_session, incident_id, name, target=target, entry=entry)
+    await printer_incidents.note_step(
+        db_session,
+        incident_id,
+        seq=seq,
+        kind=STEP_KIND_COMMAND,
+        name=name,
+        target=target,
+        feeder=feeder,
+        action_id=action_id,
+    )
+    return action_id
+
+
 class _LiveTask:
     """A driver task that is still running (``driver_live`` asks ``done()``)."""
 
@@ -2511,12 +2548,11 @@ class _LiveTask:
 
 
 class TestThePendingCommandProjection:
-    """``pending_command`` on the open-row projection (K11, 011/014-H2S 2026-10-09/10): the row's
-    LAST motion command step, answered ``held`` (the AMS acknowledged it and has not run it) or not
-    answered at all (sent, never read). A projection of the step ledger for the DB-free readers —
-    the per-push detector, the closers' ``Context``, the driver's stand-aside — never a column: the
-    ledger's one writer re-derives it at the send and the read, ``rehydrate`` after a restart, and
-    every re-projection of the row keeps it."""
+    """``pending_command`` on the open-row projection (K11, 011/014-H2S 2026-10-09/10): the row's LAST
+    farm AMS motion ACTION while the record holds it outstanding (``printer_action``: no event has
+    answered it). A projection of the RECORD for the DB-free readers — the closers' ``Context``, the
+    driver's stand-aside, the refill verdict — never a column: re-derived at every action's send and
+    answer (``rederive_actions``), by ``rehydrate`` after a restart, and kept by every re-projection."""
 
     @staticmethod
     async def _jam(db_session, printer_factory):
@@ -2530,64 +2566,83 @@ class TestThePendingCommandProjection:
         assert printer_incidents.snapshot(printer_id)["pending_command"] is None
         assert printer_incidents.pending_command(printer_id) is None
 
-    async def test_it_follows_the_one_writer_at_the_send_and_the_read(self, db_session, printer_factory):
+    async def test_it_follows_the_record_until_an_event_answers(self, db_session, printer_factory):
         printer_id, row_id = await self._jam(db_session, printer_factory)
 
-        await printer_incidents.note_step(
-            db_session, row_id, seq=1, kind=STEP_KIND_COMMAND, name="unload", target=None, feeder="jammed"
-        )
+        unload = await _command(db_session, row_id, seq=1, name="unload", feeder="jammed", entry="assist_loaded")
         pending = printer_incidents.pending_command(printer_id)
-        assert pending is not None
-        assert (pending.incident_id, pending.seq, pending.name, pending.target, pending.feeder) == (
+        assert (pending.incident_id, pending.action_id, pending.seq, pending.name, pending.target) == (
             row_id,
+            unload,
             1,
             "unload",
             None,
-            "jammed",
         )
+        assert pending.loaded_at_send is True
         assert isinstance(pending.sent_at, datetime)
 
+        # The driver's step reading ``held`` is no answer: the record still holds it outstanding.
         await printer_incidents.answer_step(db_session, row_id, 1, outcome=printer_incidents.COMMAND_HELD)
-        assert printer_incidents.pending_command(printer_id) == pending  # held: accepted, not run
+        assert printer_incidents.pending_command(printer_id) == pending
 
-        await printer_incidents.answer_step(db_session, row_id, 1, outcome="complete")
-        assert printer_incidents.pending_command(printer_id) is None  # it ran
+        await _answer_action(db_session, row_id, unload, "reached")  # the AMS ran it
+        assert printer_incidents.pending_command(printer_id) is None
 
-        await printer_incidents.note_step(db_session, row_id, seq=2, kind=STEP_KIND_COMMAND, name="load", target=2)
+        load = await _command(db_session, row_id, seq=2, name="load", target=2, entry="assist_empty")
         assert printer_incidents.pending_command(printer_id).name == "load"
-        await printer_incidents.answer_step(db_session, row_id, 2, outcome="no_movement")
-        assert printer_incidents.pending_command(printer_id) is None  # answered: nothing is queued
+        await _answer_action(db_session, row_id, load, "void")  # a reboot emptied the AMS's queue
+        assert printer_incidents.pending_command(printer_id) is None
 
-    async def test_only_the_last_command_counts_and_no_other_kind_pends(self, db_session, printer_factory):
+    async def test_a_re_derivation_that_read_before_the_answer_was_written_never_resurrects_it(
+        self, db_session, printer_factory
+    ):
+        """The record answers an action IN MEMORY first (``project_action_answer``, the same stretch as the
+        event) and writes it in a spawned task. A re-derivation whose read ran before that write — a step
+        note landing just after an operator's command took the farm's unload over — reads the action
+        unanswered; it must not resurrect it as pending (the abort then kept the row open on a command
+        nobody holds). Once a re-derivation reads the answer persisted, the overlay drops it."""
         printer_id, row_id = await self._jam(db_session, printer_factory)
-        await printer_incidents.note_step(db_session, row_id, seq=1, kind=STEP_KIND_COMMAND, name="unload")
-        await printer_incidents.answer_step(db_session, row_id, 1, outcome=printer_incidents.COMMAND_HELD)
-        await printer_incidents.note_step(db_session, row_id, seq=2, kind=STEP_KIND_COMMAND, name="unload")
-        await printer_incidents.answer_step(db_session, row_id, 2, outcome="complete")
-        # A lever (sent, never read) is no motion command: it never pends.
-        await printer_incidents.note_step(db_session, row_id, seq=3, kind=STEP_KIND_LEVER, name="resume")
+        unload = await _command(db_session, row_id, seq=1, name="unload", feeder="jammed", entry="assist_loaded")
+        assert printer_incidents.pending_command(printer_id) is not None
+
+        printer_incidents.project_action_answer(printer_id, row_id, unload, "taken_over", "an operator AMS command")
+        await printer_incidents.rederive_actions(db_session, row_id)  # the DB still reads it unanswered
+
+        assert printer_incidents.pending_command(printer_id) is None
+        (action,) = printer_incidents.farm_actions(printer_id, row_id)
+        assert action.answer == "taken_over"
+
+        await _answer_action(db_session, row_id, unload, "taken_over")  # the record's write lands
+        assert unload not in printer_incidents._projected_answers
+        assert printer_incidents.pending_command(printer_id) is None
+
+    async def test_only_the_last_farm_motion_pends(self, db_session, printer_factory):
+        printer_id, row_id = await self._jam(db_session, printer_factory)
+        await _action(db_session, row_id, "unload")
+        await _action(db_session, row_id, "unload", answer="reached")
+        # Neither a release lever (no motion) nor an operator's command is the FARM's pending motion.
+        await _action(db_session, row_id, "resume")
+        await _action(db_session, row_id, "load", target=1, actor="operator")
 
         assert printer_incidents.pending_command(printer_id) is None
 
-    async def test_rehydrate_derives_it_from_the_ledger(self, db_session, printer_factory):
+    async def test_rehydrate_derives_it_from_the_record(self, db_session, printer_factory):
         pending_printer, pending_row = await self._jam(db_session, printer_factory)
         quiet_printer, quiet_row = await self._jam(db_session, printer_factory)
-        await printer_incidents.note_step(
-            db_session, pending_row, seq=1, kind=STEP_KIND_COMMAND, name="load", target=3, feeder="empty"
-        )
-        await printer_incidents.note_step(db_session, quiet_row, seq=1, kind=STEP_KIND_COMMAND, name="unload")
-        await printer_incidents.answer_step(db_session, quiet_row, 1, outcome="complete")
-        printer_incidents._reset_state()  # a restart: the projection is gone, the ledger is not
+        await _action(db_session, pending_row, "load", target=3, entry="idle_empty")
+        await _action(db_session, quiet_row, "unload", answer="reached")
+        printer_incidents._reset_state()  # a restart: the projection is gone, the record is not
 
         assert await printer_incidents.rehydrate(db_session) == 2
 
         rehydrated = printer_incidents.pending_command(pending_printer)
         assert (rehydrated.incident_id, rehydrated.name, rehydrated.target) == (pending_row, "load", 3)
+        assert rehydrated.loaded_at_send is False
         assert printer_incidents.pending_command(quiet_printer) is None
 
     async def test_a_re_projection_keeps_it(self, db_session, printer_factory):
         printer_id, row_id = await self._jam(db_session, printer_factory)
-        await printer_incidents.note_step(db_session, row_id, seq=1, kind=STEP_KIND_COMMAND, name="unload")
+        await _action(db_session, row_id, "unload")
 
         await printer_incidents.mark_escalated(db_session, row_id)
         assert printer_incidents.pending_command(printer_id) is not None
@@ -2598,41 +2653,69 @@ class TestThePendingCommandProjection:
 
     async def test_it_is_scoped_to_the_row_asked_about(self, db_session, printer_factory):
         printer_id, row_id = await self._jam(db_session, printer_factory)
-        await printer_incidents.note_step(db_session, row_id, seq=1, kind=STEP_KIND_COMMAND, name="unload")
+        await _action(db_session, row_id, "unload")
 
         assert printer_incidents.pending_command(printer_id, incident_id=row_id) is not None
         assert printer_incidents.pending_command(printer_id, incident_id=row_id + 99) is None
         assert printer_incidents.pending_command(None) is None
+
+    async def test_the_farms_actions_on_the_hold_are_a_projection_too(self, db_session, printer_factory):
+        """ "What has the farm already done on this hold" — every farm action and its answer."""
+        printer_id, row_id = await self._jam(db_session, printer_factory)
+        resume = await _action(db_session, row_id, "resume", answer="reached")
+        await _action(db_session, row_id, "load", target=1, actor="operator")
+
+        (action,) = printer_incidents.farm_actions(printer_id, row_id)
+        assert (action.action_id, action.command, action.answer) == (resume, "resume", "reached")
+
+    async def test_a_command_with_no_echo_by_design_is_never_outstanding(self):
+        """A NULL answer is "awaiting the printer" only for a command the printer answers: a no-echo
+        command (``command_outcome.CommandSpec.echoes`` False — the airduct, a G-code line, the print
+        speed) keeps its NULL forever, which means nothing will ever answer it."""
+        from backend.app.services import command_outcome
+
+        no_echo = sorted(name for name, spec in command_outcome.COMMANDS.items() if not spec.echoes)
+        assert no_echo == ["gcode_line", "print_speed", "set_airduct"]
+
+        def _farm(command: str, answer: str | None) -> printer_incidents.FarmAction:
+            return printer_incidents.FarmAction(
+                action_id=1, command=command, target=None, answer=answer, sent_at=None, answered_at=None
+            )
+
+        assert [_farm(command, None).outstanding for command in no_echo] == [False, False, False]
+        assert _farm("resume", None).outstanding is True
+        assert _farm("resume", "reached").outstanding is False
 
     async def test_the_projection_is_json_primitives(self, db_session, printer_factory):
         """The WS lane dumps the projection with a bare ``json.dumps``."""
         import json
 
         printer_id, row_id = await self._jam(db_session, printer_factory)
-        await printer_incidents.note_step(db_session, row_id, seq=1, kind=STEP_KIND_COMMAND, name="load", target=1)
+        await _action(db_session, row_id, "load", target=1)
 
         json.dumps(printer_incidents.snapshot(printer_id))
 
-    async def test_the_held_token_is_the_classifiers_own(self):
-        """One spelling of ``held``: the store may not import ``ams_command`` (it imports this
-        module), so the token it reads is pinned into the classifier's answer vocabulary."""
+    async def test_the_tokens_are_the_records_own(self):
+        """One spelling: the store may not import the record (it sits below it), so its actor and
+        motion tokens and the driver's ``held`` step reading are pinned into their owners'."""
         from typing import get_args
 
-        from backend.app.services import ams_command
+        from backend.app.services import command_outcome
 
-        assert printer_incidents.COMMAND_HELD in get_args(ams_command.Answer)
+        assert printer_incidents._FARM_ACTOR == command_outcome.ACTOR_FARM
+        assert frozenset(get_args(command_outcome.MotionCommand)) == printer_incidents._MOTION_COMMANDS
+        assert printer_incidents.COMMAND_HELD in get_args(command_outcome.MotionReading)
         assert printer_incidents.command_pends(None) and printer_incidents.command_pends("held")
 
     async def test_the_failed_answers_are_the_classifiers_own(self):
         """The chip's ``failed`` phase reads these tokens off the ledger; they are the classifier's."""
         from typing import get_args
 
-        from backend.app.services import ams_command
+        from backend.app.services import command_outcome
 
-        assert set(get_args(ams_command.Answer)) >= printer_incidents.COMMAND_FAILED_ANSWERS == {"acted", "no_movement"}
-        assert not any(
-            printer_incidents.command_pends(answer) for answer in get_args(ams_command.Answer) if answer != "held"
-        )
+        readings = get_args(command_outcome.MotionReading)
+        assert set(readings) >= printer_incidents.COMMAND_FAILED_ANSWERS == {"acted", "no_movement"}
+        assert not any(printer_incidents.command_pends(answer) for answer in readings if answer != "held")
 
 
 def _paused_at_plate(*, subtask="task-1", print_error=0x0500808C, state="PAUSE"):

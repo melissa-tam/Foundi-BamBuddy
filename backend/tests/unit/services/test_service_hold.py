@@ -46,6 +46,7 @@ from backend.app.services.plate_occupancy import (
     TerminalDisposition,
     plate_occupancy,
 )
+from backend.tests._fixtures.printer_action import publish_at_once
 
 pytestmark = pytest.mark.asyncio
 
@@ -94,11 +95,11 @@ class _SpyClient:
         self.gcode: list[str] = []
         self.fans: list[tuple[int, int]] = []
 
-    def send_gcode(self, text: str) -> bool:
+    def send_gcode(self, text: str, *, sequence_id=None) -> bool:
         self.gcode.append(text)
         return True
 
-    def set_fan_percent(self, fan: int, percent: int) -> bool:
+    def set_fan_percent(self, fan: int, percent: int, *, sequence_id=None) -> bool:
         self.fans.append((fan, percent))
         return True
 
@@ -135,7 +136,7 @@ class _FakeManager:
         tests, and a double that omitted it would make ``enter`` fail on a socket."""
         return None
 
-    def stop_print(self, printer_id: int) -> bool:
+    def stop_print(self, printer_id: int, *, sequence_id=None) -> bool:
         self.stopped.append(printer_id)
         return True
 
@@ -150,7 +151,6 @@ def _watch_settings() -> CooldownWatchSettings:
     return CooldownWatchSettings(
         stall_window_s=0,
         stall_epsilon_c=1.0,
-        max_hold_s=0,
         plateau_eject_margin_c=3.0,
         aux_fan_enabled=True,
         aux_fan_percent=100,
@@ -249,10 +249,6 @@ class TestEnterOpensTheHold:
         lease = plate_occupancy.claim_for_dispatch(
             printer.id,
             unit_id=1857,
-            pre_state="IDLE",
-            pre_subtask=None,
-            min_hold_s=0.0,
-            max_hold_s=0.0,
             ev=Evidence(live_state="IDLE"),
         )
 
@@ -291,6 +287,8 @@ class TestEnteringKeepsTheCooldown:
         manager = _FakeManager(client)
         monkeypatch.setattr(cooldown_prep, "printer_manager", manager)
         monkeypatch.setattr(monitor_mod, "printer_manager", manager)
+        # The record (``printer_action``) is a collaborator here, tested on its own.
+        publish_at_once(monkeypatch, manager.get_client)
 
         async def _releasable(queue_item_id, *, for_first_article=False):
             return True
@@ -306,7 +304,7 @@ class TestEnteringKeepsTheCooldown:
         async def _never_releases(printer_id, threshold, **kwargs):
             await asyncio.Event().wait()  # the bed never reaches the line in this test
 
-        monkeypatch.setattr(monitor_mod, "_unit_releasable", _releasable)
+        monkeypatch.setattr(monitor_mod.eject_remote, "unit_releasable", _releasable)
         monkeypatch.setattr(monitor_mod.shop_air, "arm_line", _arm_line)
         monkeypatch.setattr(monitor_mod, "_resolve_stall_settings", _settings)
         monkeypatch.setattr(monitor_mod, "watch_bed_and_clear", _never_releases)
@@ -369,6 +367,72 @@ class TestEnteringKeepsTheCooldown:
         )
         assert client.fans == published_while_connected, "nothing may be published after the client is dropped"
 
+    async def test_the_stand_down_awaits_the_watchs_own_end_inside_its_bound(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """Slow retirement: a retiring watch whose ``finally`` takes many loop turns is waited for to its
+        end — the watch's own end is the event, and the teardown never returns while it is still retiring
+        inside ``_STAND_DOWN_WAIT_S``."""
+        printer = await printer_factory()
+        _fake_spawns(monkeypatch)
+        turns: list[int] = []
+
+        async def slow_retirement():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                for turn in range(200):  # a long, finite retirement
+                    turns.append(turn)
+                    await asyncio.sleep(0)
+                raise
+
+        retiring = asyncio.create_task(slow_retirement())
+        await asyncio.sleep(0)
+        monkeypatch.setattr(eject_cooldown_monitor, "stand_down", lambda pid, cause: (retiring.cancel(), retiring)[1])
+
+        await service_hold.quiesce_for_teardown(printer.id, cause="deactivate")
+
+        assert retiring.done()
+        assert len(turns) == 200
+
+    async def test_a_watch_that_never_retires_costs_a_warning_and_the_quiesce_still_runs(
+        self, db_session, printer_factory, monkeypatch, caplog
+    ):
+        """Restored 2026-10-12 (Raymond: "if it was self heal, it should stay self heal"): production waited
+        at most ``_STAND_DOWN_WAIT_S`` (10 s) for the cancelled watch's ``finally`` — which publishes through
+        the DB — then WARNed and quiesced. A watch that will not retire never holds the deactivate hostage.
+        The bound is shortened here only so the test does not sleep 10 s; its production value is pinned in
+        ``test_code_quality``."""
+        printer = await printer_factory()
+        _fake_spawns(monkeypatch)
+        lease = plate_occupancy.claim_for_dispatch(printer.id, unit_id=1858, ev=Evidence(live_state="IDLE"))
+        release = asyncio.Event()
+
+        async def stuck_retirement():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()  # its ``finally`` never finishes on its own (a stuck DB publish)
+
+        retiring = asyncio.create_task(stuck_retirement())
+        await asyncio.sleep(0)
+        monkeypatch.setattr(eject_cooldown_monitor, "stand_down", lambda pid, cause: (retiring.cancel(), retiring)[1])
+        monkeypatch.setattr(service_hold, "_STAND_DOWN_WAIT_S", 0.05)
+
+        try:
+            with caplog.at_level(logging.WARNING, logger=service_hold.__name__):
+                report = await asyncio.wait_for(
+                    service_hold.quiesce_for_teardown(printer.id, cause="deactivate"), timeout=5
+                )
+            assert not retiring.done(), "the stand-down returned on its bound, not on the watch's end"
+            assert "the plate watch did not retire within" in caplog.text
+            # LIVENESS: the quiesce after the bound still ran.
+            assert report.lease_revoked is True
+            assert plate_occupancy.commit_dispatch(printer.id, lease) == "lease_revoked"
+        finally:
+            release.set()
+            await asyncio.wait({retiring})
+
     async def test_the_teardown_verb_still_runs_the_whole_quiesce(self, db_session, printer_factory, monkeypatch):
         """It is the quiesce PLUS the watch, never a second sequence of its own."""
         printer = await printer_factory()
@@ -376,10 +440,6 @@ class TestEnteringKeepsTheCooldown:
         lease = plate_occupancy.claim_for_dispatch(
             printer.id,
             unit_id=1856,
-            pre_state="IDLE",
-            pre_subtask=None,
-            min_hold_s=0.0,
-            max_hold_s=0.0,
             ev=Evidence(live_state="IDLE"),
         )
 
@@ -544,10 +604,6 @@ class TestQuiesceRevokesTheLease:
         lease = plate_occupancy.claim_for_dispatch(
             printer.id,
             unit_id=1855,
-            pre_state="IDLE",
-            pre_subtask=None,
-            min_hold_s=0.0,
-            max_hold_s=0.0,
             ev=Evidence(live_state="IDLE"),
         )
 
@@ -571,10 +627,6 @@ class TestQuiesceNeverRaises:
         lease = plate_occupancy.claim_for_dispatch(
             printer.id,
             unit_id=1,
-            pre_state="IDLE",
-            pre_subtask=None,
-            min_hold_s=0.0,
-            max_hold_s=0.0,
             ev=Evidence(live_state="IDLE"),
         )
 

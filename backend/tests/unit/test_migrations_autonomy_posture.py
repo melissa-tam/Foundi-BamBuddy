@@ -57,9 +57,7 @@ async def _insert_provider(conn, name: str, *, succeeded: int = 1, self_healed: 
 async def _toggles(conn, name: str) -> dict[str, int]:
     cols = ", ".join((*_SUCCESS_COLUMNS, _FAILURE_COLUMN))
     row = (
-        await conn.execute(
-            text(f"SELECT {cols} FROM notification_providers WHERE name = :n"), {"n": name}
-        )
+        await conn.execute(text(f"SELECT {cols} FROM notification_providers WHERE name = :n"), {"n": name})
     ).fetchone()
     return dict(zip((*_SUCCESS_COLUMNS, _FAILURE_COLUMN), row, strict=True))
 
@@ -137,16 +135,12 @@ async def test_second_pass_is_a_no_op_on_a_row_created_after_the_flip(engine):
 @pytest.mark.parametrize("stored", ["true", "false"])
 async def test_deletes_the_retired_auto_add_untagged_row(engine, stored):
     async with engine.begin() as conn:
-        await conn.execute(
-            text("INSERT INTO settings (key, value) VALUES ('auto_add_untagged', :v)"), {"v": stored}
-        )
+        await conn.execute(text("INSERT INTO settings (key, value) VALUES ('auto_add_untagged', :v)"), {"v": stored})
     async with engine.begin() as conn:
         await run_migrations(conn)
 
     async with engine.connect() as conn:
-        remaining = (
-            await conn.execute(text("SELECT value FROM settings WHERE key = 'auto_add_untagged'"))
-        ).scalar()
+        remaining = (await conn.execute(text("SELECT value FROM settings WHERE key = 'auto_add_untagged'"))).scalar()
     assert remaining is None
 
 
@@ -159,8 +153,6 @@ def test_no_reader_of_the_retired_key_survives():
 
     services = pathlib.Path("backend/app/services")
     offenders = [
-        p.name
-        for p in services.glob("*.py")
-        if "auto_add_untagged" in p.read_text(encoding="utf-8", errors="replace")
+        p.name for p in services.glob("*.py") if "auto_add_untagged" in p.read_text(encoding="utf-8", errors="replace")
     ]
     assert offenders == []

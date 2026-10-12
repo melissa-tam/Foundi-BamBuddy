@@ -66,20 +66,34 @@ else — a partial push with no parseable state, an unknown dialect code (H2C id
 report ``state=0``), a state-9 slot still asserting a filament type — reads UNKNOWN and
 derives NO edge. So an H2C never reads as phantom spools, and silence about a slot is
 never mistaken for an empty one.
+
+The commanded read's self-heal bound (2026-10-12, Raymond: "if it was self heal, it should stay
+self heal"): events answer a read first (the identify-ended edge, its flap settling back, the
+record refusing or voiding it, a new session); a read none answers within ``_IDENTIFY_SELF_HEAL``
+(30 s of the printer's ONLINE time since the command, read through ``printer_action.bound_due``)
+concludes there as production's answered no-tag read, and an echo flag whose flap never began
+within that bound expires. Process memory and its rehydrate story: ``_read_pending`` (with each
+read's record-clock anchor) and ``_echo_pending`` (now a record-clock anchor) are lost on a
+restart like every edge map here — a new process has commanded no read, and the first batch after
+the restart only seeds the presence map, so no echo is owed and nothing waits on a bound; across
+a reconnect the new session's first fresh report retires the printer's pending reads
+(``note_session_start``).
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime
 from typing import TYPE_CHECKING, NamedTuple
 
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from backend.app.core.websocket import ws_manager
-from backend.app.services import hms_errors
+from backend.app.services import hms_errors, printer_action
 from backend.app.services.bambu_mqtt import AMS_STATUS_IDENTIFYING, TRAY_PRESENT_STATES, filament_engaged
+from backend.app.services.command_outcome import Answer
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.spool_tag_matcher import is_valid_tag
 from backend.app.services.tray_fields import encode_global_tray, parse_int_field, tray_identity_asserted
@@ -88,15 +102,60 @@ from backend.app.services.tray_observation import TrayObservation, observation_t
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from backend.app.services.bambu_mqtt import BambuMQTTClient
+    from backend.app.services.printer_events import ActionAnswered
+
 logger = logging.getLogger(__name__)
 
-# An identify cycle runs ≤~25 s, so an ``_echo_pending`` flag fresher than this
-# means the commanded identify is (or may still be) in flight — used by
-# :func:`identify_in_flight` and the terminal sweep's command-time skip to keep at
-# most one identify per slot running. This is DELIBERATELY tighter than
-# ``_ECHO_PENDING_STALE_S`` (120): that value is only a GC bound for a command lost
-# to a race, not a statement that an identify is still active.
-_IDENTIFY_ACTIVE_S = 30
+
+class _PendingRead(NamedTuple):
+    """A commanded read still owed its answer: when it was commanded (monotonic, the edge maps' clock),
+    its record id, and the command's instant on the record's clock (``printer_action.now``) — the anchor
+    its self-heal bound counts the printer's ONLINE seconds from."""
+
+    at: float
+    action_id: int | None
+    sent_at: datetime
+
+
+# The self-heal bound on a commanded read's ANSWER (2026-10-12, Raymond: "if it was self heal, it
+# should stay self heal"). Every event exit below comes first; when none has answered the read after
+# this many ONLINE seconds since the command (``printer_action.bound_due`` — offline time is never
+# counted), the read CONCLUDES, and with no tag landed by then it is production's answer: an ANSWERED
+# NO-TAG read (:func:`read_answered_no_tag`). It ends the WAIT for an answer and nothing else — it
+# decides no identity (doctrine rule 6 / invariant 6): "no tag after a full identify cycle" is the
+# answer production concluded on, and a tag landing later still re-stamps ``_slot_read_at`` and
+# displaces whatever that answer let the farm conclude (the identity tier outranks it, invariant 11).
+# Not sent as the action's own bound: the record answers an ``ams_get_rfid`` on its ACK (ACK_ONLY), a
+# second after the send, while the READ — the identify cycle — is still running, so the bound is read
+# through :func:`printer_action.bound_due` from the command's instant instead.
+_IDENTIFY_SELF_HEAL = printer_action.SelfHealBound(
+    "_IDENTIFY_SELF_HEAL",
+    30.0,
+    "production _IDENTIFY_ACTIVE_S: a 30 s hard bound on a commanded identify; an identify cycle runs "
+    "~10-20 s (the tray flap it produces); production's no-tag answer floor _NO_TAG_ANSWER_SETTLE_S was 15 s",
+)
+
+# A commanded identify is IN FLIGHT from its command until the read ANSWERS (2026-10-11: a slow
+# identify answered after 30 s used to read as a human reseat, and its feed-fault clear put a jammed
+# roll back in rotation). The answer is the read's own, the first of: the unit observed identifying
+# after the command (``_identifying_seen_at``) and then NOT identifying (``_identify_ended_at`` — the
+# read cycle ended, tag or no tag); the slot's own identify flap settling back (a presence gain whose
+# absence began after the command — ``on_tray_observations``). Read by :func:`identify_in_flight`, the
+# terminal sweep's command-time skip, the no-tag answer and the echo/cause records below.
+# A read that never ran its identify — the firmware REFUSED it (a fail ACK) or never received it
+# (the record VOIDS it: a later session began unacknowledged) — has no identify to end: the record's
+# answer to the ``ams_get_rfid`` action retires it (:func:`on_action_answered`).
+# A read no event answers by :data:`_IDENTIFY_SELF_HEAL` concludes there (:func:`_conclude_overdue_reads`,
+# on every status push; :func:`identify_in_flight` reads it concluded from the bound's first second, so
+# no consumer waits on a push), so it can never freeze autoconfig, harmonise, re-check, the terminal
+# sweep and the no-tag conclusion until a reconnect.
+# (printer_id, ams_id, tray_id) -> the pending read.
+_read_pending: dict[tuple[int, int, int], _PendingRead] = {}
+
+# printer_id -> time.monotonic() at which the unit was first observed NOT identifying after it was
+# seen identifying: the identify-ended EDGE every pending read of the printer is answered by.
+_identify_ended_at: dict[int, float] = {}
 
 # --- Module-level edge state (matches the fork's other event-edge bookkeeping,
 #     e.g. farm_staging._tray_signatures). Lost on restart; startup priming and
@@ -210,17 +269,19 @@ _swept_subtasks: dict[int, str] = {}
 # command's echo and swallowed exactly once. It is NOT a time-suppression window:
 # empty slots never arm (see record_recheck_read), so a real insertion made right after
 # a print ends is never eaten; only the identify echo is.
-_echo_pending: dict[tuple[int, int, int], float] = {}
+# (printer_id, ams_id, tray_id) -> the command's instant on the record's clock (``printer_action.now``).
+_echo_pending: dict[tuple[int, int, int], datetime] = {}
 
-# Echo-consume window == the identify-cycle bound (_IDENTIFY_ACTIVE_S). Within this
-# window a presence GAIN on a slot we just re-read is the firmware's identify flap
-# settling back and is swallowed; BEYOND it a gain is a REAL physical event (a
-# genuine pull+reseat), so the flag is GC'd and the gain acts normally — including
-# its feed-fault clear. The old 120 s value swallowed a real reseat made 30–120 s
-# after a re-read together with its feed-fault clear; that was a defect (F3).
-# Suppresses nothing by itself — an expired flag reads as no flag. A code constant,
-# not operator-tunable, like _IDENTIFY_ACTIVE_S above.
-_ECHO_PENDING_STALE_S = 30.0
+# The echo flag's events come first: the next presence GAIN on the slot consumes it (the identify flap
+# settling back), and the read ANSWERING with the slot reading present drops it (the identify ran and
+# flapped nothing). A real pull+reseat after the answer therefore acts normally, feed-fault clear
+# included (F3). Behind the events, production's ``_ECHO_PENDING_STALE_S`` meaning on the read's own
+# bound (2026-10-12): an echo whose flap never BEGAN within :data:`_IDENTIFY_SELF_HEAL` of the command
+# (the slot never went absent under the identify) is an echo that never came, and it no longer swallows
+# the next real edge (:func:`_echo_swallows`). A flap that DID begin under the identify keeps its echo
+# however late it settles back — the event (the absence the identify caused, captured at its loss edge
+# in ``_absent_under_identify``) outranks the bound, so a slow identify's settle-back never reads as a
+# human reseat and never clears a jammed roll back into rotation.
 
 # (printer_id, ams_id, tray_id) -> time.monotonic() of the last genuine presence GAIN
 # (echoes and the first-push seed excluded). NON-consuming: read by
@@ -316,13 +377,18 @@ _identifying_seen_at: dict[int, float] = {}
 # ``clear_on_reinsert`` both depend on.
 _running_edge_at: dict[int, float] = {}
 
-# How long after a print-start RUNNING edge an AMS presence edge is still attributable
-# to the engage transient. A CAUSE window (like ``_IDENTIFY_ACTIVE_S`` and
-# ``_ECHO_PENDING_STALE_S``), not a duration filter on the gain itself: outside it the
-# edge is judged exactly as before, and inside it nothing but the print start is
-# claimed. Doctrine rule 6 forbids a timer that decides IDENTITY — this decides
-# CAUSATION, which is the distinction the whole suppression tier rests on.
+# NAMED EXCEPTION to the plan's rule (2026-10-11: an outcome is decided only by an event; a clock only
+# pages) — how long after a print-start RUNNING edge an AMS presence edge is still attributed to the
+# engage transient. It attributes only the CAUSE of a presence edge at a print start: the action tiers
+# that assume a human moved a roll are withheld, presence itself still updates (invariant 3). No wire
+# event reports the transient's end — the feed state's START_BLOCK bounds a far longer interval
+# (heating, levelling, purge) and would withhold a person's genuine top-up swap, whose explained gain
+# the de-bounce would then read as spurious (the shape 31/32 identity class rule 7's amendment exists
+# for). It decides no printer outcome. Doctrine rule 6 forbids a timer that decides IDENTITY — this
+# decides CAUSATION. The one measurement behind it: one double-tray phantom coinciding with a print
+# start to the second (2026-08-07 15:12:03).
 _RUNNING_EDGE_TRANSIENT_S = 10.0
+
 
 # (printer_id, ams_id, tray_id) -> time.monotonic() of the last "this slot's owed
 # discovery read is still blocked" WARNING. An owed read defers QUIETLY by design
@@ -353,6 +419,9 @@ def _reset_state() -> None:
     _primed.clear()
     _swept_subtasks.clear()
     _echo_pending.clear()
+    _read_pending.clear()
+    _running_edge_at.clear()
+    _identify_ended_at.clear()
     _gain_at.clear()
     _physical_cycle_at.clear()
     _slot_read_at.clear()
@@ -363,7 +432,6 @@ def _reset_state() -> None:
     _no_tag_answer_closed.clear()
     _commanded_read_at.clear()
     _identifying_seen_at.clear()
-    _running_edge_at.clear()
 
 
 # --- Tray / state predicates ----------------------------------------------
@@ -472,7 +540,7 @@ def record_recheck_read(printer_id: int, ams_id: int, tray_id: int) -> None:
     """
     tray = _find_tray(printer_id, ams_id, tray_id)
     if tray is not None and _tray_present(tray):
-        _echo_pending[(printer_id, ams_id, tray_id)] = time.monotonic()
+        _echo_pending[(printer_id, ams_id, tray_id)] = printer_action.now()
 
 
 def live_tray(printer_id: int, ams_id: int, tray_id: int) -> dict | None:
@@ -486,13 +554,137 @@ def live_tray(printer_id: int, ams_id: int, tray_id: int) -> dict | None:
 
 
 def identify_in_flight(printer_id: int, ams_id: int, tray_id: int) -> bool:
-    """True while a commanded identify may still be running on this slot, or the
-    AMS unit is actively identifying any tray. Read-only (never pops the flag)."""
+    """True while a read we commanded on this slot has not ANSWERED (:func:`_read_in_flight` — the unit
+    observed identifying after the command and then not, its flap settling back, the record refusing or
+    voiding it, or its self-heal bound :data:`_IDENTIFY_SELF_HEAL` passing), or the AMS unit is
+    identifying any tray right now. Events first; the bound only ends the wait. Read-only."""
     state = printer_manager.get_status(printer_id)
     if getattr(state, "ams_status_main", 0) == AMS_STATUS_IDENTIFYING:
         return True
-    ts = _echo_pending.get((printer_id, ams_id, tray_id))
-    return ts is not None and time.monotonic() - ts < _IDENTIFY_ACTIVE_S
+    return _read_in_flight((printer_id, ams_id, tray_id))
+
+
+def _read_overdue(printer_id: int, read: _PendingRead) -> bool:
+    """Has the read's self-heal bound passed — :data:`_IDENTIFY_SELF_HEAL` of the printer's ONLINE seconds
+    since its command, counted by the record (``printer_action.bound_due``)?"""
+    return printer_action.bound_due(printer_id, _IDENTIFY_SELF_HEAL, read.sent_at)
+
+
+def _read_in_flight(key: tuple[int, int, int]) -> bool:
+    """A read we commanded on this slot is still owed its answer: pending, and its bound not passed (a
+    pending read past its bound has concluded — :func:`_conclude_overdue_reads` retires it on the next
+    push)."""
+    read = _read_pending.get(key)
+    return read is not None and not _read_overdue(key[0], read)
+
+
+def note_session_start(printer_id: int) -> None:
+    """A new MQTT session's first fresh report (``session_start``): the farm lost sight of the AMS across
+    the gap, so every read it commanded before is answered by what the new session reports — a read
+    still running shows as ``AMS_STATUS_IDENTIFYING`` on that report (:func:`identify_in_flight`'s live
+    arm). Retires the printer's pending reads; the echo flags and cause records stay (the settle-back
+    flap still consumes them). Pure in-memory, never raises."""
+    for key in [k for k in _read_pending if k[0] == printer_id]:
+        _read_pending.pop(key, None)
+
+
+def note_identify_activity(printer_id: int, identifying: bool) -> None:
+    """Sample the unit's identify flag on one STATUS push (the hub subscriber in
+    ``printer_event_wiring``, every push), and answer the reads it ended.
+
+    ``identifying`` stamps :data:`_identifying_seen_at` (a cause that outlives the instant, for the
+    gain qualifier). Not identifying after it was seen identifying is the identify-ended EDGE
+    (:data:`_identify_ended_at`): every read of this printer commanded at or before that identify
+    observation has its answer now (:func:`_answer_pending_reads`). Every push also concludes the reads
+    no event answered within their self-heal bound (:func:`_conclude_overdue_reads`). Pure in-memory,
+    never raises."""
+    _conclude_overdue_reads(printer_id)
+    now = time.monotonic()
+    if identifying:
+        _identifying_seen_at[printer_id] = now
+        return
+    seen = _identifying_seen_at.get(printer_id)
+    if seen is None or _identify_ended_at.get(printer_id, 0.0) > seen:
+        return
+    _identify_ended_at[printer_id] = now
+    _answer_pending_reads(printer_id, seen)
+
+
+def on_action_answered(event: ActionAnswered) -> None:
+    """A commanded read the RECORD answered REFUSED (the firmware's fail ACK) or VOID (never received, or
+    a reboot): its identify never ran, so nothing will end it and no flap of it will come — retire what
+    the command armed (in flight, the echo flag, the cause record). A hub subscriber
+    (``printer_event_wiring``: ``ActionAnswered``). Pure in-memory, never raises."""
+    if event.command != "ams_get_rfid" or event.answer not in (Answer.REFUSED.value, Answer.VOID.value):
+        return
+    for key, pending in list(_read_pending.items()):
+        if key[0] == event.printer_id and pending.action_id == event.action_id:
+            _read_pending.pop(key, None)
+            _echo_pending.pop(key, None)
+            _commanded_read_at.pop(key, None)
+
+
+def _conclude_overdue_reads(printer_id: int) -> None:
+    """The self-heal fallback (2026-10-12): every read of ``printer_id`` no event answered within
+    :data:`_IDENTIFY_SELF_HEAL` online seconds of its command CONCLUDES — retired from
+    :data:`_read_pending`, one ``[self-heal]`` line — and with no tag landed it reads as production's
+    ANSWERED NO-TAG read (:func:`read_answered_no_tag`), which :func:`close_answered_read` and the
+    table's row 5a conclude on at the slot's next pass. A slot reading PRESENT flapped nothing still
+    owed: its echo flag and cause record go with it, exactly as an answered read's do
+    (:func:`_answer_pending_reads`). A slot mid-flap keeps both for the settle-back. Then every echo of
+    the printer whose flap never began within the bound expires (:func:`_echo_swallows`). Never raises:
+    it runs on the status callback (invariant 10)."""
+    try:
+        for key, read in [(k, r) for k, r in _read_pending.items() if k[0] == printer_id]:
+            if not _read_overdue(printer_id, read):
+                continue
+            _read_pending.pop(key, None)
+            # The record's column only for an action the record has not answered (no ACK yet): one it
+            # answered on its ACK had no bound of its own pass — the READ's bound did.
+            action_id = read.action_id if printer_action.outstanding(read.action_id) else None
+            printer_action.note_bound_passed(
+                printer_id,
+                _IDENTIFY_SELF_HEAL,
+                lane=f"ams_presence.identify AMS{key[1]}-T{key[2]}",
+                action_id=action_id,
+            )
+            if _last_presence.get(key) is True:
+                _echo_pending.pop(key, None)
+                _commanded_read_at.pop(key, None)
+        for key in [k for k in _echo_pending if k[0] == printer_id and not _echo_swallows(k)]:
+            _echo_pending.pop(key, None)
+    except Exception:  # noqa: BLE001 — must never break the status callback chain
+        logger.exception("AMS presence: concluding overdue reads failed for printer %s", printer_id)
+
+
+def _echo_swallows(key: tuple[int, int, int], *, settling_back: bool = False) -> bool:
+    """Is the slot's armed echo flag still the identify's own (R25, production's
+    ``_ECHO_PENDING_STALE_S`` meaning on :data:`_IDENTIFY_SELF_HEAL`)? True while its read is inside the
+    bound, or when the slot's current absence BEGAN under the identify (``_absent_under_identify``,
+    captured at the loss edge) — the flap the echo is waiting for has started, however long it takes to
+    settle back. False for no flag, and for a flag whose flap never began within the bound: an echo
+    that never came no longer swallows the next real edge. ``settling_back``: asked AT the gain that ends
+    the absence (the presence map already reads present), so the loss edge's capture alone speaks."""
+    armed = _echo_pending.get(key)
+    if armed is None:
+        return False
+    if not printer_action.bound_due(key[0], _IDENTIFY_SELF_HEAL, armed):
+        return True
+    flapping = settling_back or _last_presence.get(key) is False
+    return flapping and _absent_under_identify.get(key, False)
+
+
+def _answer_pending_reads(printer_id: int, identified_at: float) -> None:
+    """The identify the unit was seen running at ``identified_at`` ENDED: every read of this printer
+    commanded at or before it has answered. A slot reading PRESENT at the answer flapped nothing that
+    is still owed (or its settle-back already arrived): its echo flag and its cause record go, so a
+    later genuine reseat is judged on its own. A slot still ABSENT is mid-flap: its echo and cause
+    stay for the settle-back gain, which consumes them."""
+    for key in [k for k, read in _read_pending.items() if k[0] == printer_id and read.at <= identified_at]:
+        _read_pending.pop(key, None)
+        if _last_presence.get(key) is True:
+            _echo_pending.pop(key, None)
+            _commanded_read_at.pop(key, None)
 
 
 def _identify_explains_absence(printer_id: int, ams_id: int, tray_id: int) -> bool:
@@ -562,18 +754,18 @@ def _identify_explains_gain(
        ``record_recheck_read`` arms the echo flag only for a state-10/11 slot (an identify on an
        empty slot leaves no edge to swallow), so a read commanded on a state-9 tray slipped
        the whole suppression lane and its flap banked as a physical cycle. ``commanded_at``
-       is passed in ALREADY CONSUMED by the caller: a command explains at most ONE flap.
-       A lingering "we read this slot N s ago" stamp cannot tell an identify still
-       unloading the tray from a genuine human pull made after that identify settled —
-       :func:`_identify_explains_absence`'s docstring is explicit about that, and
-       one-shot consumption is what honours it;
+       is passed in ALREADY CONSUMED by the caller: a command explains at most ONE flap, and
+       the read's ANSWER with the slot present retires the record (``_answer_pending_reads``),
+       so it never outlives its identify to explain a genuine human pull made after it — no
+       window either way (2026-10-11);
     c. the unit was OBSERVED identifying DURING the absence (``_identifying_seen_at``
        stamped strictly after the absence began). A firmware-AUTONOMOUS read carries no
        command at all and its flag can rise and fall between two edges, so neither (a)
        nor (b) sees it. Window-scoped rather than time-boxed on purpose: an observation
        from BEFORE this absence explains nothing about it;
     d. the printer started a print inside :data:`_RUNNING_EDGE_TRANSIENT_S` before the
-       edge (``_running_edge_at``) — the AMS engage transient.
+       edge (``_running_edge_at``) — the AMS engage transient (a NAMED EXCEPTION: no wire event
+       reports its end; it attributes cause only).
 
     ``paused`` vetoes (d) outright: a gain while the printer sits in PAUSE is the runout
     refill / jam reinsert that ``spool_recovery.maybe_auto_resume_on_refill`` and
@@ -581,17 +773,17 @@ def _identify_explains_gain(
     """
     if _identify_explains_absence(printer_id, ams_id, tray_id):
         return True
-    now = time.monotonic()
-    if commanded_at is not None and (
-        now - commanded_at < _IDENTIFY_ACTIVE_S or (absent_at is not None and commanded_at >= absent_at)
-    ):
+    if commanded_at is not None:
+        # One command explains the first flap after it, however long the identify took: the cause
+        # record leaves at the read's answer when the slot reads present (``_answer_pending_reads``),
+        # so a stamp still here belongs to a read whose flap is this one.
         return True
     identifying_at = _identifying_seen_at.get(printer_id)
     if identifying_at is not None and absent_at is not None and identifying_at > absent_at:
         return True
     if not paused:
         edge = _running_edge_at.get(printer_id)
-        if edge is not None and now - edge <= _RUNNING_EDGE_TRANSIENT_S:
+        if edge is not None and time.monotonic() - edge <= _RUNNING_EDGE_TRANSIENT_S:
             return True
     return False
 
@@ -1236,7 +1428,20 @@ async def command_identify(
         )
         return False, "filament engaged"
 
-    ok, msg = client.ams_refresh_tray(ams_id, tray_id)
+    answered: list[tuple[bool, str]] = []
+
+    def _identify(live: BambuMQTTClient, seq: str) -> bool:
+        result = live.ams_refresh_tray(ams_id, tray_id, sequence_id=seq)
+        answered.append(result)
+        return result[0]
+
+    sent = await printer_action.send(
+        printer_id,
+        printer_action.Command("ams_get_rfid", _identify, target=ams_id * 4 + tray_id if ams_id < 128 else ams_id),
+        actor=printer_action.ACTOR_FARM if enforce_need else printer_action.ACTOR_OPERATOR,
+        client=client,
+    )
+    ok, msg = answered[0] if answered else (False, sent.refusal_detail or "not sent")
     if ok:
         # Arm the echo flag ONLY on success: the identify cycle this command starts
         # flaps the tray present→9→present, and that settle-back gain must be
@@ -1244,6 +1449,10 @@ async def command_identify(
         # identify → no echo → nothing to arm, and no identity was learned either.
         record_recheck_read(printer_id, ams_id, tray_id)
         note_identity_learned(printer_id, ams_id, tray_id)
+        # In flight until the unit's own identify cycle ends (:func:`identify_in_flight`), the record
+        # answers the command REFUSED / VOID (:func:`on_action_answered` — no identify to end), or its
+        # self-heal bound concludes it (:data:`_IDENTIFY_SELF_HEAL`, counted from this instant).
+        _read_pending[key] = _PendingRead(time.monotonic(), sent.action_id, printer_action.now())
         # The read is spent: the slot's occasion closes until a NEW cause opens one (a
         # qualified physical cycle or the next terminal's between-prints policy). This is
         # what makes a standing condition cost ONE read instead of one per pass.
@@ -1467,16 +1676,6 @@ async def maybe_command_owed_identify(
         return False
 
 
-# How long after a commanded DISCOVERY read the absence of a tag counts as that read's
-# ANSWER. The identify cycle a command starts runs ~10-20 s (hard-bounded by
-# :data:`_IDENTIFY_ACTIVE_S`), so 15 s is late enough that a read which WILL answer with a
-# tag has answered — the answer re-stamps ``_slot_read_at`` through
-# :func:`note_identity_learned` — and early enough that a parked slot resolves on the next
-# reconcile pass rather than the next print. A CAUSE window like every other constant here,
-# not a duration filter on identity.
-_NO_TAG_ANSWER_SETTLE_S = 15.0
-
-
 def read_answered_no_tag(printer_id: int, ams_id: int, tray_id: int, *, tray_seated: bool, tray_bare: bool) -> bool:
     """Hardware evidence that the seated object is NOT the bound tagged roll.
 
@@ -1501,8 +1700,11 @@ def read_answered_no_tag(printer_id: int, ams_id: int, tray_id: int, *, tray_sea
       operator's own hand-assigned row. Note the pairing with :func:`close_answered_read`,
       which POPS the cycle on the pass that consumes an answer: an answered read therefore
       stands until a NEW qualified gain re-sets it, and this test is that re-set's teeth;
-    * at least :data:`_NO_TAG_ANSWER_SETTLE_S` has elapsed since that stamp;
-    * no identify is in flight on the slot (:func:`identify_in_flight`);
+    * the read has ANSWERED — the unit's own identify cycle ended, its flap settled back, or no event
+      answered it within :data:`_IDENTIFY_SELF_HEAL` (30 s online since the command — production's
+      ``_IDENTIFY_ACTIVE_S`` bound over its 15 s ``_NO_TAG_ANSWER_SETTLE_S`` floor, 2026-10-12: a
+      full identify cycle with no tag IS the no-tag answer) — :func:`identify_in_flight` reads false
+      (no read in flight on the slot, the unit not identifying);
     * ``_slot_read_at`` is NOT newer than the discovery stamp. A tag landing re-stamps it
       through :func:`note_identity_learned` on the firmware's publish, so a newer value
       means the read answered WITH a tag (or a newer read owns the slot) — either way this
@@ -1514,11 +1716,9 @@ def read_answered_no_tag(printer_id: int, ams_id: int, tray_id: int, *, tray_sea
     debt adjudicates it, and this module must not re-derive presence from the merged view
     (the merge can present a chimera — that is the whole reason observations exist).
 
-    The settle constant is a FLOOR, not the whole pacing: a read commanded on a slot that was
-    already PRESENT also armed the echo flag, so :func:`identify_in_flight` holds True for
-    :data:`_IDENTIFY_ACTIVE_S` (30 s) and the answer actually lands then. Both gates are
-    conservative in the same direction (later, never earlier), which is the correct bias for
-    a fact that authorizes retiring a ledger row.
+    The answer is the identify's own end, so it lands exactly when the firmware finishes — never
+    earlier, which is the correct bias for a fact that authorizes retiring a ledger row; the bound
+    only keeps a read the firmware never visibly ends from freezing every lane on the slot.
 
     A false positive — a transient read failure on a genuinely tagged roll — self-corrects:
     the next successful read finds the tag and the identity lane displaces the never-fed
@@ -1537,8 +1737,6 @@ def read_answered_no_tag(printer_id: int, ams_id: int, tray_id: int, *, tray_sea
         # left. Never POP ``_discovery_read_at`` to express that — the same stamp drives
         # the ``0700_0081`` suppression in :func:`is_expected_read_failure`, and a read
         # commanded moments before a re-seat must still own its own expected failure.
-        return False
-    if time.monotonic() - stamp < _NO_TAG_ANSWER_SETTLE_S:
         return False
     if identify_in_flight(printer_id, ams_id, tray_id):
         return False
@@ -1714,12 +1912,9 @@ async def on_tray_observations(printer_id: int, observations: list[TrayObservati
         # to them — pinned by test, because both machines break silently if it does.
         paused = (getattr(state, "state", None) or "") == "PAUSE"
 
-        # Sample the unit's identify flag on every AMS push. A firmware-AUTONOMOUS read
-        # carries no command of ours, and its flag can rise and fall entirely between two
-        # pushes — so the LIVE check alone cannot explain a tray flap it caused. Sampling
-        # turns it into a cause with a window (:func:`_identify_explains_gain`).
-        if getattr(state, "ams_status_main", 0) == AMS_STATUS_IDENTIFYING:
-            _identifying_seen_at[printer_id] = time.monotonic()
+        # The unit's identify flag is sampled on EVERY status push by the hub (``printer_event_wiring``
+        # → :func:`note_identify_activity`), never here: the push that carries the flag leaving
+        # IDENTIFYING may carry no tray data, and a settled AMS sends none.
 
         for obs in observations:
             ams_id = obs.ams_id
@@ -1768,17 +1963,28 @@ async def on_tray_observations(printer_id: int, observations: list[TrayObservati
                 # exact over-suppression _identify_explains_absence warns about.
                 commanded_at = _commanded_read_at.pop(key, None)
 
+                # The identify's own flap ENDED (its absence began at or after the command, or was
+                # never seen begin): the read has answered — no longer in flight. The second answer
+                # event beside the unit's identify-ended edge, for a cycle no sampled push showed.
+                pending = _read_pending.get(key)
+                began = _absent_since.get(key)
+                if pending is not None and (began is None or began >= pending.at):
+                    _read_pending.pop(key, None)
+
                 # Echo-consume FIRST: a re-read we commanded on this present
                 # slot flaps the firmware's tray state present→9→present
-                # (~20 s); the settle-back arrives here as a fresh gain. If a
-                # flag is armed for the slot, THIS gain is our command's own
-                # echo — pop it and swallow the whole edge (no re-read AND no
-                # feed-fault clear; the spool never physically moved). Popped
-                # regardless of ``running`` — an echo can land as a print
-                # starts. A stale flag (identify never ran) reads as no flag →
-                # the gain acts normally.
-                ts = _echo_pending.pop(key, None)
-                if ts is not None and time.monotonic() - ts < _ECHO_PENDING_STALE_S:
+                # (~20 s, as long as the identify takes); the settle-back arrives
+                # here as a fresh gain. If a flag is armed for the slot, THIS gain is
+                # our command's own echo — pop it and swallow the whole edge (no
+                # re-read AND no feed-fault clear; the spool never physically moved).
+                # Popped regardless of ``running`` — an echo can land as a print
+                # starts. The read's answer retires a flag whose identify flapped
+                # nothing (``_answer_pending_reads``); a flag still here is this flap's
+                # unless its flap never began within the read's self-heal bound — an
+                # echo that never came (:func:`_echo_swallows`, production's 30 s).
+                swallows = _echo_swallows(key, settling_back=True)
+                _echo_pending.pop(key, None)
+                if swallows:
                     logger.debug(
                         "AMS presence: swallowed re-read echo for printer %d AMS%d-T%d",
                         printer_id,
@@ -1831,7 +2037,9 @@ async def on_tray_observations(printer_id: int, observations: list[TrayObservati
                 # seated mid-print clears too) and NOT on the first-batch seed.
                 # Gated on NOT drying: a drying cycle flaps tray presence
                 # (state → 10) with no physical event, and a jammed spool must
-                # not silently re-enter rotation from a drying flap.
+                # not silently re-enter rotation from a drying flap. An identify's
+                # own flap never reaches here, however long it ran: the echo flag
+                # above lives until the read's own events end it (2026-10-11).
                 # Best-effort — a failure must never break the AMS callback.
                 if not unit_drying(printer_id, ams_id):
                     # ``qualified`` = a genuine gain that is NOT a MEASURED sub-5 s
@@ -1944,11 +2152,12 @@ async def on_tray_observations(printer_id: int, observations: list[TrayObservati
             if obs.identity_asserted:
                 note_identity_learned(printer_id, ams_id, tray_id)
 
-            # …and the OTHER answer a commanded read can give. A read whose settle window
-            # passed with no identity learned has answered NO TAG, and that answer spends
-            # the entitlements it was bought with, whatever the slot is bound to. Runs on
-            # every observation, not only gains: the answer lands ~15 s after the command,
-            # by which time the slot is emitting steady-state pushes. Non-destructive to
+            # …and the OTHER answer a commanded read can give. A read that answered (its
+            # identify ended, or no event answered it within ``_IDENTIFY_SELF_HEAL``) with
+            # no identity learned has answered NO TAG, and that answer spends the
+            # entitlements it was bought with, whatever the slot is bound to. Runs on every
+            # observation, not only gains: the answer lands ~10-30 s after the command, by
+            # which time the slot is emitting steady-state pushes. Non-destructive to
             # the row-5a conclusion the pipeline draws from the same fact one step later.
             #
             # BARE-NESS IS THE RFID PAIR, and nothing else (2026-08-20). NOT
@@ -2181,8 +2390,7 @@ async def on_printer_terminal(printer_id: int) -> None:
             # ams_get_rfid now is the witnessed gain-vs-sweep double command that
             # fails the read. Checked at COMMAND time, not during eligibility
             # collection, so a gain that arms the flag mid-sweep is still caught.
-            ts = _echo_pending.get((printer_id, ams_id, tray_id))
-            if ts is not None and time.monotonic() - ts < _IDENTIFY_ACTIVE_S:
+            if _read_in_flight((printer_id, ams_id, tray_id)):
                 logger.debug(
                     "[Printer %s] terminal AMS reconcile: skipping AMS%d slot%d — identify already in flight",
                     printer_id,

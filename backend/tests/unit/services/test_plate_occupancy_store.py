@@ -277,21 +277,23 @@ class TestHydrateEject:
         identity = po.plate_occupancy.eject_identity(printer.id)
         assert identity is not None and identity.purpose == "fa"
 
-    async def test_stale_stamp_is_nulled_and_not_hydrated(self, db_session, monkeypatch, caplog):
-        """Past the 24 h TTL the stamp is residue, not an eject in flight."""
-        printer = await _mk_printer(db_session, "EJSTALE")
-        stale = datetime.now(timezone.utc) - timedelta(hours=store._PENDING_EJECT_STALE_TTL_H + 1)
-        item = await _mk_item(db_session, printer_id=printer.id, stamp=stale)
+    async def test_an_old_stamp_is_hydrated_for_the_session_reconcile(self, db_session, monkeypatch):
+        """A stamp's age decides nothing (2026-10-11): a day-old stamp is hydrated like any other and
+        the session start's reconcile reads what the printer says about it — the 24 h TTL that dropped
+        it unasked is gone."""
+        printer = await _mk_printer(db_session, "EJOLD")
+        old = datetime.now(timezone.utc) - timedelta(days=3)
+        item = await _mk_item(db_session, printer_id=printer.id, stamp=old)
         await db_session.commit()
         _patch_session(monkeypatch, db_session)
 
-        with caplog.at_level(logging.WARNING):
-            await store.hydrate()
+        await store.hydrate()
 
-        assert po.plate_occupancy.eject_identity(printer.id) is None
+        identity = po.plate_occupancy.eject_identity(printer.id)
+        assert identity is not None and identity.hydrated is True
+        assert store._as_utc(identity.dispatched_at) == store._as_utc(old)
         await db_session.refresh(item)
-        assert item.eject_dispatched_at is None
-        assert any("stale pending-eject" in r.message for r in caplog.records)
+        assert item.eject_dispatched_at is not None
 
     async def test_second_stamp_on_one_printer_is_nulled(self, db_session, monkeypatch):
         printer = await _mk_printer(db_session, "EJDUP")

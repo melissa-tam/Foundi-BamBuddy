@@ -8,7 +8,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import select
 
+from backend.app.models.printer_action import PrinterAction
+from backend.app.services import printer_action
+from backend.app.services.bambu_mqtt import PrinterState
 from backend.app.services.virtual_printer.mqtt_bridge import (
     MQTTBridge,
     _ip_to_uint32_le,
@@ -46,7 +50,7 @@ def _make_paho_client(
     client.ip_address = ip
     client.state = MagicMock()
     client.state.connected = connected
-    client.publish_raw = MagicMock(return_value=True)
+    client.publish_forwarded = MagicMock(return_value=True)
     client._raw_handlers: list = []
 
     def _register(handler):
@@ -1066,23 +1070,243 @@ class TestCommandResponseFanout:
 
 
 class TestForwardToPrinter:
-    @pytest.mark.asyncio
-    async def test_forward_publishes_to_real_serial_request_topic(self):
+    """A slicer's command reaches the real printer THROUGH THE RECORD (2026-10-11): the operator's
+    ``slicer_forward`` action, its id on the wire in place of the slicer's own ``sequence_id`` — which
+    could equal an outstanding FARM action's id and answer it — and the printer's reply answers the
+    action and goes back to the slicer carrying the slicer's own id."""
+
+    @pytest.fixture
+    def record(self, monkeypatch, own_session_factory):
+        from backend.app.core import database as core_db
+
+        monkeypatch.setattr(core_db, "async_session", own_session_factory)
+        printer_action._reset_state()
+        yield own_session_factory
+        printer_action._reset_state()
+
+    @staticmethod
+    def _live_target() -> MagicMock:
         target = _make_paho_client()
+        state = PrinterState()
+        state.connected = True
+        state.connection_epoch = 1
+        target.state = state
+        return target
+
+    @staticmethod
+    async def _drain() -> None:
+        for _ in range(5):
+            pending = [
+                task
+                for task in asyncio.all_tasks()
+                if task is not asyncio.current_task() and (task.get_name() or "").startswith("printer-action")
+            ]
+            if not pending:
+                await asyncio.sleep(0)
+                continue
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    @staticmethod
+    async def _rows(factory) -> list[PrinterAction]:
+        async with factory() as db:
+            return list((await db.execute(select(PrinterAction).order_by(PrinterAction.id))).scalars().all())
+
+    async def _reply(self, bridge: MQTTBridge, block: str, body: dict) -> None:
+        """The printer's reply as production delivers it: the bridge's raw tap (the slicer's copy, and the
+        relay of a result-less reply) and — for a reply carrying a ``result`` — the client's ACK lane, which
+        records an echo in every block and hands it to the record (``BambuMQTTClient._record_command_acks`` →
+        the hub → ``printer_action.on_command_acked``)."""
+        from backend.app.services.bambu_mqtt import CommandAck
+        from backend.app.services.printer_events import CommandAcked
+
+        bridge._on_printer_raw(f"device/{H2D_SERIAL}/report", json.dumps({block: body}).encode())
+        if "result" in body:
+            ack = CommandAck(
+                command=str(body["command"]),
+                sequence_id=str(body["sequence_id"]),
+                result=str(body["result"]),
+                reason=body.get("reason"),
+                at=0.0,
+            )
+            printer_action.on_command_acked(CommandAcked(printer_id=bridge.target_printer_id, ack=ack))
+        await asyncio.sleep(0.01)
+        await self._drain()
+
+    @pytest.mark.asyncio
+    async def test_a_forward_is_the_operators_action_under_the_records_id(self, record):
+        target = self._live_target()
         bridge = _make_bridge(_make_server(), target)
         await bridge.start()
 
-        ok = bridge.forward_to_printer({"print": {"command": "stop"}})
-        assert ok is True
-        target.publish_raw.assert_called_once()
-        topic, payload = target.publish_raw.call_args.args
-        assert topic == f"device/{H2D_SERIAL}/request"
-        assert json.loads(payload) == {"print": {"command": "stop"}}
+        frame = {"print": {"command": "ams_change_filament", "target": 2, "sequence_id": "20017"}}
+        assert await bridge.forward_to_printer(frame) is True
 
+        (row,) = await self._rows(record)
+        assert (row.actor, row.command, row.answer) == ("operator", "slicer_forward", None)
+        target.publish_forwarded.assert_called_once()
+        assert target.publish_forwarded.call_args.args == (frame,)
+        assert target.publish_forwarded.call_args.kwargs == {"sequence_id": str(row.id)}
         await bridge.stop()
 
     @pytest.mark.asyncio
-    async def test_forward_returns_false_when_not_bound(self):
+    async def test_the_reply_answers_the_action_and_carries_the_slicers_own_id(self, record):
+        server = _make_server()
+        server.push_raw_to_clients = AsyncMock()
+        target = self._live_target()
+        bridge = _make_bridge(server, target)
+        await bridge.start()
+
+        await bridge.forward_to_printer({"print": {"command": "ams_change_filament", "sequence_id": "20017"}})
+        (row,) = await self._rows(record)
+        await self._reply(
+            bridge, "print", {"command": "ams_change_filament", "sequence_id": str(row.id), "result": "success"}
+        )
+
+        server.push_raw_to_clients.assert_awaited_once()
+        _topic, payload = server.push_raw_to_clients.await_args.args
+        assert json.loads(payload)["print"]["sequence_id"] == "20017"
+        (row,) = await self._rows(record)
+        assert row.answer == "reached"
+        assert bridge._forwarded == {}
+        await bridge.stop()
+
+    @pytest.mark.asyncio
+    async def test_a_slicer_id_equal_to_a_farm_actions_id_answers_only_its_own_frame(self, record):
+        """The defect this closes: the slicer numbers its frames itself, so its id can equal an outstanding
+        farm action's. On the wire the forward carries ITS action's id; the reply answers the forward and
+        the farm's action stays outstanding."""
+        server = _make_server()
+        server.push_raw_to_clients = AsyncMock()
+        target = self._live_target()
+        bridge = _make_bridge(server, target)
+        await bridge.start()
+        farm = await printer_action.send(42, printer_action.gcode("M400"), actor="farm", client=target)
+        assert farm.published
+
+        await bridge.forward_to_printer({"print": {"command": "gcode_line", "sequence_id": str(farm.action_id)}})
+        farm_row, forward_row = await self._rows(record)
+        assert forward_row.id != farm_row.id
+        await self._reply(
+            bridge, "print", {"command": "gcode_line", "sequence_id": str(forward_row.id), "result": "success"}
+        )
+
+        farm_row, forward_row = await self._rows(record)
+        assert forward_row.answer == "reached"
+        assert farm_row.answer is None
+        _topic, payload = server.push_raw_to_clients.await_args.args
+        assert json.loads(payload)["print"]["sequence_id"] == str(farm.action_id)
+        await bridge.stop()
+
+    @pytest.mark.asyncio
+    async def test_a_fail_reply_refuses_it_with_the_printers_reason(self, record):
+        target = self._live_target()
+        server = _make_server()
+        server.push_raw_to_clients = AsyncMock()
+        bridge = _make_bridge(server, target)
+        await bridge.start()
+
+        await bridge.forward_to_printer({"print": {"command": "ams_filament_setting", "sequence_id": "9"}})
+        (row,) = await self._rows(record)
+        await self._reply(
+            bridge,
+            "print",
+            {"command": "ams_filament_setting", "sequence_id": str(row.id), "result": "fail", "reason": "busy"},
+        )
+
+        (row,) = await self._rows(record)
+        assert (row.answer, row.reason) == ("refused", "busy")
+        await bridge.stop()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("block", ["print", "system", "xcam"])
+    async def test_a_result_carrying_reply_is_answered_once_by_the_ack_lane(self, record, monkeypatch, block):
+        """R28: a reply that carries a ``result`` is the ACK lane's alone (it reads every block); the bridge
+        never relays it, so the action is answered exactly once."""
+        from backend.app.services.printer_events import ActionAnswered
+
+        relayed: list = []
+        monkeypatch.setattr(printer_action, "on_forward_answered", lambda *args: relayed.append(args))
+        answered: list = []
+        real_publish = printer_action.printer_events.publish
+
+        async def _publish(event):
+            if isinstance(event, ActionAnswered):
+                answered.append(event.action_id)
+            await real_publish(event)
+
+        monkeypatch.setattr(printer_action.printer_events, "publish", _publish)
+        server = _make_server()
+        server.push_raw_to_clients = AsyncMock()
+        target = self._live_target()
+        bridge = _make_bridge(server, target)
+        await bridge.start()
+
+        await bridge.forward_to_printer({block: {"command": "ledctrl", "sequence_id": "12"}})
+        (row,) = await self._rows(record)
+        await self._reply(bridge, block, {"command": "ledctrl", "sequence_id": str(row.id), "result": "success"})
+
+        (row,) = await self._rows(record)
+        assert row.answer == "reached"
+        assert relayed == []
+        assert answered == [row.id]
+        _topic, payload = server.push_raw_to_clients.await_args.args
+        assert json.loads(payload)[block]["sequence_id"] == "12"  # the slicer still gets its own id back
+        await bridge.stop()
+
+    @pytest.mark.asyncio
+    async def test_a_data_reply_outside_the_print_block_is_the_printers_answer(self, record):
+        """A ``system`` / ``xcam`` reply carrying no ``result`` never reaches the ACK log; the relay answers it."""
+        server = _make_server()
+        server.push_raw_to_clients = AsyncMock()
+        target = self._live_target()
+        bridge = _make_bridge(server, target)
+        await bridge.start()
+
+        await bridge.forward_to_printer({"system": {"command": "get_access_code", "sequence_id": "31"}})
+        (row,) = await self._rows(record)
+        await self._reply(
+            bridge, "system", {"command": "get_access_code", "sequence_id": str(row.id), "access_code": "x"}
+        )
+
+        (row,) = await self._rows(record)
+        assert row.answer == "reached"
+        _topic, payload = server.push_raw_to_clients.await_args.args
+        assert json.loads(payload)["system"]["sequence_id"] == "31"
+        await bridge.stop()
+
+    @pytest.mark.asyncio
+    async def test_a_reply_naming_no_forwarded_frame_passes_untouched(self, record):
+        server = _make_server()
+        server.push_raw_to_clients = AsyncMock()
+        bridge = _make_bridge(server, self._live_target())
+        await bridge.start()
+
+        body = json.dumps({"print": {"command": "ams_filament_setting", "sequence_id": "77", "result": "success"}})
+        bridge._on_printer_raw(f"device/{H2D_SERIAL}/report", body.encode())
+        await asyncio.sleep(0.01)
+
+        _topic, payload = server.push_raw_to_clients.await_args.args
+        assert payload == body.encode()
+        assert await self._rows(record) == []
+        await bridge.stop()
+
+    @pytest.mark.asyncio
+    async def test_a_frame_that_did_not_go_out_is_refused_and_unmapped(self, record):
+        target = self._live_target()
+        target.publish_forwarded.return_value = False
+        bridge = _make_bridge(_make_server(), target)
+        await bridge.start()
+
+        assert await bridge.forward_to_printer({"print": {"command": "stop", "sequence_id": "5"}}) is False
+
+        await self._drain()
+        (row,) = await self._rows(record)
+        assert row.answer == "refused"
+        assert bridge._forwarded == {}
+        await bridge.stop()
+
+    @pytest.mark.asyncio
+    async def test_forward_returns_false_when_not_bound(self, record):
         pm = MagicMock()
         pm.get_client = MagicMock(return_value=None)
         bridge = MQTTBridge(
@@ -1094,8 +1318,28 @@ class TestForwardToPrinter:
             printer_manager=pm,
         )
         await bridge.start()
-        assert bridge.forward_to_printer({"print": {"command": "stop"}}) is False
+        assert await bridge.forward_to_printer({"print": {"command": "stop"}}) is False
+        assert await self._rows(record) == []
         await bridge.stop()
+
+    @pytest.mark.asyncio
+    async def test_the_map_is_bounded_and_a_new_session_clears_it(self, record, monkeypatch):
+        from backend.app.services.virtual_printer import mqtt_bridge
+
+        monkeypatch.setattr(mqtt_bridge, "_FORWARDED_MAX_ENTRIES", 2)
+        target = self._live_target()
+        bridge = _make_bridge(_make_server(), target)
+        await bridge.start()
+
+        for seq in ("1", "2", "3"):
+            await bridge.forward_to_printer({"print": {"command": "gcode_line", "sequence_id": seq}})
+        assert list(bridge._forwarded.values()) == ["2", "3"]
+
+        target.state.connection_epoch = 2
+        await bridge.forward_to_printer({"print": {"command": "gcode_line", "sequence_id": "4"}})
+        assert list(bridge._forwarded.values()) == ["4"]
+        await bridge.stop()
+        assert bridge._forwarded == {}
 
 
 # ---------------------------------------------------------------------------
@@ -1369,7 +1613,7 @@ class TestPublishRouting:
     def _attach_active_bridge(self, server: SimpleMQTTServer) -> MagicMock:
         bridge = MagicMock()
         bridge.is_active = True
-        bridge.forward_to_printer = MagicMock(return_value=True)
+        bridge.forward_to_printer = AsyncMock(return_value=True)
         server.set_bridge(bridge)
         return bridge
 
@@ -1465,7 +1709,7 @@ class TestPublishRouting:
 
         await server._handle_publish(0x30, payload, writer, "client1")
 
-        bridge.forward_to_printer.assert_called_once()
+        bridge.forward_to_printer.assert_awaited_once()
         forwarded = bridge.forward_to_printer.call_args.args[0]
         assert forwarded["print"]["command"] == "extrusion_cali_get"
 
@@ -1482,7 +1726,7 @@ class TestPublishRouting:
 
         await server._handle_publish(0x30, payload, writer, "client1")
 
-        bridge.forward_to_printer.assert_called_once()
+        bridge.forward_to_printer.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

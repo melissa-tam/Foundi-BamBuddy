@@ -74,8 +74,8 @@ _allowed_at: dict[tuple[str, str], float] = {}
 # A code must be absent at least this long before a reappearance re-notifies;
 # anything shorter is one continuing incident. 600 s sits far above the observed
 # 1-3 min flap gap, so the storm collapses to a single send, while a real
-# clear-and-recur hours later still alerts. A code constant, not operator-tunable
-# (like ams_presence._IDENTIFY_ACTIVE_S).
+# clear-and-recur hours later still alerts. A code constant, not operator-tunable: it
+# paces ALERTS only, never a state decision.
 _HMS_RENOTIFY_ABSENT_SECONDS = 600.0
 
 

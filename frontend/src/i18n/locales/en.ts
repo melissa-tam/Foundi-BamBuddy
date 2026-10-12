@@ -204,6 +204,8 @@ export default {
         filamentUnreadPending: 'Filament unread — reading the seated roll',
         no_usb_drive: 'No USB drive in the printer — insert a USB-A drive (FAT32/exFAT)',
         libraryFileMissing: 'Source file missing from library — restore or re-upload the file',
+        uploadStalled: 'Upload to the printer stalled — retrying on the next dispatch',
+        printerNotConnected: 'Printer not connected — dispatches when it reconnects',
         staggerHold: 'Waiting for the power-stagger window — starts shortly',
         spoolJamRecovering: 'Spool jam — swapping to another spool and resuming',
         spoolJamRecoveryFailed: 'Spool jam recovery failed — printer left paused for a human',
@@ -1326,7 +1328,7 @@ export default {
       reported: 'Printer reported: {{message}}',
       notShown: 'No longer shown on the printer',
     },
-    // The "Toolhead empty" chip's tooltip sentences (`utils/incidentChip`).
+    // The hold chip's toolhead sentences (`services/hold_chip`).
     toolhead: {
       loading: 'Loading {{slot}}.',
       loadingAnySlot: 'Loading a spool.',
@@ -1339,13 +1341,28 @@ export default {
         loadActed: 'AMS moved but the load did not finish.',
         unloadActed: 'AMS moved but the unload did not finish.',
       },
-      // Rule (3)'s tooltip per the backend's T3 verdict (`toolhead.refill_reason`).
+      // The hold chip's tooltip on a paused print over an empty toolhead, per the T3 verdict (`services/hold_chip`).
       reason: {
         owed: 'Resume loads a spool first.',
         maintenance: 'Maintenance mode: the farm loads nothing. Load a slot, then resume.',
         physical: 'Clear the filament path and load a slot, then resume.',
         command_pending: "The AMS holds the farm's queued command. The farm loads the toolhead when it runs.",
       },
+      // The hold chip's toolhead states (`services/hold_chip`, 2026-10-11).
+      label: {
+        resuming: 'Resuming',
+        resumeRefused: 'Resume refused',
+        airStopNotTaken: 'Air stop not taken',
+        fed: 'Toolhead fed',
+      },
+      fedFrom: 'Toolhead fed from {{slot}}.',
+      fedFromExternal: 'Toolhead fed from the external spool.',
+      resumeSent: 'Resume sent {{time}}.',
+      refusedBy: 'Printer: {{reason}}.',
+      pressResume: 'Press Resume.',
+      resumeResent: 'The farm resends the resume.',
+      airStopNotTaken: 'Printing with nothing fed. The printer did not take the farm\'s stop.',
+      stopOnPrinter: 'Stop the print on the printer.',
     },
     // The human's turn at a paused plate check: the printer's own
     // "Ignore and resume" button on the card, behind a confirm.
@@ -2545,7 +2562,7 @@ export default {
     spoolRecoveryMaxAttempts: 'Max recovery attempts',
     spoolRecoveryMaxAttemptsDesc: 'How many spools to try before leaving the print paused for a human (1-5).',
     spoolRecoveryStepTimeout: 'Step timeout (seconds)',
-    spoolRecoveryStepTimeoutDesc: 'How long each recovery step may run before it is treated as failed (15-600s).',
+    spoolRecoveryStepTimeoutDesc: 'How long a recovery step waits for the printer before the farm takes the next step (15–600 s).',
     spoolRecoveryProtectLayers: 'Protect first layers',
     spoolRecoveryProtectLayersDesc: 'During the first N layers, spools below the minimum start weight are not eligible as replacements; after that they can be used. 0 = low spools are always eligible.',
     taglessDefaultFilament: 'Default filament for bare tagless trays',
@@ -2818,14 +2835,14 @@ export default {
     farmPauseStallMinutesHelp: 'Flag and notify when a printing unit sits paused this long with no auto-recovery running — it never cancels anything (5–720)',
     farmPlateCheckDecisionMinutes: 'Plate check decision window (min)',
     farmPlateCheckDecisionMinutesHelp: 'After a failed re-check the print waits paused this long for Ignore and resume or Stop; then the farm stops it and holds the plate.',
+    farmAttentionPageMinutes: 'Waiting page (min)',
+    farmAttentionPageMinutesHelp: 'A printer that has not carried out a command, or stays in a state the farm waits on, is paged after this long and hourly after. The page decides nothing.',
     farmCooldownStallWindow: 'Cooling check interval (min)',
-    farmCooldownStallWindowHelp: 'How often to confirm the bed is still cooling before an eject. Two failed checks in a row quarantine the printer. 0 turns the check off.',
+    farmCooldownStallWindowHelp: 'How often to confirm the bed is still cooling before an eject. Two failed checks in a row hold the plate and page an operator. 0 turns the check off.',
     farmCooldownStallEpsilon: 'Minimum cooling per check (°C)',
     farmCooldownStallEpsilonHelp: 'The bed must drop at least this much between checks to count as still cooling.',
-    farmCooldownMaxHold: 'Give-up timer (min)',
-    farmCooldownMaxHoldHelp: 'If the bed is still warmer than the eject temperature after this long, eject anyway. 0 = keep waiting.',
     farmCooldownPlateauMargin: 'Close-enough margin (°C)',
-    farmCooldownPlateauMarginHelp: 'If cooling stalls with the bed within this many degrees of its own chamber air, treat it as cooled and eject; stuck hotter than that quarantines the printer.',
+    farmCooldownPlateauMarginHelp: 'If cooling stalls with the bed within this many degrees of its own chamber air, treat it as cooled and eject; stuck hotter than that holds the plate and pages an operator.',
     farmCooldownAuxFanEnabled: 'Aux fan during cooldown',
     farmCooldownAuxFanEnabledHelp: 'Runs the auxiliary fan from the end of the print until the eject dispatches.',
     farmCooldownAuxFan: 'Aux fan speed (%)',
@@ -6327,6 +6344,7 @@ export default {
     printStalled: 'Print stalled',
     storageLow: 'USB storage low',
     cooldownEscalation: 'Cooldown running long',
+    printerWaiting: 'Printer waiting on a command or state',
     // Quiet hours
     quietHours: 'Quiet Hours',
     noNotificationsDuring: 'No notifications during these hours',

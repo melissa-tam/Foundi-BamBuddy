@@ -112,7 +112,7 @@ class _FakeClient:
     #: merely that a verdict came back.
     last_refresh: tuple[int, int] | None = None
 
-    def ams_refresh_tray(self, ams_id: int, tray_id: int) -> tuple[bool, str]:
+    def ams_refresh_tray(self, ams_id: int, tray_id: int, *, sequence_id=None) -> tuple[bool, str]:
         """The client's own wire-safety refusal — an operator bypass reaches it verbatim.
 
         Refusing here keeps the route test hermetic AND exercises the honest path: a read
@@ -885,7 +885,7 @@ async def _recheck(db_session, monkeypatch, *, seated: bool, tray: dict | None =
 class _ReadingClient(_FakeClient):
     """A printer that ACCEPTS the read — the contrast case for ``read_issued``."""
 
-    def ams_refresh_tray(self, ams_id: int, tray_id: int) -> tuple[bool, str]:
+    def ams_refresh_tray(self, ams_id: int, tray_id: int, *, sequence_id=None) -> tuple[bool, str]:
         _FakeClient.last_refresh = (ams_id, tray_id)
         return True, "ok"
 

@@ -257,6 +257,7 @@ async def init_db():
         print_log,
         print_queue,
         printer,
+        printer_action,
         printer_incident,
         printer_incident_step,
         printer_model_geometry,
@@ -563,6 +564,9 @@ _AUTOINCREMENT_TABLES: tuple[str, ...] = (
     "sku_files",
     "print_batches",
     "print_queue",
+    # The row id IS the wire sequence_id (``services/printer_action``): a reissued id would let a
+    # late firmware ACK answer a stranger's command.
+    "printer_action",
 )
 
 # RETIRED BUT KEPT PHYSICALLY — the expand half of an expand/contract column retirement.
@@ -579,6 +583,13 @@ _RETIRED_COLUMNS: dict[str, tuple[str, ...]] = {
     # (``services/eject/shop_air``); the profile threshold and the run override are gone.
     "eject_profiles": ("cooldown_temp_c",),
     "print_batches": ("cooldown_temp_c_override",),
+    # 2026-10-11, the action record: a step's send time and tray are the ``printer_action`` row's
+    # (``printer_incident_step.action_id``). RETIRED-UNREAD rather than unwritten: the step's one
+    # writer still WRITES both as a rollback mirror (the previous build reads them, and the model
+    # maps them for that write), and nothing in this build reads them back off a step
+    # (``test_code_quality.TestPrinterActionOwnership``). Relaxing ``sent_at``'s NOT NULL here is
+    # the expand step the build that stops writing them needs; removing the entry is the drop.
+    "printer_incident_step": ("sent_at", "target"),
 }
 
 
@@ -3948,6 +3959,10 @@ async def run_migrations(conn):
         # it clears. The farm has not commanded anything there; the page names the
         # printer's Continue and the printer card's Unload.
         ("on_ams_wedged_idle", "1", "TRUE"),
+        # The attention owner's page (2026-10-11, farm_stall): the farm decides no printer outcome by a
+        # clock, so a command the printer accepted and never carried out — or a printer stuck in a state
+        # the farm waits on — WAITS, and this is how a person hears of it past the page bound.
+        ("on_printer_waiting", "1", "TRUE"),
         # USB storage-low: the printer's USB filled up and the farm ran auto-cleanup.
         ("on_storage_low", "1", "TRUE"),
         # Cooldown escalation: post-print eject cooldown is running long (bed still
@@ -4358,6 +4373,19 @@ async def run_migrations(conn):
         "CREATE INDEX IF NOT EXISTS ix_recovery_escalation_printer_created "
         "ON recovery_escalation(printer_id, created_at)",
     )
+    # The unit an escalation names (2026-10-12, R19): an upload stall records the unit whose upload stalled,
+    # so a POOLED unit skips that printer until it completes a print (``farm_policy.upload_stalled_printers``).
+    # Additive and nullable (NULL for the AMS driver's give-ups); ``create_all`` adds it to a fresh table.
+    # ON DELETE SET NULL as ``printer_action.queue_item_id``: a deleted unit never blocks its row's delete.
+    await _safe_execute(
+        conn,
+        "ALTER TABLE recovery_escalation ADD COLUMN queue_item_id INTEGER "
+        "REFERENCES print_queue(id) ON DELETE SET NULL",
+    )
+    await _safe_execute(
+        conn,
+        "CREATE INDEX IF NOT EXISTS ix_recovery_escalation_queue_item_id ON recovery_escalation(queue_item_id)",
+    )
 
     # Retention: a recovery_escalation row older than the quarantine window can
     # never influence a decision, so drop it at startup — behaviour-preserving and
@@ -4700,6 +4728,16 @@ async def run_migrations(conn):
     # from its short ``code``. Idempotent ADD COLUMN (``_safe_execute`` swallows
     # "duplicate column name" / "already exists"); VARCHAR is valid on both dialects.
     await _safe_execute(conn, "ALTER TABLE printer_incident ADD COLUMN hms_full_codes VARCHAR(512)")
+    # Migration (2026-10-11, the incident-closing lane of the event-not-clock plan): two durable facts
+    # process memory used to hold, both additive and nullable. ``fault_layer`` — the job layer the
+    # fault opened the row at, so the ``repair`` class's "a print ran through the path after the
+    # fault" reads the job's own record (a layer printed fed past it) instead of a motion ledger a
+    # restart emptied. ``rearmed_at`` — when the wire re-armed an ABORTED close's bar on its standing
+    # fault; NULL while the bar stands, so a restart no longer lifts every bar at once. Rows written
+    # before these columns read NULL: no fault layer (that evidence stands), and a standing bar (lifted
+    # by the next witnessed clear or pause).
+    await _safe_execute(conn, "ALTER TABLE printer_incident ADD COLUMN fault_layer INTEGER")
+    await _safe_execute(conn, "ALTER TABLE printer_incident ADD COLUMN rearmed_at DATETIME")
 
     # Migration (2026-09-23, 012-H2S shape 41): the recovery driver's STEP LEDGER, a 3NF
     # child of printer_incident. The wire cannot restate which verbs a driver already
@@ -4748,6 +4786,33 @@ async def run_migrations(conn):
     await _safe_execute(
         conn,
         "CREATE INDEX IF NOT EXISTS ix_printer_incident_step_incident ON printer_incident_step (incident_id)",
+    )
+    # Migration (2026-10-11, the 001-H2S stranded hold): a step references the ACTION it sent
+    # (``printer_action``, the durable record of every command and its answer — created by
+    # ``create_all`` from its model). The step keeps the driver's own vocabulary and reading; the
+    # send, its sequence id and the printer's answer live on the action. ``sent_at`` / ``target``
+    # stay on the step as the ROLLBACK MIRROR the previous build reads (written by ``note_step``,
+    # read by nothing in this build). NULL = a step written before the action record existed and
+    # not yet linked by the guarded backfill below. Idempotent ADD COLUMN on both dialects.
+    await _safe_execute(conn, "ALTER TABLE printer_incident_step ADD COLUMN action_id INTEGER")
+    # Migration (2026-10-11, the plate-check lane of the event-not-clock plan): the plate a plate-check
+    # press was sent over (``deposited`` / ``clear``), recorded at the trip so the ladder's retry-or-hold
+    # decision survives a restart between the press and rung 2. Additive and nullable: rows written
+    # before it read NULL (the decision then reads the live job, failing closed).
+    await _safe_execute(conn, "ALTER TABLE printer_incident_step ADD COLUMN deposit VARCHAR(16)")
+    # The farm's own reason a command's frame never went out (``not_connected`` / ``not_sent`` /
+    # ``runout_hold``) — what tells "the printer refused it" from "it never left" (a resume that never
+    # left is still owed). ``create_all`` adds it to a fresh table only; a DB that ran an earlier build
+    # of ``printer_action`` gains it here, BEFORE the guarded backfill below writes it.
+    await _safe_execute(conn, "ALTER TABLE printer_action ADD COLUMN refusal VARCHAR(16)")
+    # When an action's SELF-HEAL bound first passed in the printer's online time with no event answering
+    # it (2026-10-12: "if it was self heal, it should stay self heal") — written once, by
+    # ``services/printer_action`` alone. Additive and nullable: ``create_all`` adds it to a fresh table, a
+    # DB that ran an earlier build of ``printer_action`` gains it here (TIMESTAMP: both dialects).
+    await _safe_execute(conn, "ALTER TABLE printer_action ADD COLUMN bound_passed_at TIMESTAMP")
+    await _safe_execute(
+        conn,
+        "CREATE INDEX IF NOT EXISTS ix_printer_incident_step_action ON printer_incident_step (action_id)",
     )
 
     # Migration (2026-08-09): the roll's SECOND RFID chip. A Bambu roll physically
@@ -6082,6 +6147,33 @@ async def run_migrations(conn):
                 _unfed_repair_marker,
             )
 
+    # Backfill, EVERY boot (2026-10-11; every boot since 2026-10-12): every step with no action — written
+    # before the action record existed, or by the previous build during a rollback window — gets its
+    # action (``printer_action``) and is linked to it, so the record holds the whole history and an open
+    # row's pending command is never invisible (AMS shape 46). Not marker-guarded: a once-marker would
+    # leave a rollback window's steps unlinked forever. Planned from the live rows and re-verified per
+    # row (``services/printer_action_backfill``); the answer is an explicit table, an unmapped reading
+    # left unlinked and logged (on every boot, until a build maps it). Cheap when there is nothing to
+    # do — one read of the indexed ``action_id IS NULL`` set — and silent then. Fully guarded: a failure
+    # is rolled back and logged, and the next boot retries.
+    _action_log_tag = "[MIGRATION] step-action backfill:"
+    try:
+        from backend.app.services import printer_action_backfill as _action_backfill
+
+        async with conn.begin_nested():
+            _action_tally = await _action_backfill.backfill_step_actions(conn)
+            for _action_level, _action_line in _action_tally.lines:
+                logger.log(_action_level, "%s %s", _action_log_tag, _action_line)
+        if _action_tally.linked or _action_tally.skipped:
+            logger.log(
+                logging.WARNING if _action_tally.skipped else logging.INFO,
+                "%s %s",
+                _action_log_tag,
+                _action_tally.summary(),
+            )
+    except Exception:  # noqa: BLE001 — a backfill must never take startup down for every install
+        logger.exception("%s failed and was rolled back (non-fatal); the next boot retries it", _action_log_tag)
+
     # The eject line follows MEASURED shop air (2026-09-25, user ruling: ONE value). The
     # per-profile ``eject_profiles.cooldown_temp_c`` and the per-run
     # ``print_batches.cooldown_temp_c_override`` are no longer read or written; both
@@ -6326,7 +6418,7 @@ async def _migrate_ams_wedged_idle_template_measured(conn) -> None:
     state" and to press Retry/Continue. The wire record supports only a load into an
     EMPTY path under the firmware's change-error modal (dropped, 3 witnesses); an
     unload with nothing loaded cannot be judged, and commands with filament loaded were
-    never measured. ``services/ams_command`` now measures every AMS command per posture,
+    never measured. ``services/printer_action`` now measures every AMS command per posture,
     and the printer card's Unload reports whether the AMS moved, so the page names both
     exits and asserts nothing unmeasured.
 

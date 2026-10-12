@@ -29,7 +29,7 @@ from sqlalchemy import delete, func, select
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_usage_history import SpoolUsageHistory
-from backend.app.services import ams_presence, slot_pipeline, spool_binding, spool_tagless
+from backend.app.services import ams_presence, printer_action, slot_pipeline, spool_binding, spool_tagless
 from backend.app.services.slot_pipeline import PipelineDeps, run_slot_pipeline
 from backend.app.services.slot_state import Decision, DecisionKind, SlotState
 from backend.app.services.tray_observation import observation_tray_dict, observe_tray
@@ -2025,8 +2025,9 @@ async def test_spent_latch_holds_without_a_qualified_cycle(db_session, printer_f
 # --- REPLACE_SPENT on an answered no-tag read (2026-08-07, spool 226) --------
 
 
-def _arm_no_tag_answer(printer_id, ams_id=0, tray_id=0, *, age=60.0):
-    """Stamp the slot as "we commanded a discovery read ``age`` s ago and no tag ever came".
+def _arm_no_tag_answer(printer_id, ams_id=0, tray_id=0, *, age=60.0, answered=True):
+    """Stamp the slot as "we commanded a discovery read ``age`` s ago and no tag ever came" — and, when
+    ``answered``, the read's identify ENDED (nothing in flight); else the read is still in flight.
 
     The ledger shape ``ams_presence.read_answered_no_tag`` adjudicates: identity-learned
     stamped immediately BEFORE the discovery stamp (``command_identify``'s own order, which is
@@ -2036,6 +2037,10 @@ def _arm_no_tag_answer(printer_id, ams_id=0, tray_id=0, *, age=60.0):
     now = ams_presence.time.monotonic()
     ams_presence._slot_read_at[(printer_id, ams_id, tray_id)] = now - age - 0.5
     ams_presence._discovery_read_at[(printer_id, ams_id, tray_id)] = now - age
+    if not answered:
+        ams_presence._read_pending[(printer_id, ams_id, tray_id)] = ams_presence._PendingRead(
+            now - age, None, printer_action.now()
+        )
 
 
 async def _spent_tagged_slot(db_session, printer_id, ams_id=0, tray_id=0, **kw):
@@ -2160,12 +2165,12 @@ async def test_a_fed_tray_still_takes_the_swap_its_answered_read_earned(db_sessi
 
 @pytest.mark.asyncio
 async def test_a_fresh_read_is_not_yet_an_answer(db_session, printer_factory, env):
-    """The settle floor, end to end: a read commanded seconds ago may still be running, so the
-    slot only owes its read — the swap waits for the answer to be an answer."""
+    """End to end: a read whose identify has not ANSWERED may still be running, so the slot only owes
+    its read — the swap waits for the answer to be an answer (an event, never a settle floor)."""
     printer = await printer_factory()
     env.settings["tagless_default_filament"] = _tagless_default_json()
     departed = await _spent_tagged_slot(db_session, printer.id, 0, 1)
-    _arm_no_tag_answer(printer.id, 0, 1, age=1.0)
+    _arm_no_tag_answer(printer.id, 0, 1, age=1.0, answered=False)
 
     obs = _obs(printer.id, {"id": 1, "state": 10})
     transitions = await run_slot_pipeline(printer.id, [obs], _deps(db_session, env))

@@ -41,17 +41,11 @@ import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
+from typing import ClassVar
 
 from backend.app.services import hms_errors, tray_fields
 
 logger = logging.getLogger(__name__)
-
-# How many consecutive QUIET reports make an empty toolhead with no firmware sequence AIR
-# (operator-ratified 2026-10-10, P1). The tray field leads the change posture by up to ~3 s
-# (shape 41, 012-H2S; ≤ 2 s on 2026-10-10), so six posture-carrying reports keep a margin and stay
-# inside the operator's 20 s ("If nothing is feeding after 20secs the print is ruined already",
-# 2026-09-17). Only a report that CARRIED the posture votes (invariant 12's corroboration rule).
-_AIR_CONFIRM_FRAMES = 6
 
 # The process-global event sequence. ``itertools.count`` advances atomically under the GIL, and
 # every printer's client steps its tracker on its own MQTT network thread.
@@ -71,8 +65,9 @@ class FeedPhase(str, Enum):
     * ``CHANGING`` — the firmware owns the next motion (:class:`ChangeCause`).
     * ``RUNOUT_HELD`` — PAUSEd on a runout demand: the firmware asks for filament.
     * ``EMPTY_UNCONFIRMED`` — RUNNING, empty, no firmware sequence YET.
-    * ``AIR`` — RUNNING, empty, and printing: a layer advanced while empty, or
-      :data:`_AIR_CONFIRM_FRAMES` quiet reports passed.
+    * ``AIR`` — RUNNING, empty, and printing: a layer advanced while empty (air advances layers; a
+      firmware change never does — shape 47). No count of quiet reports decides it (2026-10-11: a
+      frame count is a clock).
     * ``EMPTY_PAUSED`` — PAUSEd empty, no demand, no change posture.
     * ``UNKNOWN`` — not a live reading, or no readable feed.
     """
@@ -91,9 +86,9 @@ class FeedPhase(str, Enum):
 
 
 class ChangeCause(str, Enum):
-    """Why the firmware owns the next motion (a ``CHANGING`` phase). Every cause has the SAME two
-    exits to AIR — a layer advance while empty, or :data:`_AIR_CONFIRM_FRAMES` quiet reports — so
-    a false or missed TAIL can never hide air to the FINISH.
+    """Why the firmware owns the next motion (a ``CHANGING`` phase). Every cause has the SAME exit
+    to AIR — a layer advance while empty — so a false or missed TAIL can never hide air to the
+    FINISH: printing on air advances layers, a change never does.
 
     * ``POSTURE`` — the change posture reads 1 (``bambu_mqtt.ams_mid_filament_change``).
     * ``RUNOUT_SWITCH`` — the toolhead read empty out of a TAIL: the firmware's backup switch.
@@ -121,7 +116,7 @@ class FeedSignal(str, Enum):
     """What ONE frame says, given the tracker's previous facts — :func:`_classify`'s closed answer,
     in its priority order (first match wins)."""
 
-    # 1. Not a reading of the printer now (or a new session): UNKNOWN, re-seeded.
+    # 1. Not a reading of the printer now: UNKNOWN, re-seeded.
     NOT_LIVE = "not_live"
     # 2. The job-lifecycle gate is shut.
     NO_JOB = "no_job"
@@ -149,10 +144,7 @@ class FeedSignal(str, Enum):
     FED_ABSENT = "fed_absent"  # y itself reads trusted-absent
     FED_PLAIN = "fed_plain"
     EMPTY_ADVANCED = "empty_advanced"  # the layer advanced past the open empty episode's layer
-    EMPTY_CONFIRMED = "empty_confirmed"  # this quiet vote completes _AIR_CONFIRM_FRAMES
-    EMPTY_QUIET = "empty_quiet"  # a quiet vote: posture carried, not 1, no runout word standing
-    EMPTY_LOUD = "empty_loud"  # posture carried, a runout word standing: resets the streak
-    EMPTY_SILENT = "empty_silent"  # posture not carried: neither votes nor breaks the streak
+    EMPTY_HELD = "empty_held"  # empty, the layer has not advanced: the firmware may still feed it
     UNREADABLE = "unreadable"
 
 
@@ -178,23 +170,20 @@ class FeedFrame:
     ``live`` is the client's ``live_reading.reads_live(state)`` (a pre-first-report frame of a new
     session carries the old session's merge); ``epoch`` the session (``connection_epoch``).
     ``feed`` is EVERY extruder's feed and the active one (``tray_fields.toolhead_feed``).
-    ``posture_carried`` / ``posture``: whether this push carried ``ams_status`` and whether the
-    merged value reads the change posture (``bambu_mqtt.ams_mid_filament_change`` stays its
-    origin; the client passes the bool). ``presence`` is the trusted per-tray presence
+    ``posture``: whether the merged value reads the change posture
+    (``bambu_mqtt.ams_mid_filament_change`` stays its origin; the client passes the bool). ``presence`` is the trusted per-tray presence
     (``tray_fields.tray_presence_map``; absent means ``is False`` only). The runout words standing,
     each read through ``hms_errors``: the slotted demand, whether any demand stands (the
     slot-agnostic hold included), the pull-back notice and the auto-switch report. ``layer`` is
     the job-gated layer (``job_peaks().layer_num``, behind the stale-predecessor gate);
     ``job_active`` the lifecycle gate (``_was_running and not _completion_triggered`` — P2S leaves
-    RUNNING during an auto-fallback, #957); ``farm_acting`` whether a farm motion owns the printer
-    at this push, from the provider the registry injects (decided at STEP time).
+    RUNNING during an auto-fallback, #957).
     """
 
     live: bool
     epoch: int
     gcode_state: str
     feed: tray_fields.ToolheadFeed
-    posture_carried: bool
     posture: bool
     presence: Mapping[tuple[int, int], bool | None]
     runout_demand: tuple[int, int] | None
@@ -204,7 +193,6 @@ class FeedFrame:
     layer: int
     total_layers: int
     job_active: bool
-    farm_acting: bool
     boundary: JobBoundary = JobBoundary.NONE
 
     @classmethod
@@ -213,11 +201,9 @@ class FeedFrame:
         state: object,
         *,
         live: bool,
-        posture_carried: bool,
         posture: bool,
         layer: int,
         job_active: bool,
-        farm_acting: bool,
         boundary: JobBoundary,
     ) -> FeedFrame:
         """THE one build of a frame off a printer state (duck-typed, like every wire reader here):
@@ -230,7 +216,6 @@ class FeedFrame:
             epoch=tray_fields.parse_int_field(getattr(state, "connection_epoch", None)) or 0,
             gcode_state=str(getattr(state, "state", None) or "").upper(),
             feed=tray_fields.toolhead_feed(state),
-            posture_carried=posture_carried,
             posture=posture,
             presence=tray_fields.tray_presence_map(getattr(state, "raw_data", None)),
             runout_demand=hms_errors.current_runout_demand(hms_list),
@@ -240,7 +225,6 @@ class FeedFrame:
             layer=layer,
             total_layers=tray_fields.parse_int_field(getattr(state, "total_layers", None)) or 0,
             job_active=job_active,
-            farm_acting=farm_acting,
             boundary=boundary,
         )
 
@@ -272,6 +256,8 @@ class RollDrained:
     print RUNNING — the roll ran dry at the AMS (for the active extruder: entering TAIL). Once per
     drained tray per extruder, until that tray reads present again."""
 
+    kind: ClassVar[str] = "roll_drained"
+
     seq: int
     extruder: int
     tray: int
@@ -281,15 +267,17 @@ class RollDrained:
 class LoadLanded:
     """The active extruder's EFFECTIVE feeder became a real AMS tray other than the previous
     push's, within one session and one active extruder — in ANY gcode state (a person's Load on an
-    idle printer is repair evidence). ``incident_resolution.MotionLedger``'s load edge, except that
-    a pre-flip inside a TAIL is no landing (the landing fires when the backup actually feeds).
-    ``from_phase`` is the phase before this push; ``farm_acting`` the frame's, at step time."""
+    idle printer is repair evidence). A pre-flip inside a TAIL is no landing (the landing fires when
+    the backup actually feeds).
+    ``from_phase`` is the phase before this push. WHOSE load it was is the record's
+    (``printer_action``: an outstanding farm or operator load of the tray, else ``observed_load``)."""
+
+    kind: ClassVar[str] = "load_landed"
 
     seq: int
     extruder: int
     tray: int
     from_phase: FeedPhase
-    farm_acting: bool
 
 
 @dataclass(frozen=True)
@@ -297,6 +285,8 @@ class AutoSwitched:
     """The firmware's runout switch, read off the wire sequence ONLY:
     ``TAIL(departed) → CHANGING(…, departed) → FED(arrived)``, ``arrived != departed``. Never from
     an HMS word — the HMS-edge lane already stamps on 0x00030002."""
+
+    kind: ClassVar[str] = "auto_switched"
 
     seq: int
     extruder: int
@@ -308,8 +298,13 @@ class AutoSwitched:
 class AirBegan:
     """The print entered AIR; ``layer`` is the layer its empty episode began at (never below 1)."""
 
+    kind: ClassVar[str] = "air_began"
+
     seq: int
     layer: int
+
+
+FeedEvent = RollDrained | LoadLanded | AutoSwitched | AirBegan
 
 
 # --- the reading ---------------------------------------------------------------------------------
@@ -343,7 +338,9 @@ class FeedReading:
     where its load LANDS, so a tail is charged to the drained roll). ``last_loaded`` is the last
     real feeder (-1 none), reset at a new job only. ``first_unfed_layer`` is the lowest layer the
     job PRINTED with nothing fed (``JobPeaks.first_unfed_layer``). The four events are each the
-    LAST of its kind, ``None`` before the first.
+    LAST of its kind, ``None`` before the first; ``events`` are the ones THIS step produced, in
+    their within-push order (drains, the landing, the switch, air) — what the client re-publishes
+    (``printer_events.FeedEventReported``) and logs, one per event.
     """
 
     phase: FeedPhase
@@ -361,6 +358,7 @@ class FeedReading:
     load_landed: LoadLanded | None
     auto_switched: AutoSwitched | None
     air_began: AirBegan | None
+    events: tuple[FeedEvent, ...] = ()
 
     def extruder(self, extruder_id: int) -> ExtruderReading:
         """One extruder's record; an empty one for an extruder this job never read."""
@@ -392,11 +390,9 @@ _UNKNOWN = _Phase(FeedPhase.UNKNOWN)
 class _Facts:
     """The tracker's previous facts the classifier reads (and nothing else)."""
 
-    epoch: int | None
     active_extruder: int | None  # of the previous LIVE frame
     held: int | None  # the previous push's effective feeder while FED / TAIL on this extruder
     episode: int | None  # the open empty episode's run layer
-    votes: int  # consecutive quiet votes
 
 
 @dataclass(frozen=True)
@@ -504,10 +500,7 @@ _FED_SIGNALS = (
 )
 _EMPTY_SIGNALS = (
     FeedSignal.EMPTY_ADVANCED,
-    FeedSignal.EMPTY_CONFIRMED,
-    FeedSignal.EMPTY_QUIET,
-    FeedSignal.EMPTY_LOUD,
-    FeedSignal.EMPTY_SILENT,
+    FeedSignal.EMPTY_HELD,
 )
 
 # The fed cells (7c), by the phase they leave. The held-feeder signals (drained / restored /
@@ -550,14 +543,12 @@ _FED_FROM_CHANGING: dict[FeedSignal, _Handler] = {
 _EMPTY_UNOWNED: dict[FeedSignal, _Handler] = dict.fromkeys(_EMPTY_SIGNALS, _unconfirmed)
 _EMPTY_FROM_TAIL: dict[FeedSignal, _Handler] = dict.fromkeys(_EMPTY_SIGNALS, _runout_switch)
 _EMPTY_FROM_HELD: dict[FeedSignal, _Handler] = dict.fromkeys(_EMPTY_SIGNALS, _runout_resume)
-# EMPTY_UNCONFIRMED and EVERY CHANGING cause: a layer advance while empty is air at once, or the
-# quiet votes confirm it; a loud or silent report keeps waiting for the firmware.
+# EMPTY_UNCONFIRMED and EVERY CHANGING cause: a layer advance while empty is air at once; any other
+# empty report keeps waiting for the firmware — however many of them, however long (2026-10-11:
+# "using time as a gate is not the correct way to discern status complete or incompleteness").
 _EMPTY_CONFIRMING: dict[FeedSignal, _Handler] = {
     FeedSignal.EMPTY_ADVANCED: _air,
-    FeedSignal.EMPTY_CONFIRMED: _air,
-    FeedSignal.EMPTY_QUIET: _stay,
-    FeedSignal.EMPTY_LOUD: _stay,
-    FeedSignal.EMPTY_SILENT: _stay,
+    FeedSignal.EMPTY_HELD: _stay,
 }
 _EMPTY_ON_AIR: dict[FeedSignal, _Handler] = dict.fromkeys(_EMPTY_SIGNALS, _stay)
 
@@ -623,7 +614,7 @@ def _transition(phase: FeedPhase, signal: FeedSignal) -> _Handler:
 
 def _classify(frame: FeedFrame, facts: _Facts) -> FeedSignal:
     """ONE signal for this frame, by the FIXED priority order of :class:`FeedSignal`. Pure."""
-    if not frame.live or frame.epoch != facts.epoch:
+    if not frame.live:
         return FeedSignal.NOT_LIVE
     if not frame.job_active:
         return FeedSignal.NO_JOB
@@ -664,21 +655,13 @@ def _classify(frame: FeedFrame, facts: _Facts) -> FeedSignal:
     if active.kind == "empty":
         if facts.episode is not None and frame.layer > facts.episode:
             return FeedSignal.EMPTY_ADVANCED
-        if not frame.posture_carried:
-            return FeedSignal.EMPTY_SILENT
-        if frame.runout_word:
-            return FeedSignal.EMPTY_LOUD
-        if facts.votes + 1 >= _AIR_CONFIRM_FRAMES:
-            return FeedSignal.EMPTY_CONFIRMED
-        return FeedSignal.EMPTY_QUIET
+        return FeedSignal.EMPTY_HELD
     return FeedSignal.UNREADABLE
 
 
 # The phases an empty episode runs through, and the phases a held feeder belongs to.
 _EPISODE_PHASES = frozenset({FeedPhase.EMPTY_UNCONFIRMED, FeedPhase.CHANGING, FeedPhase.AIR})
-_VOTING_PHASES = frozenset({FeedPhase.EMPTY_UNCONFIRMED, FeedPhase.CHANGING})
 _HOLDING_PHASES = frozenset({FeedPhase.FED, FeedPhase.TAIL})
-_QUIET_VOTES = frozenset({FeedSignal.EMPTY_QUIET, FeedSignal.EMPTY_CONFIRMED})
 
 
 class FeedTracker:
@@ -687,8 +670,12 @@ class FeedTracker:
     Process memory with the client's own rehydrate story: a restart re-reads the phase from the
     first live frame (the ATTACH seed: TAIL when the active extruder is fed and its feeding tray
     reads absent — no event at an attach), and the job's record resets where the client resets its
-    peaks (:class:`JobBoundary`). A frame that is not live, or of a new session, reads UNKNOWN and
-    re-seeds: no event from it, nor from the first live frame after it.
+    peaks (:class:`JobBoundary`). A frame that is not live reads UNKNOWN and re-seeds. The first
+    live frame of a session (a new client's first report, a reconnect's) RE-SEEDS and is READ: its
+    phase is the LEVEL that frame shows — a paused print fed from a slot reads FED off the session's
+    first fresh report (001-H2S incident 574, 2026-10-11: the resume it was owed needed a level the
+    tracker only reached one report later) — and it emits no event: an edge needs two readings of
+    one session.
 
     The feeder BOOKKEEPING (``last_loaded``, ``last_fed``, the feeder log) follows every frame,
     live or not — it is the per-push record the client's ``tray_change_log`` / ``last_loaded_tray``
@@ -701,7 +688,6 @@ class FeedTracker:
         self._phase = _UNKNOWN
         self._active: int | None = None  # the active extruder of the previous LIVE frame
         self._episode: int | None = None
-        self._votes = 0
         # The previous push's effective feeder and its active extruder (a landing's edge).
         self._prev_feeder: int | None = None
         self._prev_extruder: int | None = None
@@ -739,12 +725,13 @@ class FeedTracker:
         attach = frame.boundary is JobBoundary.ATTACH
         if frame.boundary is JobBoundary.NEW_JOB or attach:
             self._begin_job(frame, attach=attach)
+        if frame.live and frame.epoch != self._epoch:
+            # The session's first live frame: re-seed what a previous session held, then READ it.
+            self._reseed(frame.epoch)
         facts = _Facts(
-            epoch=self._epoch,
             active_extruder=self._active,
             held=self._prev_feeder if self._phase.phase in _HOLDING_PHASES else None,
             episode=self._episode,
-            votes=self._votes,
         )
         signal = _classify(frame, facts)
         prev = self._phase
@@ -761,7 +748,7 @@ class FeedTracker:
         arrived = tray_fields.valid_feeder(feeder)  # the external holder is no AMS tray
         if not quiet and active is not None and arrived is not None:
             if arrived != self._prev_feeder and active == self._prev_extruder:
-                landed = LoadLanded(next(_SEQUENCE), active, arrived, prev.phase, frame.farm_acting)
+                landed = LoadLanded(next(_SEQUENCE), active, arrived, prev.phase)
             if (
                 prev.phase is FeedPhase.CHANGING
                 and prev.departed is not None
@@ -790,7 +777,8 @@ class FeedTracker:
         self._load_landed = landed or self._load_landed
         self._auto_switched = switched or self._auto_switched
         self._air_began = air or self._air_began
-        return self._read(active=active, feeder=feeder)
+        events = tuple(event for event in (*drained, landed, switched, air) if event is not None)
+        return self._read(active=active, feeder=feeder, events=events)
 
     def _begin_job(self, frame: FeedFrame, *, attach: bool) -> None:
         """The client reset its peaks: a NEW job starts its record from nothing; an ATTACH keeps
@@ -810,7 +798,19 @@ class FeedTracker:
         self._phase = _UNKNOWN
         self._active = None
         self._episode = None
-        self._votes = 0
+
+    def _reseed(self, epoch: int) -> None:
+        """A new session's first live frame: nothing a previous session held is a fact about this one
+        — the phase, the active extruder, the held feeder and the open episode go; the job's record
+        (the feeder log, the last feeder, the unfed layer) stays: it is the job's, not the session's.
+        The frame is then READ for its level, quietly (``_seeding``: no event)."""
+        self._epoch = epoch
+        self._seeding = True
+        self._phase = _UNKNOWN
+        self._active = None
+        self._episode = None
+        self._prev_feeder = None
+        self._prev_extruder = None
 
     def _note_drains(
         self, frame: FeedFrame, nxt: _Phase, active: int | None, quiet: bool, events: list[RollDrained]
@@ -870,20 +870,12 @@ class FeedTracker:
         """The empty episode opens on entry to EMPTY_UNCONFIRMED or to a CHANGING whose active feed
         reads empty (at ``max(layer, 1)``: layer 0 is the start block), runs through AIR, and
         closes on any other phase or a fed toolhead — a sub-second pause-and-refill inside one
-        layer never stamps. A tool change opens a new one. The quiet votes count inside the
-        episode's waiting phases only: a carried quiet report votes, a silent one neither votes
-        nor breaks the streak, anything else breaks it."""
+        layer never stamps. A tool change opens a new one."""
         if nxt.phase in _EPISODE_PHASES and frame.feed.active.kind == "empty":
             if self._episode is None or signal is FeedSignal.TOOL_CHANGE:
                 self._episode = max(frame.layer, 1)
         else:
             self._episode = None
-        if nxt.phase not in _VOTING_PHASES:
-            self._votes = 0
-        elif signal in _QUIET_VOTES:
-            self._votes += 1
-        elif signal is not FeedSignal.EMPTY_SILENT:
-            self._votes = 0
 
     def _fail_closed(self) -> None:
         """A frame that could not be read: UNKNOWN, and the next live frame re-seeds."""
@@ -891,12 +883,11 @@ class FeedTracker:
         self._seeding = True
         self._active = None
         self._episode = None
-        self._votes = 0
         self._prev_feeder = None
         self._prev_extruder = None
         self._reading = self._read(active=None, feeder=None)
 
-    def _read(self, *, active: int | None, feeder: int | None) -> FeedReading:
+    def _read(self, *, active: int | None, feeder: int | None, events: tuple[FeedEvent, ...] = ()) -> FeedReading:
         extruder_ids = sorted(
             set(self._last_fed) | set(self._drained) | {extruder for extruder, _feeder, _layer in self._log}
         )
@@ -925,6 +916,7 @@ class FeedTracker:
             load_landed=self._load_landed,
             auto_switched=self._auto_switched,
             air_began=self._air_began,
+            events=events,
         )
 
     def _segments(self, extruder_id: int) -> tuple[tuple[int, int], ...]:

@@ -68,7 +68,7 @@ from backend.app.services.eject.donor import (
     resolve_donor,
 )
 from backend.app.services.eject.geometry import GeometryUnavailable, get_geometry_required
-from backend.app.services.eject.monitor import _unit_releasable, eject_cooldown_monitor
+from backend.app.services.eject.monitor import eject_cooldown_monitor
 from backend.app.services.plate_occupancy import (
     CooldownEject,
     Evidence,
@@ -459,7 +459,7 @@ async def _eject_farm_unit(
     (The direct dispatch registers the eject, so ``_desired_policy`` sees ``eject_present``
     and stands the watch down; its ``finally`` retires the prep.)
     """
-    if not await _unit_releasable(item.id):
+    if not await eject_remote.unit_releasable(item.id):
         return None
 
     hot = _thermal_gate(state, await shop_air.current_line(db), model=model, allow_hot=allow_hot)

@@ -112,7 +112,12 @@ _LEDGER_DECREASE_MARGIN_PCT = 50.0
 # one push is not evidence (the AMS re-reports a tray on every state change), so
 # the contradiction must HOLD across at least two pushes spanning ten seconds. A
 # push that stops reading as a contradiction drops the window entirely. Process
-# lifetime only — a restart simply re-corroborates.
+# lifetime only — a restart simply re-corroborates (the safe direction: the ledger
+# heals in one direction, and a write deferred is never a write wrong). Observations
+# arrive only through ``main.on_ams_change``, fired from a LIVE push's AMS change,
+# never from a reconnect's cached re-broadcast. Restored 2026-10-12 (operator ruling
+# "the behaviour should stay the same for the most part"), replacing the completed-read
+# substitute.
 _LEDGER_DECREASE_MIN_PUSHES = 2
 _LEDGER_DECREASE_STABLE_S = 10.0
 

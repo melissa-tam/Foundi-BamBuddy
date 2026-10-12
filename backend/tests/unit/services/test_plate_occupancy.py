@@ -271,6 +271,31 @@ class TestDepositEvidence:
         assert evidence.deposited is True
 
     @pytest.mark.parametrize(
+        ("token", "deposited"),
+        [("clear", False), ("deposited", True), (None, True), ("maybe", True)],
+    )
+    def test_recorded_reads_the_trips_token_back_fail_closed(self, token, deposited):
+        """The plate a plate-check press recorded at its trip (2026-10-11): ``clear`` is the measured
+        zero; ``deposited``, no record and a token this build cannot name all fail CLOSED."""
+        evidence = po.DepositEvidence.recorded(token)
+        assert evidence.deposited is deposited
+        assert evidence.is_dry_run is False
+
+    def test_the_ledger_token_round_trips_through_recorded(self):
+        from backend.app.services.bambu_mqtt import JobPeaks
+
+        clear = po.DepositEvidence.live(
+            JobPeaks(last_progress=0.0, last_layer_num=0, progress=0.0, layer_num=0, reliable=True)
+        )
+        unvouched = po.DepositEvidence.live(
+            JobPeaks(last_progress=0.0, last_layer_num=0, progress=0.0, layer_num=0, reliable=False)
+        )
+        assert (clear.ledger_token, unvouched.ledger_token) == (po.DEPOSIT_CLEAR, po.DEPOSIT_DEPOSITED)
+        assert po.DepositEvidence.recorded(clear.ledger_token).deposited is False
+        assert po.DepositEvidence.recorded(unvouched.ledger_token).deposited is True
+        assert frozenset({po.DEPOSIT_CLEAR, po.DEPOSIT_DEPOSITED}) == po.DEPOSIT_TOKENS
+
+    @pytest.mark.parametrize(
         "saved,current,reliable,deposited",
         [
             # A job paused before its first layer, measured from its start: nothing.
@@ -320,9 +345,7 @@ class TestNoteTerminal:
         assert view.plate_policy == po.CooldownEject(unit_id=1, run_id=1)
 
     def test_raises_the_gate_while_a_lease_is_held(self, clock):
-        lease = po.plate_occupancy.claim_for_dispatch(
-            1, 9, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
-        )
+        lease = po.plate_occupancy.claim_for_dispatch(1, 9, ev=po.Evidence())
         assert isinstance(lease, po.DispatchLease)
 
         po.plate_occupancy.note_terminal(1, _disposition(queue_item_id=9))
@@ -333,9 +356,7 @@ class TestNoteTerminal:
         assert view.lease_unit_id is None
 
     def test_a_foreign_terminal_leaves_the_lease_to_its_own_timers(self, clock):
-        lease = po.plate_occupancy.claim_for_dispatch(
-            1, 9, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
-        )
+        lease = po.plate_occupancy.claim_for_dispatch(1, 9, ev=po.Evidence())
         assert isinstance(lease, po.DispatchLease)
 
         po.plate_occupancy.note_terminal(1, _disposition(queue_item_id=404))
@@ -454,9 +475,7 @@ class TestRefusedPlateTerminal:
 
     def test_it_settles_nobody_elses_claim(self, clock):
         """Legal from any owner; a terminal naming no leased unit leaves the lease alone."""
-        lease = po.plate_occupancy.claim_for_dispatch(
-            1, 9, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
-        )
+        lease = po.plate_occupancy.claim_for_dispatch(1, 9, ev=po.Evidence())
         assert isinstance(lease, po.DispatchLease)
 
         po.plate_occupancy.note_terminal(1, self._refused())
@@ -478,9 +497,7 @@ class TestDeclareOccupied:
         """The 2026-08-30 01:06:57 shape: the declaration landed between the
         scheduler's claim (01:06:56.8) and its start_print (01:06:59.8) and used to
         be erased by an unconditional gate clear on the dispatch path."""
-        lease = po.plate_occupancy.claim_for_dispatch(
-            4, 1010, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
-        )
+        lease = po.plate_occupancy.claim_for_dispatch(4, 1010, ev=po.Evidence())
         assert isinstance(lease, po.DispatchLease)
 
         assert po.plate_occupancy.declare_occupied(4, po.Evidence()) is None
@@ -491,9 +508,7 @@ class TestDeclareOccupied:
 
     def test_a_revoked_uncommitted_lease_is_not_pruned_on_read(self, clock):
         """It must survive to be FOUND by commit_dispatch — that is the refusal."""
-        lease = po.plate_occupancy.claim_for_dispatch(
-            4, 1010, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
-        )
+        lease = po.plate_occupancy.claim_for_dispatch(4, 1010, ev=po.Evidence())
         assert isinstance(lease, po.DispatchLease)
         po.plate_occupancy.declare_occupied(4, po.Evidence())
         clock.advance(10_000)
@@ -545,9 +560,7 @@ class TestRevokeLease:
     """
 
     def _lease(self, printer_id: int = 4) -> po.DispatchLease:
-        lease = po.plate_occupancy.claim_for_dispatch(
-            printer_id, 1010, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
-        )
+        lease = po.plate_occupancy.claim_for_dispatch(printer_id, 1010, ev=po.Evidence())
         assert isinstance(lease, po.DispatchLease)
         return lease
 
@@ -621,13 +634,9 @@ class TestClaimForDispatch:
         elif setup == "hydrated_eject":
             po.plate_occupancy.hydrate_eject(1, _pending(hydrated=True))
         elif setup == "lease":
-            po.plate_occupancy.claim_for_dispatch(
-                1, 3, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
-            )
+            po.plate_occupancy.claim_for_dispatch(1, 3, ev=po.Evidence())
 
-        result = po.plate_occupancy.claim_for_dispatch(
-            1, 9, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=ev
-        )
+        result = po.plate_occupancy.claim_for_dispatch(1, 9, ev=ev)
 
         if expected is None:
             assert isinstance(result, po.DispatchLease), label
@@ -636,18 +645,14 @@ class TestClaimForDispatch:
             assert result == expected, label
 
     def test_commit_refuses_a_lease_the_printer_does_not_hold(self, clock):
-        lease = po.plate_occupancy.claim_for_dispatch(
-            1, 9, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
-        )
+        lease = po.plate_occupancy.claim_for_dispatch(1, 9, ev=po.Evidence())
         assert isinstance(lease, po.DispatchLease)
         po.plate_occupancy.release_dispatch(1, "test")
 
         assert po.plate_occupancy.commit_dispatch(1, lease) == "lease_unknown"
 
     def test_commit_refuses_onto_an_occupied_plate(self, clock):
-        lease = po.plate_occupancy.claim_for_dispatch(
-            1, 9, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
-        )
+        lease = po.plate_occupancy.claim_for_dispatch(1, 9, ev=po.Evidence())
         assert isinstance(lease, po.DispatchLease)
         po.plate_occupancy.note_terminal(1, _disposition(queue_item_id=404))
 
@@ -655,9 +660,7 @@ class TestClaimForDispatch:
 
     def test_release_is_idempotent_and_never_refuses(self, clock):
         po.plate_occupancy.release_dispatch(1, "nothing held")
-        lease = po.plate_occupancy.claim_for_dispatch(
-            1, 9, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
-        )
+        lease = po.plate_occupancy.claim_for_dispatch(1, 9, ev=po.Evidence())
         assert isinstance(lease, po.DispatchLease)
 
         po.plate_occupancy.release_dispatch(1, "watchdog")
@@ -685,9 +688,7 @@ class TestClaimForEject:
         if setup == "plate":
             _occupy(1)
         elif setup == "plate_and_lease":
-            po.plate_occupancy.claim_for_dispatch(
-                1, 3, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
-            )
+            po.plate_occupancy.claim_for_dispatch(1, 3, ev=po.Evidence())
             po.plate_occupancy.declare_occupied(1, po.Evidence())
             # The declaration REVOKES the lease, so force the in-flight shape back on
             # to test the refusal itself.
@@ -749,9 +750,7 @@ class TestClearAndRecover:
         assert po.plate_occupancy.clear_plate(1) == "not_occupied"
 
     def test_operator_recover_drops_everything(self, clock, caplog):
-        po.plate_occupancy.claim_for_dispatch(
-            1, 9, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
-        )
+        po.plate_occupancy.claim_for_dispatch(1, 9, ev=po.Evidence())
         po.plate_occupancy.declare_occupied(1, po.Evidence())
         po.plate_occupancy._records[1].eject = _pending()
 
@@ -772,88 +771,63 @@ class TestClearAndRecover:
 
 
 # ---------------------------------------------------------------------------
-# 7. Lease settlement (read-time, never a transition)
+# 7. The lease ends on the START's answer (2026-10-11 — never a clock)
 # ---------------------------------------------------------------------------
 
 
-class TestLeaseSettlement:
-    def _claim_and_commit(self, clock, *, pre_state: str | None = IDLE, min_hold_s=2.0, max_hold_s=60.0):
-        lease = po.plate_occupancy.claim_for_dispatch(
-            1,
-            9,
-            pre_state=pre_state,
-            pre_subtask="sub-0",
-            min_hold_s=min_hold_s,
-            max_hold_s=max_hold_s,
-            ev=po.Evidence(),
-        )
+class TestLeaseEndsOnTheStartsAnswer:
+    """A committed lease holds until ``release_dispatch`` — the dispatch's start answered by the record
+    (``services/dispatch_start``) or an unwind. No minimum cooldown, no ceiling: a start still digesting
+    holds the printer however long it takes."""
+
+    def _claim_and_commit(self):
+        lease = po.plate_occupancy.claim_for_dispatch(1, 9, ev=po.Evidence())
         assert isinstance(lease, po.DispatchLease)
         assert po.plate_occupancy.commit_dispatch(1, lease) is None
         return lease
 
-    def test_an_uncommitted_lease_is_active_forever(self, clock):
-        """The upload is in flight; there is nothing on the wire to transition yet."""
-        po.plate_occupancy.claim_for_dispatch(
-            1, 9, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
-        )
+    def test_an_uncommitted_lease_holds(self, clock):
+        """The upload is in flight; the printer is unambiguously spoken for."""
+        po.plate_occupancy.claim_for_dispatch(1, 9, ev=po.Evidence())
         clock.advance(10_000)
 
         view = po.plate_occupancy.snapshot(1, po.Evidence(live_state=RUNNING))
         assert view.lease_active is True
         assert view.lease_unit_id == 9
 
-    def test_transition_plus_min_hold_settles_the_lease(self, clock):
-        self._claim_and_commit(clock)
+    @pytest.mark.parametrize("live_state", [None, "", IDLE, "PREPARE", RUNNING, "FINISH"])
+    def test_a_committed_lease_holds_whatever_the_wire_reads_and_however_long(self, clock, live_state):
+        """Slow firmware (an H2D digesting a project_file for 210 s, or longer): no window settles it."""
+        self._claim_and_commit()
+        clock.advance(100_000)
 
-        # Transitioned but inside min_hold → still held.
-        clock.advance(1.0)
-        assert po.plate_occupancy.snapshot(1, po.Evidence(live_state=RUNNING)).lease_active is True
+        view = po.plate_occupancy.snapshot(1, po.Evidence(live_state=live_state))
+        assert view.lease_active is True
+        assert view.lease_unit_id == 9
 
-        clock.advance(2.0)
-        view = po.plate_occupancy.snapshot(1, po.Evidence(live_state=RUNNING))
-        assert view.lease_active is False
-        # Settled AND pruned: a spent lease must not linger in the record.
-        assert view.lease_unit_id is None
-
-    def test_min_hold_alone_without_a_transition_keeps_the_lease(self, clock):
-        self._claim_and_commit(clock)
-        clock.advance(30.0)
-
-        assert po.plate_occupancy.snapshot(1, po.Evidence(live_state=IDLE)).lease_active is True
-
-    def test_max_hold_expires_the_lease_with_no_evidence_at_all(self, clock):
-        """An idle queue must never strand a lease past its own ceiling."""
-        self._claim_and_commit(clock)
-        clock.advance(61.0)
+    def test_release_dispatch_ends_it(self, clock):
+        self._claim_and_commit()
+        po.plate_occupancy.release_dispatch(1, "the start was reached (action 7)")
 
         view = po.plate_occupancy.snapshot(1, po.Evidence())
         assert view.lease_active is False
         assert view.lease_unit_id is None
 
-    def test_without_a_pre_state_min_hold_alone_decides(self, clock):
-        """The scheduler's old empty-string sentinel: no snapshot, no transition test."""
-        self._claim_and_commit(clock, pre_state=None)
+    def test_a_revoked_lease_holds_nothing_but_survives_for_the_commit(self, clock):
+        lease = po.plate_occupancy.claim_for_dispatch(1, 9, ev=po.Evidence())
+        assert isinstance(lease, po.DispatchLease)
+        assert po.plate_occupancy.revoke_lease(1, "operator declared the plate occupied") is True
 
-        assert po.plate_occupancy.snapshot(1, po.Evidence()).lease_active is True
-        clock.advance(2.5)
         assert po.plate_occupancy.snapshot(1, po.Evidence()).lease_active is False
-
-    @pytest.mark.parametrize("live_state", [None, ""])
-    def test_silence_is_not_a_transition(self, clock, live_state):
-        self._claim_and_commit(clock)
-        clock.advance(30.0)
-
-        assert po.plate_occupancy.snapshot(1, po.Evidence(live_state=live_state)).lease_active is True
+        assert po.plate_occupancy.commit_dispatch(1, lease) == "lease_revoked"
 
     def test_snapshot_without_evidence_reports_lease_active_none(self, clock):
-        po.plate_occupancy.claim_for_dispatch(
-            1, 9, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
-        )
+        po.plate_occupancy.claim_for_dispatch(1, 9, ev=po.Evidence())
         assert po.plate_occupancy.snapshot(1).lease_active is None
 
-    def test_settlement_never_fans_out(self, clock):
-        """A settle is an expiry, not a state change: no persist, no broadcast, no kick."""
-        self._claim_and_commit(clock)
+    def test_reading_a_lease_never_fans_out(self, clock):
+        """Reads change nothing: no persist, no broadcast, no kick."""
+        self._claim_and_commit()
         calls: list[str] = []
         po.plate_occupancy.configure(
             persist=lambda pid, view: calls.append("persist"),
@@ -862,15 +836,13 @@ class TestLeaseSettlement:
             policy_driver=lambda pid, view, cause: calls.append("policy"),
         )
 
-        clock.advance(61.0)
-        assert po.plate_occupancy.snapshot(1, po.Evidence()).lease_active is False
+        clock.advance(100_000)
+        assert po.plate_occupancy.snapshot(1, po.Evidence()).lease_active is True
 
         assert calls == []
 
     def test_printers_with_lease_or_eject(self, clock):
-        po.plate_occupancy.claim_for_dispatch(
-            1, 9, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
-        )
+        po.plate_occupancy.claim_for_dispatch(1, 9, ev=po.Evidence())
         _hold_live_eject(2)
         po.plate_occupancy.hydrate_eject(3, _pending(hydrated=True))
         _occupy(4)  # a plate alone is not a lease or an eject
@@ -1371,9 +1343,7 @@ class TestGatePriorities:
         assert po.plate_occupancy.snapshot(1, po.Evidence(live_state=IDLE)).owner == "none"
         assert po.plate_occupancy.snapshot(1, po.Evidence(live_state=RUNNING)).owner == "job"
 
-        po.plate_occupancy.claim_for_dispatch(
-            1, 9, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
-        )
+        po.plate_occupancy.claim_for_dispatch(1, 9, ev=po.Evidence())
         assert po.plate_occupancy.snapshot(1, po.Evidence(live_state=IDLE)).owner == "dispatch"
 
         po.plate_occupancy.release_dispatch(1, "test")
@@ -1407,13 +1377,9 @@ class TestGatePriorities:
             po.plate_occupancy.hydrate_plate(1, "subtask-A", po.EscalationOnly())
             po.plate_occupancy.hydrate_eject(1, _pending(hydrated=True))
         elif setup == "lease":
-            po.plate_occupancy.claim_for_dispatch(
-                1, 3, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
-            )
+            po.plate_occupancy.claim_for_dispatch(1, 3, ev=po.Evidence())
         elif setup == "plate_and_lease":
-            po.plate_occupancy.claim_for_dispatch(
-                1, 3, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
-            )
+            po.plate_occupancy.claim_for_dispatch(1, 3, ev=po.Evidence())
             _occupy(1)
             po.plate_occupancy._records[1].lease.revoked = False
 
@@ -1445,9 +1411,7 @@ class TestBedMotion:
     )
     def test_the_claim_refusal_table(self, label, setup, ev, expected, clock):
         if setup == "lease":
-            po.plate_occupancy.claim_for_dispatch(
-                1, 3, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
-            )
+            po.plate_occupancy.claim_for_dispatch(1, 3, ev=po.Evidence())
         elif setup == "live_eject":
             _hold_live_eject(1)
         elif setup == "hydrated_eject":
@@ -1466,9 +1430,7 @@ class TestBedMotion:
         assert po.plate_occupancy.dispatchable(1, idle) == "bed_motion_in_flight"
         assert po.plate_occupancy.snapshot(1).bed_motion_active is True
         # The dispatch claim is gated by the same rule, so nothing mints a lease under it.
-        refused = po.plate_occupancy.claim_for_dispatch(
-            1, 9, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=idle
-        )
+        refused = po.plate_occupancy.claim_for_dispatch(1, 9, ev=idle)
         assert refused == "bed_motion_in_flight"
 
         clock.advance(2.1)

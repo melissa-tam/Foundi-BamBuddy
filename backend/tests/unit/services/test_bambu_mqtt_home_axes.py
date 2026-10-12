@@ -30,7 +30,7 @@ def _client(model: str | None):
 def _capture(client) -> list[str]:
     sent: list[str] = []
 
-    def _send(gcode: str) -> bool:
+    def _send(gcode: str, *, sequence_id: str) -> bool:
         sent.append(gcode)
         return True
 
@@ -41,7 +41,7 @@ def _capture(client) -> list[str]:
 def test_single_nozzle_h2s_sends_bare_g28():
     client = _client("H2S")
     sent = _capture(client)
-    assert client.home_axes() is True
+    assert client.home_axes(sequence_id="1") is True
     assert sent == ["G28"]
 
 
@@ -50,7 +50,7 @@ def test_dual_nozzle_model_sends_torque_triplet(model):
     # Both the display name (H2C) and the raw device code (O1C2) resolve dual.
     client = _client(model)
     sent = _capture(client)
-    assert client.home_axes() is True
+    assert client.home_axes(sequence_id="1") is True
     assert sent == [_TRIPLET]
 
 
@@ -61,7 +61,7 @@ def test_runtime_dual_flag_overrides_missing_model():
     client = _client(None)
     client._is_dual_nozzle = True
     sent = _capture(client)
-    assert client.home_axes() is True
+    assert client.home_axes(sequence_id="1") is True
     assert sent == [_TRIPLET]
 
 
@@ -69,5 +69,5 @@ def test_axes_argument_is_ignored_single_nozzle():
     # The legacy axes argument never narrows the home — always a full home.
     client = _client("H2S")
     sent = _capture(client)
-    assert client.home_axes("z") is True
+    assert client.home_axes("z", sequence_id="1") is True
     assert sent == ["G28"]

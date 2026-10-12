@@ -213,7 +213,7 @@ class TestCensus:
     def test_the_forbidden_set_is_exactly_the_migration_list(self):
         """One origin. The census cannot drift from what ``run_migrations`` actually rebuilds."""
         assert frozenset(_AUTOINCREMENT_TABLES) == ID_REUSE_FORBIDDEN
-        assert len(_AUTOINCREMENT_TABLES) == len(set(_AUTOINCREMENT_TABLES)) == 13
+        assert len(_AUTOINCREMENT_TABLES) == len(set(_AUTOINCREMENT_TABLES)) == 14
 
     def test_the_whole_dangling_reference_class_is_forbidden(self):
         """The five non-farm tables the delete-path audit found are IN, not scheduled.

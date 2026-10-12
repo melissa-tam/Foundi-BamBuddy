@@ -804,6 +804,40 @@ class TestLivePrintQuestions:
         async with maker() as s:
             assert await completed_since(s, pid, _naive(since)) is True
 
+    async def test_completed_after_is_the_one_predicate_by_value_and_by_column(self, own_session_factory):
+        """``completed_after`` is THE "completed print after T" predicate both callers read: by value
+        (``completed_since``, one printer) and correlated by column (``farm_policy.upload_stalled_printers``'
+        bulk read, per escalation row). Each row's correlated answer equals the per-printer answer."""
+        from backend.app.models.recovery_escalation import RecoveryEscalation
+        from backend.app.services.print_binding import completed_after, completed_since
+
+        maker = own_session_factory
+        pid, other = await seed_printer(maker, serial="H2S-C"), await seed_printer(maker, serial="H2S-D")
+        await seed_archive(maker, printer_id=pid, status="completed", completed_at=NOW - timedelta(hours=1))
+        await seed_archive(maker, printer_id=pid, status="failed", completed_at=NOW)
+        await seed_archive(maker, printer_id=other, status="completed", completed_at=NOW)
+        cases = [
+            (pid, NOW - timedelta(hours=2)),  # the completion after it → True
+            (pid, NOW - timedelta(minutes=30)),  # only a failure after it → False
+            (other, NOW - timedelta(minutes=30)),  # the other printer's completion → True
+            (other, NOW + timedelta(minutes=1)),  # nothing after it → False
+        ]
+        async with maker() as s:
+            for printer_id, at in cases:
+                s.add(RecoveryEscalation(printer_id=printer_id, created_at=_naive(at), reason="upload_stalled"))
+            await s.commit()
+            by_value = [await completed_since(s, printer_id, _naive(at)) for printer_id, at in cases]
+            rows = await s.execute(
+                select(
+                    RecoveryEscalation.printer_id,
+                    RecoveryEscalation.created_at,
+                    completed_after(RecoveryEscalation.printer_id, RecoveryEscalation.created_at),
+                ).order_by(RecoveryEscalation.id)
+            )
+            by_column = [bool(found) for _pid, _at, found in rows.all()]
+        assert by_value == [True, False, True, False]
+        assert by_column == by_value
+
 
 # ---------------------------------------------------------------------------
 # RC1 — the restart regression, through main.on_print_complete

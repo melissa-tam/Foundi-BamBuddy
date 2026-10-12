@@ -2498,7 +2498,7 @@ class NotificationService:
         path returned 200 and moved nothing, and the printer would have taken no work
         until somebody touched its screen. A load into an empty path under the
         firmware's change-error modal is the one measured posture; every other command
-        in this state is measured per send by :mod:`ams_command`. The page names the
+        in this state is measured per send by :mod:`command_outcome`. The page names the
         printer's Continue and the printer card's Unload, which reports whether the AMS
         moved.
 
@@ -2528,6 +2528,39 @@ class NotificationService:
             message,
             db,
             "ams_wedged_idle",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            variables=variables,
+        )
+
+    async def on_printer_waiting(
+        self,
+        printer_id: int | None,
+        printer_name: str,
+        detail: str,
+        db: AsyncSession,
+    ):
+        """Fire when the farm has been WAITING on a printer past the page bound (2026-10-11).
+
+        The farm decides no printer outcome by a clock: a command the printer accepted and has not
+        carried out, a printer RUNNING inside a firmware change, a read the firmware never answered —
+        each WAITS for the printer's own event. This is how a person hears of the wait. ONE caller,
+        the attention owner (``farm_stall.check_waiting_on_printers``), which owns the bound, the
+        once-guard and the hourly repeat; ``detail`` is its whole sentence.
+        """
+        providers = await self._get_providers_for_event(db, "on_printer_waiting", printer_id)
+        if not providers:
+            return
+
+        variables = {"printer_name": printer_name, "detail": detail}
+        title, message = await self._build_message_from_template(db, "printer_waiting", variables)
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "printer_waiting",
             printer_id,
             printer_name,
             force_immediate=True,
@@ -2663,7 +2696,6 @@ class NotificationService:
         *,
         bed_c: float | None,
         line_c: float | None,
-        max_hold_minutes: int,
         db: AsyncSession,
     ):
         """Fire when a post-print eject cooldown is running long.
@@ -2671,8 +2703,8 @@ class NotificationService:
         Distinct from ``plate_not_empty`` (which means "objects on the plate"):
         the bed simply has not been released yet. The ``detail`` states the live bed,
         the eject line (measured shop air + margin; None when shop air is unknown, and
-        the detail then says so), and what happens next — a forced eject at the
-        max-hold cap, or, when the cap is disabled, that none is set. Built here so the
+        the detail then says so), and what happens next — the eject waits for the bed to
+        reach the line or stop cooling; there is no time cap (2026-10-11). Built here so the
         template stays a simple ``{printer}: {detail}``.
         """
         providers = await self._get_providers_for_event(db, "on_cooldown_escalation", printer_id)
@@ -2680,12 +2712,11 @@ class NotificationService:
             return
 
         bed_txt = f"{bed_c:.0f}" if bed_c is not None else "unknown"
-        if max_hold_minutes and max_hold_minutes > 0:
-            cap_txt = f"forced eject at the {max_hold_minutes}-minute cap"
-        else:
-            cap_txt = "no forced-eject cap is set"
         line_txt = f"eject line {line_c:.0f} °C" if line_c is not None else "no eject line (shop air unknown)"
-        detail = f"Still cooling: bed {bed_txt} °C, {line_txt} — {cap_txt}."
+        detail = (
+            f"Still cooling: bed {bed_txt} °C, {line_txt}. The eject runs when the bed reaches the line or stops "
+            "cooling."
+        )
 
         variables = {
             "printer": printer_name,

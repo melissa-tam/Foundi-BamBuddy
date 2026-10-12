@@ -78,7 +78,9 @@ class TestIntegritySweepScope:
         present = await _add_file(db_session, base_dir, "archive/library/files/here.3mf")
         missing = await _add_file(db_session, base_dir, "archive/library/files/gone.3mf", write_bytes=False)
         # External bytes live outside our management — their absence is not our fault.
-        await _add_file(db_session, base_dir, str(base_dir / "elsewhere" / "ext.3mf"), write_bytes=False, is_external=True)
+        await _add_file(
+            db_session, base_dir, str(base_dir / "elsewhere" / "ext.3mf"), write_bytes=False, is_external=True
+        )
         # A trashed row is EXPECTED to lose its bytes; announcing it would be noise.
         await _add_file(
             db_session,

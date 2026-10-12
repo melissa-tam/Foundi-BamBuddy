@@ -17,6 +17,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from backend.tests._fixtures.printer_action import route_verbs
+
 
 def _occupancy():
     """The authority singleton (imported lazily so module import order stays free)."""
@@ -724,28 +726,49 @@ class _PlateCheckJourney:
 class _LadderWire:
     """The one scripted printer the plate-check ladder journeys run against: a live
     ``PrinterState`` the episode driver polls through ``printer_manager.get_status``, the client
-    it presses and reads through (the same client ``farm_policy`` lifts the bed with), and the
-    raw ``stop_print``.
+    it presses, stops and reads through (the same client ``farm_policy`` lifts the bed with), and
+    what production's event hub hands the record (2026-10-11 — every send is an action the record
+    answers on an event, never a window).
 
-    ``after_press`` / ``after_stop`` are the printer's answers: mutations applied one per status
-    read after that send (the last one holds), so the journey scripts what the driver's own
-    polls see rather than a clock. The stop's default answer is the firmware's own for a stop
-    from PAUSE — IDLE, the dialog and the HMS list gone."""
+    ``after_press`` is the printer's answer to a press: mutations applied one per status read after
+    it (the last one holds), so the journey scripts what the driver's own polls see rather than a
+    clock. The stop's answer is applied AT its publish: the firmware's own for a stop from PAUSE —
+    IDLE, the dialog and the HMS list gone — unless ``stop_taken`` is False. ``ack`` / ``stop_ack``
+    hand the record the firmware's ACK of a press / a stop on the loop right after the publish; the
+    record reads the printer's reports from :meth:`_PlateCheckLadder._episode_done`'s pump."""
 
-    def __init__(self, state, *, ack="success", layer=1, after_press=(), stop_taken=True):
+    current: "_LadderWire | None" = None
+
+    def __init__(self, state, *, ack="success", layer=1, after_press=(), stop_taken=True, stop_ack=None):
         self.state = state
         self.layer = layer
         self.after_press = list(after_press)
         self.stop_taken = stop_taken
+        self.stop_ack = stop_ack
         self.presses: list[tuple] = []
+        self._pressed: set = set()
         self.stops: list[int] = []
+        self.printer_id: int | None = None
         self._pending: list = []
         self.client = MagicMock()
         self.client.execute_hms_action.side_effect = self._press
-        self.client.await_ack = AsyncMock(side_effect=lambda sent, budget_s, poll_s: self._ack(sent, ack))
+        self.client.stop_print.side_effect = self._stop
+        self.ack = ack
+        self.client.ack_for.side_effect = self._ack_for
         self.client.job_peaks.side_effect = self._peaks
         self.client.feed.side_effect = self._feed
         self.client.send_gcode.return_value = True  # the held-bed lift
+
+    def _to_record(self, command, sequence_id, result):
+        """The firmware's ACK, handed to the record on the loop right after the publish."""
+        from backend.app.services import printer_action
+        from backend.app.services.bambu_mqtt import CommandAck
+        from backend.app.services.printer_events import CommandAcked
+
+        ack = CommandAck(command=command, sequence_id=str(sequence_id), result=result, reason=None, at=0.0)
+        asyncio.get_running_loop().call_soon(
+            printer_action.on_command_acked, CommandAcked(printer_id=self.printer_id, ack=ack)
+        )
 
     @staticmethod
     def set(**fields):
@@ -778,28 +801,34 @@ class _LadderWire:
 
         return ScriptedFeed().settle(self.state)
 
-    def _press(self, print_error, action, job_id):
-        from backend.app.services.bambu_mqtt import SentCommand
-
+    def _press(self, print_error, action, job_id, *, sequence_id=None):
         self.presses.append((print_error, action, job_id))
+        self._pressed.add(sequence_id)
         self._pending = list(self.after_press)
-        return SentCommand(command="resume", sequence_id=str(len(self.presses)))
+        if self.ack is not None:
+            self._to_record("resume", sequence_id, self.ack)
+        return True
 
-    @staticmethod
-    def _ack(sent, result):
+    def _ack_for(self, sequence_id):
+        """The firmware's ACK of a press, read by the record (``printer_action.ack_of``)."""
         from backend.app.services.bambu_mqtt import CommandAck
 
-        return CommandAck(command=sent.command, sequence_id=sent.sequence_id, result=result, reason=None, at=0.0)
+        if self.ack is None or sequence_id not in self._pressed:
+            return None
+        return CommandAck(command="resume", sequence_id=sequence_id, result=self.ack, reason=None, at=0.0)
 
-    def get_status(self, _printer_id):
+    def get_status(self, printer_id):
+        self.printer_id = printer_id
         if self._pending:
             self._pending.pop(0)(self)
         return self.state
 
-    def stop_print(self, printer_id):
-        self.stops.append(printer_id)
+    def _stop(self, *, sequence_id=None):
+        self.stops.append(self.printer_id)
         if self.stop_taken:
-            self._pending = [self.set(state="IDLE", print_error=0, hms_errors=[])]
+            self.set(state="IDLE", print_error=0, hms_errors=[])(self)
+        if self.stop_ack is not None:
+            self._to_record("stop", sequence_id, self.stop_ack)
         return True
 
     def install(self, stack):
@@ -807,7 +836,7 @@ class _LadderWire:
 
         stack.enter_context(patch.object(printer_manager, "get_status", side_effect=self.get_status))
         stack.enter_context(patch.object(printer_manager, "get_client", return_value=self.client))
-        stack.enter_context(patch.object(printer_manager, "stop_print", side_effect=self.stop_print))
+        stack.enter_context(patch.object(_LadderWire, "current", self))
         return self
 
 
@@ -836,20 +865,12 @@ class _PlateCheckLadder(_PlateCheckJourney):
         return state
 
     @staticmethod
-    def _fast_ladder(stack, *, stop_confirm_s=5.0):
-        """The ladder's waits, collapsed. ``stop_confirm_s`` stays long where the journey itself
-        delivers the terminal the driver is waiting for."""
+    def _fast_ladder(stack):
+        """The ladder's push cadence, collapsed. No number decides an outcome any more (2026-10-11):
+        every send is answered by the record on an event."""
         from backend.app.services import pause_recovery
 
-        for name, value in (
-            ("_EPISODE_POLL_S", 0.01),
-            ("_RECHECK_ACK_S", 0.05),
-            ("_RECHECK_ACK_POLL_S", 0.01),
-            ("_RECHECK_CONFIRM_S", 0.2),
-            ("_STOP_CONFIRM_S", stop_confirm_s),
-            ("_VISION_STOP_RETRY_S", 0.0),
-        ):
-            stack.enter_context(patch.object(pause_recovery, name, value))
+        stack.enter_context(patch.object(pause_recovery, "_EPISODE_POLL_S", 0.005))
 
     @staticmethod
     def _decision_window(stack, seconds):
@@ -896,11 +917,40 @@ class _PlateCheckLadder(_PlateCheckJourney):
 
     @staticmethod
     async def _episode_done(printer_id):
-        """Await the episode driver the sampler spawned, to its end."""
+        """Run the episode driver the sampler spawned to its end, the record fed the printer's reports
+        meanwhile (production's hub: ``printer_action.on_status_reported`` per push)."""
         import backend.app.core.tasks as core_tasks
+        from backend.app.services import printer_action
+        from backend.app.services.printer_events import StatusReported
 
         name = f"plate-check-p{printer_id}"
-        pending = [t for t in list(core_tasks._background_tasks) if t.get_name() == name and not t.done()]
+        loop = asyncio.get_running_loop()
+        for _ in range(5000):
+            pending = [
+                t
+                for t in list(core_tasks._background_tasks)
+                if t.get_name() == name and not t.done() and t.get_loop() is loop
+            ]
+            if not pending:
+                return
+            wire = _LadderWire.current
+            if wire is not None:
+                printer_action.on_status_reported(StatusReported(printer_id=printer_id, state=wire.state))
+            await asyncio.sleep(0.002)
+        pytest.fail(f"the plate-check driver on printer {printer_id} never ended")
+
+    @staticmethod
+    async def _press_answered(printer_id):
+        """Await a person's press's ledger answer — written when the record has the printer's answer."""
+        import backend.app.core.tasks as core_tasks
+
+        name = f"plate-check-press-p{printer_id}"
+        loop = asyncio.get_running_loop()
+        pending = [
+            t
+            for t in list(core_tasks._background_tasks)
+            if t.get_name() == name and not t.done() and t.get_loop() is loop
+        ]
         if pending:
             await asyncio.wait_for(asyncio.gather(*pending), timeout=10)
 
@@ -1093,8 +1143,9 @@ class TestPlateCheckLadderJourney(_PlateCheckLadder):
     async def test_iii_the_retrys_own_failure_holds_for_a_person_whose_ignore_resumes_it(
         self, test_engine, clock, async_client
     ):
-        """A second failed episode on this printer inside the hour would be an escalation, so the
-        print is HELD paused at the dialog (operator ruling 2026-10-05): the hold shows on /status,
+        """The RETRY's own failed re-check is an escalation (the unit is the retry of a plate the farm
+        already stopped and retried — its lineage, ruling 2026-09-29), so the print is HELD paused at
+        the dialog (operator ruling 2026-10-05): the hold shows on /status,
         a person's Ignore and resume through the route is sent and answered, the same job prints
         on, and the hold closes ``observed_running`` through the rule table — no stop, no gate."""
         from contextlib import ExitStack
@@ -1130,13 +1181,14 @@ class TestPlateCheckLadderJourney(_PlateCheckLadder):
             assert exit_["actions"] == ["PROBLEM_SOLVED_RESUME", "IGNORE_RESUME"]
 
             # Ignore and resume, through the route — and the printer accepts it.
-            wire.client.await_ack = AsyncMock(side_effect=lambda sent, budget_s, poll_s: wire._ack(sent, "success"))
+            wire.ack = "success"
             response = await async_client.post(
                 f"/api/v1/printers/{printer_id}/hms/execute-action",
                 json={"print_error": exit_["print_error"], "action": "IGNORE_RESUME", "job_id": exit_["job_id"]},
             )
             assert response.status_code == 200
             assert wire.presses[-1] == ("0500808C", "IGNORE_RESUME", "SUB-3R")
+            await self._press_answered(printer_id)
             assert await self._ledger(mocks.maker, row.id) == [("dialog", "fail"), ("dialog", "success")]
 
             # The same job prints on: the hold closes through the rule table.
@@ -1247,7 +1299,7 @@ class TestPlateCheckLadderJourney(_PlateCheckLadder):
             assert len(waits) == 1
 
     @pytest.mark.asyncio
-    async def test_v_a_stop_the_farm_cannot_land_falls_back_to_the_paused_hold(self, test_engine):
+    async def test_v_a_stop_the_printer_refuses_falls_back_to_the_paused_hold(self, test_engine):
         from contextlib import ExitStack
 
         from backend.app.models.print_queue import PrintQueueItem
@@ -1257,9 +1309,12 @@ class TestPlateCheckLadderJourney(_PlateCheckLadder):
         with ExitStack() as stack:
             mocks = TestPlateClearGate._setup_mocks(stack, test_engine)
             printer_id, item_id, _batch = await self._seed_farm_unit(mocks.maker, serial="LAD-5", subtask="SUB-5")
-            wire = _LadderWire(self._paused("SUB-5"), ack="fail", stop_taken=False, layer=0).install(stack)
+            # The printer REFUSES the farm's stop (its fail ACK): the job never ends by it.
+            wire = _LadderWire(self._paused("SUB-5"), ack="fail", stop_taken=False, stop_ack="fail", layer=0).install(
+                stack
+            )
             page = stack.enter_context(patch.object(notification_service, "on_plate_not_empty", new_callable=AsyncMock))
-            self._fast_ladder(stack, stop_confirm_s=0.2)
+            self._fast_ladder(stack)
 
             pause_recovery.note_status_push(printer_id, wire.state)
             await self._episode_done(printer_id)
@@ -1802,6 +1857,112 @@ class TestFarmRestartStop(_PlateCheckJourney):
             assert _occupancy().is_plate_occupied(printer_id) is False
 
 
+class TestFarmAirStop(_PlateCheckJourney):
+    """The terminal of a job the farm STOPPED because it printed on AIR (operator ruling 2026-10-12:
+    "printing on air = ruined print already" — on proof a layer printed with nothing fed, the farm stops
+    the ruined print and the unit is retried). Driven through the real ``on_print_complete``, job phase
+    and ``farm_policy``; the open row's ledger carries the farm's air stop through the store's own writer
+    (``printer_incidents.note_step`` → ``PAYLOAD_AIR_STOP``), never a patched projection.
+
+    The ORDINARY failed disposition: recorded ``failed`` (``printed_without_filament``, the measured
+    sentence), the unit's one retry, the consecutive-failure count, the plate gate of a deposit — and the
+    H2S's echo of the farm's own remote stop is never read as an operator stop (which would cancel the
+    unit with no retry and hold its run)."""
+
+    _SUB = "SUB-AIR"
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        self._reset_process_state()
+        yield
+        self._reset_process_state()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("screen_echo", [True, False], ids=["h2s_cancel_echo", "h2c_no_echo"])
+    async def test_the_unit_fails_printed_without_filament_and_is_retried(self, test_engine, screen_echo):
+        import contextlib
+        from contextlib import ExitStack
+
+        from sqlalchemy import select
+
+        from backend.app.main import on_print_complete
+        from backend.app.models.print_batch import PrintBatch
+        from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.models.printer_incident import KIND_TOOLHEAD_REFILL, STATUS_RECOVERING
+        from backend.app.services import farm_policy, printer_incidents
+
+        tasks_before = set(asyncio.all_tasks())
+        with ExitStack() as stack:
+            mocks = TestPlateClearGate._setup_mocks(stack, test_engine)
+            stopped_page = stack.enter_context(
+                patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock)
+            )
+            quarantine = stack.enter_context(
+                patch.object(farm_policy, "maybe_quarantine_printer", new_callable=AsyncMock)
+            )
+            printer_id, item_id, batch_id = await self._seed_farm_unit(
+                mocks.maker, serial=f"AIR-{int(screen_echo)}", subtask=self._SUB
+            )
+            async with mocks.maker() as s:
+                row = await printer_incidents.open_new(
+                    s,
+                    printer_id=printer_id,
+                    job_id=self._SUB,
+                    item_id=item_id,
+                    kind=KIND_TOOLHEAD_REFILL,
+                    code="",
+                    codes="",
+                    slot_global_tray=0,
+                    status=STATUS_RECOVERING,
+                )
+                # The farm's air stop, as its owner writes it BEFORE the frame goes out.
+                await printer_incidents.note_step(s, row.id, seq=1, kind="stop", name=printer_incidents.AIR_STOP_STEP)
+            assert printer_incidents.air_stop_sent(printer_id) is True
+
+            payload = {
+                "status": "failed",
+                "filename": "/data/Metadata/test.gcode",
+                "subtask_name": "Test",
+                "subtask_id": self._SUB,
+                "timelapse_was_active": False,
+                "peaks_reliable": True,
+                "last_layer_num": 63,
+                "last_progress": 52.0,
+                "total_layers": 120,
+                "first_unfed_layer": 61,
+            }
+            if screen_echo:
+                payload["user_cancel_observed"] = True
+            await on_print_complete(printer_id, payload)
+            for task in asyncio.all_tasks() - tasks_before:
+                if (task.get_name() or "").startswith(("farm-policy-terminal", "notify-no-archive")):
+                    with contextlib.suppress(Exception):
+                        await task
+            await TestPlateClearGate._drain(tasks_before)
+
+            async with mocks.maker() as s:
+                item = await s.get(PrintQueueItem, item_id)
+                # A failed print, never an operator's stop — and the operator reads why.
+                assert (item.status, item.stop_source) == ("failed", None)
+                assert (item.error_message or "").startswith("Printed without filament from layer 61 of 120")
+                retries = (
+                    (await s.execute(select(PrintQueueItem).where(PrintQueueItem.retry_of_id == item_id)))
+                    .scalars()
+                    .all()
+                )
+                assert len(retries) == 1  # the unit's one retry is spent on it
+                batch = await s.get(PrintBatch, batch_id)
+                assert (batch.status, batch.pause_reason) == ("active", None)  # the run is not held
+                # The terminal's closer ended the toolhead row (a job hold cannot outlive its job).
+                assert await printer_incidents.get_open(s, printer_id) is None
+
+            stopped_page.assert_not_awaited()  # no operator-stop page
+            quarantine.assert_awaited()  # the consecutive-failure count reads it
+            assert mocks.notif.on_print_complete.await_args.args[2] == "failed"
+            # A deposit: the plate is gated for the eject, as for any failed print with a part on it.
+            assert _occupancy().is_plate_occupied(printer_id) is True
+
+
 class TestAnUnattributedAbortHoldsTheRun(_PlateCheckJourney):
     """An ``aborted`` terminal nobody attributed (no UI mark, no screen echo, no hold, no
     reconcile flag) on a farm unit that DEPOSITED — the printer ended the job in neither
@@ -1870,7 +2031,7 @@ class TestQueuePageStopReachesThePolicy(_PlateCheckJourney):
             stopped_page = stack.enter_context(
                 patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock)
             )
-            stack.enter_context(patch.object(printer_manager, "stop_print", return_value=True))
+            stack.enter_context(route_verbs(stop=lambda *_a, **_k: True))
             printer_id, item_id, batch_id = await self._seed_farm_unit(mocks.maker, serial="QPS-1", subtask="SUB-Q")
 
             # The REAL route: the operator's request, then the row committed ``cancelled`` /
@@ -1963,7 +2124,7 @@ class TestOperatorStopIsDurable(_DurableStop):
             stopped_page = stack.enter_context(
                 patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock)
             )
-            stack.enter_context(patch.object(printer_manager, "stop_print", return_value=True))
+            stack.enter_context(route_verbs(stop=lambda *_a, **_k: True))
             outcomes, dispositions = self.spy_policy(stack)
             printer_id, item_id, batch_id = await self._seed_farm_unit(
                 mocks.maker, serial=f"DRQ-{raw}", subtask="SUB-RQ"
@@ -2009,7 +2170,7 @@ class TestOperatorStopIsDurable(_DurableStop):
             )
             running = self._state(gcode_state="RUNNING", subtask="SUB-RC")
             stack.enter_context(patch.object(printer_manager, "get_status", return_value=running))
-            stack.enter_context(patch.object(printer_manager, "stop_print", return_value=True))
+            stack.enter_context(route_verbs(stop=lambda *_a, **_k: True))
             outcomes, dispositions = self.spy_policy(stack)
             printer_id, item_id, batch_id = await self._seed_farm_unit(
                 mocks.maker, serial=f"DRC-{raw}", subtask="SUB-RC"
@@ -2049,7 +2210,7 @@ class TestOperatorStopIsDurable(_DurableStop):
             mocks = TestPlateClearGate._setup_mocks(stack, test_engine)
             idle = self._state(gcode_state="IDLE", subtask=None)
             stack.enter_context(patch.object(printer_manager, "get_status", return_value=idle))
-            stack.enter_context(patch.object(printer_manager, "stop_print", return_value=True))
+            stack.enter_context(route_verbs(stop=lambda *_a, **_k: True))
             outcomes, _dispositions = self.spy_policy(stack)
             printer_id, item_id, _batch = await self._seed_farm_unit(mocks.maker, serial="DST-1", subtask="SUB-DEAD")
 
@@ -2092,7 +2253,7 @@ class TestOperatorStopIsDurable(_DurableStop):
             stopped_page = stack.enter_context(
                 patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock)
             )
-            stack.enter_context(patch.object(printer_manager, "stop_print", return_value=True))
+            stack.enter_context(route_verbs(stop=lambda *_a, **_k: True))
             outcomes, dispositions = self.spy_policy(stack)
             printer_id, item_id, batch_id = await self._seed_farm_unit(mocks.maker, serial="DUP-1", subtask="SUB-DQ")
 
@@ -2816,23 +2977,32 @@ class TestOccupancyLiveness:
         ``eject_in_flight`` (8 consecutive on printer 4, 01:46-01:49) until the operator
         hand-jogged the toolhead. The start deadline is the ONLY signal that shape
         produces, so it must free the printer while KEEPING the plate gated: the sweep
-        never ran, the part is still there."""
+        never ran, the part is still there.
+
+        Answered by the RECORD, never a deadline (2026-10-11): the busy job's end with the
+        sweep's own id never reported voids its ``eject_start``, and that answer — however
+        long the busy job ran — is what retires the claim."""
         from backend.app.services.eject import remote
         from backend.app.services.plate_occupancy import EscalationOnly, Evidence
+        from backend.app.services.printer_events import ActionAnswered
 
         pid = 4101
-        _claim_eject(pid, purpose="manual", run_id=None, queue_item_id=None)
+        _claim_eject(pid, purpose="manual", run_id=None, queue_item_id=None, start_action_id=77)
         assert _occupancy().ejectable(pid, Evidence(live_state="IDLE")) == "eject_in_flight"
 
-        slept: list[float] = []
-
-        async def _sleep(seconds):
-            slept.append(seconds)
-
         with patch("backend.app.services.eject.monitor.notify_plate_not_empty", new_callable=AsyncMock) as paged:
-            await remote._start_deadline(pid, sleep=_sleep, timeout_s=1.0)
+            await remote.on_action_answered(
+                ActionAnswered(
+                    printer_id=pid,
+                    action_id=77,
+                    command="eject_start",
+                    actor="farm",
+                    incident_id=None,
+                    answer="void",
+                    reason="the printer was busy with another job and never started it",
+                )
+            )
 
-        assert slept == [1.0], "The deadline must WAIT the timeout before concluding anything."
         # The printer is free: the claim is gone and a new eject may be dispatched.
         assert _occupancy().eject_identity(pid) is None
         assert _occupancy().ejectable(pid, Evidence(live_state="IDLE")) is None

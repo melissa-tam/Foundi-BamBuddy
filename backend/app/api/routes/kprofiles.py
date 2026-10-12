@@ -21,6 +21,7 @@ from backend.app.schemas.kprofile import (
     KProfileNoteResponse,
     KProfilesResponse,
 )
+from backend.app.services import printer_action
 from backend.app.services.printer_manager import printer_manager
 
 logger = logging.getLogger(__name__)
@@ -124,27 +125,39 @@ async def set_kprofile(
     if is_edit and is_dual_nozzle:
         # Dual-nozzle in-place edit: use cali_idx with slot_id=0 and empty setting_id
         logger.info("[API] Dual-nozzle in-place edit: cali_idx=%s", profile.slot_id)
-        success = client.set_kprofile(
-            filament_id=profile.filament_id,
-            name=profile.name,
-            k_value=profile.k_value,
-            nozzle_diameter=profile.nozzle_diameter,
-            nozzle_id=profile.nozzle_id,
-            extruder_id=profile.extruder_id,
-            setting_id=None,
-            slot_id=0,
-            cali_idx=profile.slot_id,  # Pass the original slot for in-place edit
+        success = await printer_action.operator_verb(
+            printer_id,
+            "extrusion_cali_set",
+            lambda live, seq: live.set_kprofile(
+                filament_id=profile.filament_id,
+                name=profile.name,
+                k_value=profile.k_value,
+                nozzle_diameter=profile.nozzle_diameter,
+                nozzle_id=profile.nozzle_id,
+                extruder_id=profile.extruder_id,
+                setting_id=None,
+                slot_id=0,
+                cali_idx=profile.slot_id,  # Pass the original slot for in-place edit
+                sequence_id=seq,
+            ),
+            client=client,
         )
     elif is_edit:
         # Single-nozzle edit: use delete + add approach
         logger.info("[API] Edit: deleting existing profile slot_id=%s", profile.slot_id)
-        delete_success = client.delete_kprofile(
-            cali_idx=profile.slot_id,
-            filament_id=profile.filament_id,
-            nozzle_id=profile.nozzle_id,
-            nozzle_diameter=profile.nozzle_diameter,
-            extruder_id=profile.extruder_id,
-            setting_id=profile.setting_id,
+        delete_success = await printer_action.operator_verb(
+            printer_id,
+            "extrusion_cali_del",
+            lambda live, seq: live.delete_kprofile(
+                cali_idx=profile.slot_id,
+                filament_id=profile.filament_id,
+                nozzle_id=profile.nozzle_id,
+                nozzle_diameter=profile.nozzle_diameter,
+                extruder_id=profile.extruder_id,
+                setting_id=profile.setting_id,
+                sequence_id=seq,
+            ),
+            client=client,
         )
         if not delete_success:
             raise HTTPException(500, "Failed to delete existing K-profile for edit")
@@ -153,27 +166,39 @@ async def set_kprofile(
         await asyncio.sleep(0.5)
         logger.info("[API] Edit: delete complete, now adding updated profile")
 
-        success = client.set_kprofile(
-            filament_id=profile.filament_id,
-            name=profile.name,
-            k_value=profile.k_value,
-            nozzle_diameter=profile.nozzle_diameter,
-            nozzle_id=profile.nozzle_id,
-            extruder_id=profile.extruder_id,
-            setting_id=None,  # Generate new setting_id for add
-            slot_id=0,  # Always 0 for add (new profile)
+        success = await printer_action.operator_verb(
+            printer_id,
+            "extrusion_cali_set",
+            lambda live, seq: live.set_kprofile(
+                filament_id=profile.filament_id,
+                name=profile.name,
+                k_value=profile.k_value,
+                nozzle_diameter=profile.nozzle_diameter,
+                nozzle_id=profile.nozzle_id,
+                extruder_id=profile.extruder_id,
+                setting_id=None,  # Generate new setting_id for add
+                slot_id=0,  # Always 0 for add (new profile)
+                sequence_id=seq,
+            ),
+            client=client,
         )
     else:
         # New profile: add with slot_id=0
-        success = client.set_kprofile(
-            filament_id=profile.filament_id,
-            name=profile.name,
-            k_value=profile.k_value,
-            nozzle_diameter=profile.nozzle_diameter,
-            nozzle_id=profile.nozzle_id,
-            extruder_id=profile.extruder_id,
-            setting_id=None,  # Generate new setting_id for add
-            slot_id=0,  # Always 0 for add (new profile)
+        success = await printer_action.operator_verb(
+            printer_id,
+            "extrusion_cali_set",
+            lambda live, seq: live.set_kprofile(
+                filament_id=profile.filament_id,
+                name=profile.name,
+                k_value=profile.k_value,
+                nozzle_diameter=profile.nozzle_diameter,
+                nozzle_id=profile.nozzle_id,
+                extruder_id=profile.extruder_id,
+                setting_id=None,  # Generate new setting_id for add
+                slot_id=0,  # Always 0 for add (new profile)
+                sequence_id=seq,
+            ),
+            client=client,
         )
 
     if not success:
@@ -234,7 +259,12 @@ async def set_kprofiles_batch(
     # Get nozzle_diameter from first profile (all should have same)
     nozzle_diameter = profiles[0].nozzle_diameter
 
-    success = client.set_kprofiles_batch(profile_dicts, nozzle_diameter)
+    success = await printer_action.operator_verb(
+        printer_id,
+        "extrusion_cali_set",
+        lambda live, seq: live.set_kprofiles_batch(profile_dicts, nozzle_diameter, sequence_id=seq),
+        client=client,
+    )
 
     if not success:
         raise HTTPException(500, "Failed to send K-profiles batch command")
@@ -271,13 +301,19 @@ async def delete_kprofile(
         f"[API] delete_kprofile: printer={printer_id}, slot_id={profile.slot_id}, "
         f"setting_id={profile.setting_id}, filament_id={profile.filament_id}"
     )
-    success = client.delete_kprofile(
-        cali_idx=profile.slot_id,
-        filament_id=profile.filament_id,
-        nozzle_id=profile.nozzle_id,
-        nozzle_diameter=profile.nozzle_diameter,
-        extruder_id=profile.extruder_id,
-        setting_id=profile.setting_id,
+    success = await printer_action.operator_verb(
+        printer_id,
+        "extrusion_cali_del",
+        lambda live, seq: live.delete_kprofile(
+            cali_idx=profile.slot_id,
+            filament_id=profile.filament_id,
+            nozzle_id=profile.nozzle_id,
+            nozzle_diameter=profile.nozzle_diameter,
+            extruder_id=profile.extruder_id,
+            setting_id=profile.setting_id,
+            sequence_id=seq,
+        ),
+        client=client,
     )
 
     if not success:

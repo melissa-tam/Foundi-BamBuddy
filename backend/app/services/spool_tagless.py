@@ -362,9 +362,8 @@ _SPENT_SWAP_PARK_AFTER_S: float = 900.0
 # ~1 s while the firmware runs its own RFID read; an ``ams_filament_setting`` write
 # landing in that window destroys the RFID-detected state and the firmware never
 # retries (2026-07-25: a fresh Bambu-tagged roll sat as the tagless default with a
-# phantom binding for 6 h). 30 s ≈ the fork's own identify bounds
-# (``ams_presence._IDENTIFY_ACTIVE_S`` / the client's ``_IDENTIFY_GATE_S``), i.e. the
-# window in which a firmware read may still be running.
+# phantom binding for 6 h). 30 s ≈ the client's identify gate (``_IDENTIFY_GATE_S``), i.e.
+# the window in which a firmware read may still be running (invariant 5's settle).
 _CONFIG_SETTLE_S = 30.0
 
 # Hard cap on the second settle arm (an UNANSWERED physical cycle — the farm does not
@@ -1123,6 +1122,15 @@ def _apply_new_fields(spool: Spool, fields: dict | None) -> None:
         spool.note = note
 
 
+class Replacement(NamedTuple):
+    """What :func:`_replace_row_after_cycle` did: the replacement row, and whether this lane's tagless
+    config write for the slot (:func:`_push_config`) went out — False when the bind was refused, the
+    push did not go out, or the replacement minted from the tray's own config (no tagless write)."""
+
+    spool: Spool
+    config_published: bool
+
+
 async def _replace_row_after_cycle(
     db: AsyncSession,
     printer_id: int,
@@ -1132,7 +1140,7 @@ async def _replace_row_after_cycle(
     departed: Spool,
     *,
     new_fields: dict | None = None,
-) -> Spool:
+) -> Replacement:
     """Archive a departed tagless row and mint+bind+push its replacement.
 
     The OPERATOR lane's spent-binding / fresh-roll transition, shared by
@@ -1147,7 +1155,8 @@ async def _replace_row_after_cycle(
     default's complete identity; else mints from the tray's own (genuinely different)
     config.
     Optional ``new_fields`` (brand/label_weight/cost_per_kg/note) ride the new row.
-    Commits; broadcasts ``spool_auto_assigned(origin="tagless")``. Returns the new spool.
+    Commits; broadcasts ``spool_auto_assigned(origin="tagless")``. Returns the new spool and whether its
+    tagless config write went out (:class:`Replacement`).
 
     **The ARCHIVE stamp lands before the unbind, and that ordering is load-bearing.**
     The departure goes through ``spool_binding.release_spool_from_slot`` — the ONE
@@ -1192,8 +1201,8 @@ async def _replace_row_after_cycle(
                 ams_id,
                 tray_id,
             )
-            return new_spool
-        await _push_config(db, new_spool, printer_id, ams_id, tray_id, tray or {})
+            return Replacement(new_spool, False)
+        published = await _push_config(db, new_spool, printer_id, ams_id, tray_id, tray or {})
     else:
         if not tray_configured:
             # No configured tray to mint from and no default → cannot build an identity.
@@ -1210,8 +1219,9 @@ async def _replace_row_after_cycle(
             tray_info_idx=tray.get("tray_info_idx", "") or "",
         )
         await db.commit()
+        published = False  # minted from the tray's own config: no tagless config write
     await _broadcast_auto_assigned(printer_id, ams_id, tray_id, new_spool.id, origin="tagless")
-    return new_spool
+    return Replacement(new_spool, published)
 
 
 # --- ledger-overcharge reconcile (009-H2S spool 290, 2026-08-12) ------------
@@ -1264,9 +1274,12 @@ async def _replace_row_after_cycle(
 #    ruling — not even a warning, because a warning there is noise. Rule 8 governs it:
 #    hardware runout evidence is the exhaustion truth, never ``label − weight_used``.
 #  * **A recorded re-bind.** A release HARD-DELETES the assignment row, so a live
-#    ``SpoolAssignment.created_at`` is the moment of the CURRENT bind. Meaningfully later
-#    than the spool row's own ``created_at`` means the roll left and came back at a KNOWN
-#    instant — the only instant at which an unobserved swap could have happened.
+#    ``SpoolAssignment.created_at`` is the moment of the CURRENT bind. A CHARGED TERMINAL
+#    between the spool row's own ``created_at`` and that bind (a ``spool_usage_history`` row
+#    of this spool before the boundary — :func:`_charged_before`) means the row was in service,
+#    left and came back at a KNOWN instant — the only instant at which an unobserved swap could
+#    have happened. An event, never a gap: a mint and its bind with no print between them is
+#    the original binding however long the two happened to be apart (2026-10-11).
 #
 # Attribution is then EXACT, never apportioned: the successor is charged the SUM of the
 # ``spool_usage_history`` rows recorded since that boundary, and those rows are RE-POINTED
@@ -1317,14 +1330,6 @@ _OVERCHARGE_MARGIN_G = 20.0
 # derived from how the tracker attributes grams, and nothing an operator could tune it to
 # would be more correct.
 _REATTRIBUTION_FIT_MARGIN_G = 20.0
-
-# How much later than the spool row's own creation an assignment's ``created_at`` must sit
-# before it counts as a RE-bind rather than the original one. A mint and its bind happen
-# inside one request — the gap is milliseconds to seconds (a mint, a flush, a bind, a
-# commit) — while the re-bind this lane looks for is separated from the mint by at least
-# one print. Two minutes is far above the former and far below the latter, so the boundary
-# test needs no other tuning.
-_RECONCILE_BOUNDARY_EPSILON_S = 120.0
 
 # Durable notify-ledger scope for the TAGGED warn-once branch. Its own key space (keyed by
 # spool, like the spent-contradiction scope beside it) so neither lane's window can be
@@ -1423,6 +1428,19 @@ async def _warn_tagged_overcharge(db: AsyncSession, spool: Spool, assignment: Sp
         spool.created_at.isoformat() if spool.created_at else "?",
     )
     await notify_dedup.record_sent(db, _LEDGER_OVERCHARGE_SCOPE, key)
+
+
+async def _charged_before(db: AsyncSession, spool_id: int, boundary: datetime) -> bool:
+    """Was a terminal charged to ``spool_id`` BEFORE ``boundary`` (a ``spool_usage_history`` row)? The
+    re-bind proof's event: the row served a print, then its current binding began — so the binding is
+    a RE-bind, never the one it entered service with."""
+    return (
+        await db.execute(
+            select(SpoolUsageHistory.id)
+            .where(SpoolUsageHistory.spool_id == spool_id, SpoolUsageHistory.created_at < boundary)
+            .limit(1)
+        )
+    ).first() is not None
 
 
 async def _charges_since(db: AsyncSession, spool_id: int, boundary: datetime) -> float:
@@ -1771,11 +1789,10 @@ async def _scan_ledger_overcharges(db: AsyncSession) -> int:
             continue  # the binding moved under us since the candidate query
         try:
             boundary = assignment.created_at
-            created = spool.created_at
-            if boundary is None or created is None:
+            if boundary is None or spool.created_at is None:
                 continue  # no timestamps, no provable boundary
-            if (boundary - created).total_seconds() <= _RECONCILE_BOUNDARY_EPSILON_S:
-                continue  # bound continuously since it entered service: overfill, not a swap
+            if not await _charged_before(db, spool.id, boundary):
+                continue  # no print charged before this binding: bound since it entered service — overfill
             if not is_tagless_spool(spool):
                 await _warn_tagged_overcharge(db, spool, assignment)
                 continue
@@ -2379,15 +2396,17 @@ async def apply_fresh_roll(
     tray = _live_tray(printer_id, ams_id, tray_id)
     if tray is None:
         raise ValueError("slot is no longer readable")
-    new_spool = await _replace_row_after_cycle(
-        db,
-        printer_id,
-        ams_id,
-        tray_id,
-        tray,
-        spool,
-        new_fields={"brand": brand, "label_weight": label_weight, "cost_per_kg": cost_per_kg, "note": note},
-    )
+    new_spool = (
+        await _replace_row_after_cycle(
+            db,
+            printer_id,
+            ams_id,
+            tray_id,
+            tray,
+            spool,
+            new_fields={"brand": brand, "label_weight": label_weight, "cost_per_kg": cost_per_kg, "note": note},
+        )
+    ).spool
     await clear_fresh_prompt(db, spool)
     _pending_physical_cycles.discard((printer_id, ams_id, tray_id))
     return new_spool
@@ -2553,6 +2572,16 @@ def _end_autoconfig_epoch(
     printer_manager.request_evidence_pushall(printer_id, verdict)
 
 
+def autoconfig_ended(printer_id: int, ams_id: int, tray_id: int) -> str | None:
+    """The verdict that ENDED this slot's config-write epoch (``config_refused`` — the firmware's
+    ``fail`` ACK — or the lane's own adoption verdicts), or ``None`` while the lane is still writing
+    (or never wrote). The answer to "will a write to this slot still land": once ended, nothing more is
+    coming until an edge re-arms the slot. Read by the recovery driver's wait on its forced bare-tray
+    config (``spool_recovery._await_bare_tray_configured``)."""
+    epoch = _autoconfig_epochs.get((printer_id, ams_id, tray_id))
+    return epoch.ended if epoch is not None else None
+
+
 def _rearm_autoconfig_epoch(printer_id: int, ams_id: int, tray_id: int, *, cause: str) -> None:
     """Drop a slot's write epoch — the ONLY way a latched slot ever writes again.
 
@@ -2703,7 +2732,11 @@ async def maybe_autoconfigure_bare_tray(
 
     Makes an unconfigured third-party spool usable — including mid-print, where
     the newly-configured slot joins the firmware backup pool. Returns True when a
-    config push was attempted this tick.
+    config write WENT OUT this tick, counted on the slot's write epoch — so its answer
+    is one the caller can read: the slot adopting a ``tray_type``, or the epoch ending
+    (:func:`autoconfig_ended` — a ``fail`` ack, or the strike ladder). A write the
+    client refused at publish (drying, the identify gate, the settle gate, no session)
+    and every deferral above the commit point answer False: nothing is in flight.
 
     Trigger: tray PRESENT (state 10/11) AND tray_type empty AND no valid tag AND
     a non-empty ``tagless_default_filament`` setting — clearing that setting is the
@@ -2796,8 +2829,12 @@ async def maybe_autoconfigure_bare_tray(
         if key not in _pending_physical_cycles:
             return False  # latched — no re-push of a spent slot's config
         _pending_physical_cycles.discard(key)  # consume the cycle
-        await _replace_row_after_cycle(db, printer_id, ams_id, tray_id, tray, assignment.spool)
-        return True
+        # The replacement's config write is THIS arm's write: counted on the slot's epoch at its commit
+        # point (before the publish, so the firmware's answer always meets an open epoch), so a ``fail``
+        # ack and the adoption end it like every write of this lane.
+        _note_autoconfig_attempt(printer_id, ams_id, tray_id)
+        replacement = await _replace_row_after_cycle(db, printer_id, ams_id, tray_id, tray, assignment.spool)
+        return replacement.config_published
 
     if assignment is not None and not _own_tagless_slot(tray, assignment):
         # Operator- or RFID-bound slot (or an orphan) — never overwrite. Only our
@@ -2888,8 +2925,7 @@ async def maybe_autoconfigure_bare_tray(
         spool = assignment.spool
 
     _note_autoconfig_attempt(printer_id, ams_id, tray_id)
-    await _push_config(db, spool, printer_id, ams_id, tray_id, tray)
-    return True
+    return await _push_config(db, spool, printer_id, ams_id, tray_id, tray)
 
 
 # --- backup-group identity harmonisation -----------------------------------

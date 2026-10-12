@@ -41,8 +41,8 @@ def same_job(live: str | None, record: str | None) -> JobIdentity:
 
     ``unknown`` when either side names no job (None, ``""`` or ``"0"``) — an absent id is not
     evidence of a DIFFERENT job, and callers decide what an unknown is worth to them (the terminal
-    lookup accepts it, the adopt accepts it only for the sole printing unit, the dead-claim judge
-    reads it as "not started"). ``same`` / ``other`` only when both sides name a job.
+    lookup accepts it, the adopt accepts it only for the sole printing unit, the unrecorded-claim
+    judge reads it as "not started"). ``same`` / ``other`` only when both sides name a job.
     """
     live_id, record_id = job_id(live), job_id(record)
     if live_id is None or record_id is None:

@@ -22,10 +22,10 @@ from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
 
-from backend.app.services.feed_state import FeedFrame, FeedReading, FeedTracker, JobBoundary
+from backend.app.services.feed_state import FeedEvent, FeedFrame, FeedReading, FeedTracker, JobBoundary
 from backend.app.services.hms_actions import HMSAction, get_actions_for_error_code
 from backend.app.services.hms_errors import hms_severity, print_error_dialog
-from backend.app.services.live_reading import reads_live
+from backend.app.services.live_reading import is_fresh, reads_live
 from backend.app.services.tray_fields import (
     TRAY_NOW_EXTERNAL_SPOOL,
     TRAY_PRESENT_STATES,
@@ -68,12 +68,12 @@ AMS_STATUS_IDLE = 0
 # AMS main status 1 = filament_change: the AMS is inside a filament change. What a
 # motion command does in this state depends on the POSTURE (is filament loaded?), and
 # only some postures are measured — see ams_mid_filament_change. Exported so
-# spool_recovery and services/ams_command key the posture off this one origin.
+# spool_recovery and services/command_outcome key the posture off this one origin.
 AMS_STATUS_FILAMENT_CHANGE = 1
 
 # AMS main status 3 = assist: the steady state of every RUNNING H2S (fleet sample
 # 2026-09-11). An assist fault leaves the feeder engaged and DOES accept unloads
-# (006-H2S 2026-07-21). Exported so services/ams_command names the posture from this
+# (006-H2S 2026-07-21). Exported so services/command_outcome names the posture from this
 # one origin instead of restating the integer.
 AMS_STATUS_ASSIST = 3
 
@@ -90,7 +90,7 @@ def ams_mid_filament_change(state) -> bool:
     * an UNLOAD with nothing loaded is undecidable — nothing physical can move, so
       "no movement" answers nothing (8 sends across 009/002/012, all silent);
     * a command with filament LOADED (a mechanical feed fault behind a PAUSE) was
-      never measured before 2026-09-23; ``services/ams_command`` now measures every
+      never measured before 2026-09-23; ``services/printer_action`` now measures every
       attempt and records the wire's answer per posture.
 
     The two operator routes (``/ams/load``, ``/ams/unload``) no longer refuse on this
@@ -144,9 +144,15 @@ _AMS_COMMAND_RESULT_COMMANDS = frozenset({"ams_filament_setting", "extrusion_cal
 # copy-shaped path to the same wire data.
 _AMS_COMMAND_RESULT_FIELDS = ("command", "result", "ams_id", "tray_id", "sequence_id", "reason")
 
+# The top-level report blocks a command echo can ride (invariant 14: every echo is consumed): the
+# request topic's blocks, each answered in kind — ``print`` (controls, motion, config writes),
+# ``system`` (``ledctrl``, the dialog frames), ``xcam`` (``xcam_control_set``, ``ipcam_record_set``),
+# ``info`` (``get_version``). ``pushing`` carries no echo (``pushall`` is answered by a full report).
+_ACK_BLOCKS = ("print", "system", "xcam", "info")
+
 # The AMS MOTION commands whose report-topic echo is the firmware's own answer to a
 # load / unload / CONTINUE. Logged at INFO (never DEBUG) so the answer lands in every
-# support bundle beside services/ams_command's measured verdict. The log line only: the
+# support bundle beside services/command_outcome's measured verdict. The log line only: the
 # ACK itself is recorded for EVERY command on `PrinterState.command_acks` (see
 # `CommandAck`). The firmware does echo them — 012-H2S 2026-09-23 answered six motion
 # commands `result=success` (and the `ams_control resume` lever `SUCCESS`).
@@ -180,10 +186,10 @@ class CommandAck:
     Every such echo, whatever the command (the config writes, the motion commands, the
     ``ams_control`` / ``pause`` / ``resume`` / ``clean_print_error`` controls), is
     appended to ``PrinterState.command_acks`` at the ONE parse point in
-    ``_process_message``. ``services/ams_command`` correlates an ACK to its own send by
-    ``sequence_id`` (:meth:`BambuMQTTClient.ack_for`), which is why the sequenced
-    publishers send a real incrementing id (BambuStudio's ``m_sequence_id++``) instead
-    of ``"0"``: with every send numbered ``"0"`` no ACK could name the send it answers.
+    ``_process_message``. ``services/printer_action`` correlates an ACK to its own send by
+    ``sequence_id`` — the action's row id, which every state-changing publisher sends (never
+    ``"0"``: with every send numbered ``"0"`` no ACK could name the send it answers) — and
+    reads it into the action's answer (``printer_events.CommandAcked``).
 
     ``sequence_id`` is ``str()``-normalised so a numeric echo compares equal to the
     string the publisher sent (an absent id is ``""``, a number no send carries).
@@ -205,23 +211,6 @@ class CommandAck:
         return self.result is not None and self.result.lower() in _ACK_SUCCESS_RESULTS
 
 
-@dataclass(frozen=True)
-class SentCommand:
-    """What one publish put on the wire — the handle its firmware ACK is read by
-    (:meth:`BambuMQTTClient.await_ack`, over :meth:`BambuMQTTClient.ack_for`).
-
-    ``command`` is the wire command name the ACK will carry (``"resume"``, ``"ignore"``,
-    ``"idle_ignore"``, ``"ams_control"``, ``"clean_print_error"``, …) and ``sequence_id``
-    the id the frame carried. ``sequence_id`` is ``None`` only for a frame whose echo is
-    never recorded as an ACK — the system-topic ``uiop`` dialog close
-    (:meth:`BambuMQTTClient._record_command_ack` reads the ``print`` topic only) — so a
-    reader answers "sent, no readable answer" instead of waiting for one.
-    """
-
-    command: str
-    sequence_id: str | None
-
-
 # The hex digits an 8-char dialog ``err`` may spell (see ``_decimal_dialog_err``).
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
@@ -238,6 +227,12 @@ _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 # change it holds), FILAMENT_EXTRUDED / ABORT and the OK buttons. A PLATE-CHECK dialog's press never
 # reaches this set: the route hands it to ``pause_recovery.human_dialog_action`` first (the episode's
 # turn — before the first layer, where the start block loads).
+# The printer-dialog buttons whose press ends on the SYSTEM-topic dialog close (``uiop``), whose echo is
+# never recorded as an ACK: the press answers "sent", never a wait for an answer that cannot come. Read
+# by the ``/hms/execute-action`` route, beside :data:`DIALOG_RESUME_ACTIONS`.
+DIALOG_UNANSWERED_ACTIONS: frozenset[str] = frozenset({HMSAction.DBL_CHECK_OK})
+
+
 DIALOG_RESUME_ACTIONS: frozenset[str] = frozenset(
     {
         HMSAction.RESUME_PRINTING,
@@ -316,25 +311,46 @@ _EVIDENCE_PUSHALL_MIN_S: float = 120.0
 # reconnect or a dropped report degrades to. Three at the fleet's ~1 Hz report cadence
 # is ~3 s of latency on a genuine removal — below one scheduler tick, invisible to the
 # operator — in exchange for making a single anomalous frame unable to release a
-# binding. CODE CONSTANT, not a setting: it is a property of the wire, not a preference.
+# binding (shape 28). Only FRESH frames count (``live_reading.is_fresh``: the current
+# session's first report already applied): a frame of a session not yet reporting breaks
+# the run, so a streak never spans a reconnect. CODE CONSTANT, not a setting: it is a
+# property of the wire, not a preference. Restored 2026-10-12 (operator ruling "the
+# behaviour should stay the same for the most part"), replacing the single-full-report rule.
 _ZERO_EXIST_BITS_TRUST_PUSHES = 3
 
-# Consecutive TRUSTED pushes on which one slot's tray state (10/11) must contradict
+# Consecutive TRUSTED, FRESH pushes on which one slot's tray state (10/11) must contradict
 # its CLEAR mask bit before the mask's answer is asserted onto the tray
 # (_normalize_cleared_trays, second duty). Mirrors _ZERO_EXIST_BITS_TRUST_PUSHES —
 # the same "repetition turns a frame into a fact" reasoning, applied per slot: one
 # contradicted frame is a mid-insert race; three seconds of the same contradiction is
 # the firmware's tray-state latch (live-proven 2026-08-10, printer 4: state-10 stubs
 # beside a correct clear bit for hours while the mask was right on every sampled
-# printer in both polarities).
+# printer in both polarities). Restored 2026-10-12 (same ruling), replacing "a trusted
+# clear bit beats an identity-less present tray at once".
 _CONTRADICTED_STATE_TRUST_PUSHES = 3
 
-# AMS drying latch. `dry_time` (minutes remaining) is the primary "unit is drying"
-# signal, but the firmware only reports it once a cycle is under way. A monotonic
-# latch (deadline = start + cycle duration + slack) covers the gap before the first
-# dry_time push and a touchscreen-started cycle seeded from the drying echo.
+
+# The gcode_states a job's terminal fires on (``_update_state``'s completion detection): entering
+# one from another state raises ``_terminal_pending`` before the state is written.
+_JOB_OVER_GCODE_STATES = frozenset({"FINISH", "FAILED", "IDLE"})
+
+# AMS drying latch — the self-heal fallback behind a drying start the unit has not reported yet
+# (restored 2026-10-12, Raymond: "if it was self heal, it should stay self heal"). Events decide
+# first: the unit's positive ``dry_time`` (then its report decides), the start's mode-1 fail echo, a
+# later session's report of the unit not drying. A start none of those answers would otherwise leave
+# the unit "drying" forever, and ``ams_unit_drying`` refuses EVERY AMS write on it; the latch ends that
+# wait at start + cycle duration + slack (production since the drying feature; the duration is the
+# command's / echo's own ``duration`` in hours), or the cap when no duration was supplied. A client
+# clock, never the record's: it bounds a unit's cycle, not a command's answer.
 _DRYING_LATCH_SLACK_S = 1800  # 30 min past the nominal cycle end
 _DRYING_LATCH_DEFAULT_S = 24 * 3600  # latch cap when no duration was supplied
+
+
+def _drying_latch_until(duration_s: int) -> float:
+    """The monotonic instant an awaited drying start stops counting as drying: the cycle's own duration
+    (``_DRYING_LATCH_DEFAULT_S`` when none was supplied) plus ``_DRYING_LATCH_SLACK_S``."""
+    return time.monotonic() + (duration_s or _DRYING_LATCH_DEFAULT_S) + _DRYING_LATCH_SLACK_S
+
 
 # Per-printer identify gate: after we publish an ams_get_rfid identify, hold off any
 # further identify on this printer for this long. The AMS identifies one slot at a
@@ -753,13 +769,13 @@ class PrinterState:
     # The AMS's own TARGET tray (``print.ams.tray_tar``), exactly as the wire spelled it —
     # never disambiguated (on H2D it is a local slot 0-3, not a global id), so no reader
     # may treat it as a feeder id. Recorded because it is part of the wire's answer to a
-    # motion command (services/ams_command reads it as movement evidence). None = no push
+    # motion command (services/command_outcome reads it as movement evidence). None = no push
     # has carried a parseable value yet.
     tray_tar: int | None = None
     # The firmware's command ACKs, oldest first, bounded (invariant 14): EVERY command
     # echo with a `result` lands here as a `CommandAck`, written only at the echo parse
     # point in `_process_message` and read through `BambuMQTTClient.ack_for`, which
-    # services/ams_command uses to correlate the ACK to its own send by sequence id.
+    # services/printer_action uses to correlate the ACK to its own send by sequence id.
     command_acks: deque[CommandAck] = field(default_factory=lambda: deque(maxlen=_COMMAND_ACK_KEEP))
     # The last real feeder (an AMS tray, or the external holder as 254) fed — survives the
     # end retract's 255 for usage tracking after the print completes; -1 = none, reset at a new
@@ -1065,7 +1081,10 @@ class BambuMQTTClient:
         on_drying_complete: Callable[[int], None] | None = None,
         on_print_running_observed: Callable[[dict], None] | None = None,
         on_finish_photo_moment: Callable[[dict], None] | None = None,
-        farm_acting: Callable[[], bool] | None = None,
+        on_command_ack: Callable[[CommandAck], None] | None = None,
+        on_feed_event: Callable[[FeedEvent, FeedReading], None] | None = None,
+        on_session_report: Callable[[int], None] | None = None,
+        on_session_lost: Callable[[], None] | None = None,
     ):
         self.ip_address = ip_address
         self.serial_number = serial_number
@@ -1118,21 +1137,30 @@ class BambuMQTTClient:
         # stage 22 never arrives (cancel mid-print, external-spool-
         # only prints, HMS halt before unload, firmware variants).
         self.on_finish_photo_moment = on_finish_photo_moment
-        # Does a FARM motion own this printer right now (a live recovery driver, or a farm
-        # command the step ledger holds pending)? Injected by the registry, which knows the
-        # printer id and the incident store (``printer_manager`` wires it); this client imports
-        # nothing above itself (dependency inversion). Asked once per push, while the feed
-        # frame is built, so a landing is attributed at STEP time. Default: never.
-        self._farm_acting = farm_acting
+        # The four transport facts the printer-event hub re-publishes
+        # (``services/printer_events``), each handed over at its ONE producer: a recorded ACK
+        # (``_record_command_ack``), a feed-state event (``_step_feed``), the session's first
+        # fresh report (the ``report_epoch`` stamp in ``_update_state``, once per session) and
+        # the session's end (``note_disconnected``, on its edge). Injected by the registry,
+        # which knows the printer id and hops onto the event loop; this client imports nothing
+        # above itself.
+        self._on_command_ack = on_command_ack
+        self._on_feed_event = on_feed_event
+        self._on_session_report = on_session_report
+        self._on_session_lost = on_session_lost
         # Per-AMS previous dry_time, used to detect the falling edge above.
         # Seeded lazily as we observe each AMS unit.
         self._previous_dry_times: dict[int, int] = {}
         # Per-AMS active-cycle target params (filament + temp) we sent on the
         # last start. Bambu does not echo these back in the per-tick AMS push
         # — only the dry_time countdown — so we cache what we sent to drive
-        # the UI badge. Cleared on stop or on the dry_time falling edge to 0.
-        # Each entry also carries a monotonic "latched_until" deadline so the
-        # unit reads as drying before the first dry_time push (see ams_unit_drying).
+        # the UI badge. Cleared on the stop's success echo or on the dry_time
+        # falling edge to 0. Each entry also carries ``awaiting_start`` (True from
+        # the start command / its echo until the unit REPORTS its cycle), the
+        # MQTT ``session`` it was set in, and the monotonic ``latched_until`` that
+        # ends an awaited start nothing answered (see ams_unit_drying). Process
+        # memory: lost on a restart, when the unit's own ``dry_time`` on the first
+        # report is the whole answer (a cycle under way reports it; none is awaited).
         self._drying_targets: dict[int, dict[str, object]] = {}
         # monotonic() deadline until which a fresh ams_get_rfid identify we
         # published is treated as still in flight on THIS printer — no second
@@ -1150,6 +1178,12 @@ class BambuMQTTClient:
         # the job's terminal and by the next job boundary.
         self._was_running: bool = False
         self._completion_triggered: bool = False  # Prevent duplicate completion triggers
+        # A terminal MAY be firing on the push being applied: raised BEFORE this push writes a
+        # job-over gcode_state (FINISH / FAILED / IDLE, entered from another state), cleared when the
+        # push is done — by then the completion detection either scheduled the terminal handler
+        # (``printer_manager``'s in-flight counter, already up) or decided none fired. So no reader
+        # ever sees the job-over state without a mark (``printer_manager.terminal_in_flight``).
+        self._terminal_pending: bool = False
         self._timelapse_during_print: bool = False  # Track if timelapse was active during this print
         # #1721: one-shot guard so the end-of-print stage-22 detector
         # and the FINISH-state fallback don't both fire on the same
@@ -1175,10 +1209,6 @@ class BambuMQTTClient:
         # with the peaks' own rehydrate story: its job record resets where the peaks reset (a
         # print start, an attach), and its phase re-reads from the first live report.
         self._feed = FeedTracker()
-        # Did THIS push carry ``ams_status`` (the change posture)? Reset at the top of every
-        # message; only a push that carried it may vote toward AIR (invariant 12's
-        # corroboration rule — a merged value is not this push's evidence).
-        self._push_carried_posture: bool = False
         # Stale-predecessor gate for the two "last valid" captures above. The firmware
         # keeps republishing the PREVIOUS job's layer/percent for the seconds a new job
         # spends heating and levelling, so a reading arriving just after a print start
@@ -1229,14 +1259,22 @@ class BambuMQTTClient:
         # one that does not keeps the last truth, matching the merged trays it guards).
         # None = never seen.
         self._last_tray_exist_bits: int | None = None
-        # Consecutive bits-carrying pushes that have reported the SAME all-zero
+        # Consecutive FRESH bits-carrying pushes that have reported the SAME all-zero
         # tray_exist_bits, clamped at _ZERO_EXIST_BITS_TRUST_PUSHES. Reset by a non-zero
-        # mask (trusted immediately, so no streak is needed) and by a bits-less push
-        # (the run of evidence is broken — the next zero starts a fresh one).
+        # mask (trusted immediately, so no streak is needed), by a bits-less push (the run
+        # of evidence is broken — the next zero starts a fresh one) and by a push of a
+        # session not yet reporting (``live_reading.is_fresh`` False — a reconnect).
+        # Rehydrate story: process memory only; a restart restarts the streak at 0, so the
+        # first three fresh frames after it are withheld — the safe direction (nothing is
+        # released on fewer frames than the rule asks).
         self._zero_exist_bits_streak: int = 0
-        # Per-slot count of consecutive TRUSTED pushes whose tray state contradicted a
-        # CLEAR mask bit (see _CONTRADICTED_STATE_TRUST_PUSHES). Entries drop the
-        # moment the contradiction stops holding for that slot.
+        # Per-slot count of consecutive TRUSTED, FRESH pushes whose tray state contradicted
+        # a CLEAR mask bit (see _CONTRADICTED_STATE_TRUST_PUSHES). Entries drop the moment
+        # the contradiction stops holding for that slot; untrusted or bits-less frames are
+        # neutral to the bank; a push of a session not yet reporting empties it (a streak
+        # never spans a reconnect). Rehydrate story: as the zero streak above — a restart
+        # restarts every slot's run, the safe direction (the slot reads UNKNOWN, fail-open,
+        # until three fresh frames agree again).
         self._bit_state_contradiction_streak: dict[tuple[int, int], int] = {}
         # (ams_id, tray_id) -> monotonic() of the first push whose state-9 partial
         # CONTRADICTED the CACHED exist bit above. On the H2S dialect the mask rides
@@ -1261,11 +1299,11 @@ class BambuMQTTClient:
         # so that missing-serial / missing-firmware warnings fire only once per connection.
         self._ams_version_warned: set[tuple[int | str, str]] = set()
 
-        # K-profile command tracking
-        self._sequence_id: int = 0
-        # Wire command name -> the sequence_id of this client's most recent publish of it,
-        # written by the sequenced publishers at the publish (see last_sent_sequence_id).
-        self._last_sent_sequence: dict[str, str] = {}
+        # K-profile command tracking. Every state-changing publisher takes its ``sequence_id`` from
+        # its caller: the id is the ``printer_action`` row of the send (``services/printer_action``,
+        # the one caller of the publishers), unique across printers and restarts.
+        # The id of this client's last ``project_file`` (read back off the request topic).
+        self._last_project_file_sequence: str | None = None
         self._pending_kprofile_response: asyncio.Event | None = None
         self._kprofile_response_data: list | None = None
 
@@ -1414,11 +1452,16 @@ class BambuMQTTClient:
         returns early by design.
 
         Stamped on the EDGE only, so a repeated "still offline" assertion cannot walk the
-        anchor forward and shrink a reported outage to nothing.
+        anchor forward and shrink a reported outage to nothing. The same edge is the session's
+        end the printer-event hub re-publishes (``printer_events.SessionLost`` — the record's
+        online clock stops there), handed over guarded: invariant 10.
         """
-        if self.state.connected:
+        ended = self.state.connected
+        if ended:
             self.state.disconnected_at = time.time()
         self.state.connected = False
+        if ended:
+            self._hand_over(self._on_session_lost)
 
     def check_staleness(self) -> bool:
         """Check staleness and update connected state if stale. Returns True if connected."""
@@ -1763,10 +1806,10 @@ class BambuMQTTClient:
             # Diagnostic for #1162 follow-up (X2D + FTS routing): when a
             # slicer-launched project_file passes through the request topic,
             # log the full payload so we can diff Studio's field set against
-            # ours. We pin our own sequence_id to "20000" (line ~3195), so
+            # ours. Our own start carries its action's id (``start_print``), so
             # any other value means the command came from Studio/Orca, not
             # from us.
-            if print_data.get("sequence_id") != "20000":
+            if print_data.get("sequence_id") != self._last_project_file_sequence:
                 logger.info(
                     "[%s] External project_file payload: %s",
                     self.serial_number,
@@ -1775,8 +1818,6 @@ class BambuMQTTClient:
 
     def _process_message(self, payload: dict):
         """Process incoming MQTT message from printer."""
-        # A per-push fact: set below only by a push that carries ``ams_status``.
-        self._push_carried_posture = False
         # Handle top-level AMS data (comes outside of "print" key)
         # Wrap in try/except to prevent breaking the MQTT connection
         if "ams" in payload:
@@ -1925,7 +1966,6 @@ class BambuMQTTClient:
             # Main status: 0=idle, 1=filament_change, 2=rfid_identifying, 3=assist, 4=calibration
             # Sub status (when main=1): 2=heating, 3=AMS feeding, 4=retract, 6=push, 7=purge
             if "ams_status" in print_data:
-                self._push_carried_posture = True
                 raw_ams_status = print_data["ams_status"]
                 if isinstance(raw_ams_status, str):
                     try:
@@ -2002,101 +2042,99 @@ class BambuMQTTClient:
                 elif cmd == "ams_filament_setting":
                     self._last_ams_cmd_time = 0.0
                     self._ams_cmd_unanswered = 0
-                # The ACK lane. Last in this block so the echo has already served every
-                # in-client duty above (dev-mode probe, zombie detection) and — because
-                # `print.ams` is handled further up — the status half of the same payload
-                # is already merged: a consumer acting on the verdict sees the AMS state
-                # that came with it, never a half-applied push. Every ACK is recorded
-                # (invariant 14); only the two config writes are also DELIVERED.
-                self._record_command_ack(print_data)
+
+        # The ACK lane — THE one parse point for every command echo, whatever block carries it
+        # (``print``, ``system``, ``xcam``, ``info``; invariant 14). After every block's in-client
+        # duties above (dev-mode probe, zombie detection) and — because `print.ams` is handled
+        # further up — after the status half of the same payload is merged: a consumer acting on
+        # the verdict sees the AMS state that came with it, never a half-applied push. Before the
+        # print block's state apply below, as it always was.
+        self._record_command_acks(payload)
+
+        if "print" in payload:
+            print_data = payload["print"]
+            if "command" in print_data:
+                # Only the two config writes are also DELIVERED (the tagless write epoch).
                 self._deliver_command_result(print_data)
             if "command" in print_data and print_data.get("command") == "extrusion_cali_get":
                 self._handle_kprofile_response(print_data)
 
-            self._update_state(print_data)
+            try:
+                self._update_state(print_data)
+            finally:
+                # The push is applied and its completion detection ran (``_terminal_pending``).
+                self._terminal_pending = False
 
-    def _record_command_ack(self, print_data: dict) -> None:
+    def terminal_pending(self) -> bool:
+        """Is the push being applied writing a job-over state whose terminal may fire on it
+        (``_terminal_pending``)? Read by ``printer_manager.terminal_in_flight`` BEFORE its counter."""
+        return self._terminal_pending
+
+    def _record_command_acks(self, payload: dict) -> None:
+        """Record every command echo one report carries, in every top-level block that can carry
+        one (:data:`_ACK_BLOCKS`): the controls, motion and config writes ride ``print``; the
+        chamber light (``ledctrl``) and the printer-dialog frames ride ``system``; the camera and
+        detector settings (``xcam_control_set``, ``ipcam_record_set``) ride ``xcam``; a version
+        read rides ``info``. A block is an echo when it carries the request's ``command`` plus a
+        ``result`` (:meth:`_record_command_ack`)."""
+        for block in _ACK_BLOCKS:
+            data = payload.get(block)
+            if isinstance(data, dict) and "command" in data:
+                self._record_command_ack(data)
+
+    def _record_command_ack(self, block: dict) -> None:
         """Append a command echo to ``state.command_acks`` when it is an ACK — the
-        request's own ``command`` plus a ``result`` key — whatever the command.
+        request's own ``command`` plus a ``result`` key — whatever the command, whatever the
+        block (:meth:`_record_command_acks`, its one caller).
 
         Invariant 14: every command ACK is consumed. This is the ONE writer of
         ``command_acks``; readers correlate an ACK to their own send by sequence id
-        through :meth:`ack_for` (``services/ams_command`` reads the ACK for each motion
+        through :meth:`ack_for` (``services/printer_action`` reads the ACK for each motion
         command it publishes). An echo without ``result`` (a status push that happens to
         carry ``command``, e.g. ``push_status``) is not an ACK and is not recorded.
+
+        The recorded ACK is then handed to the registry (``on_command_ack``), which publishes
+        it on the printer-event hub (``printer_events.CommandAcked``).
         """
-        if "result" not in print_data:
+        if "result" not in block:
             return
-        sequence_id = print_data.get("sequence_id")
-        self.state.command_acks.append(
-            CommandAck(
-                command=str(print_data["command"]),
-                sequence_id="" if sequence_id is None else str(sequence_id),
-                result=_wire_str(print_data["result"]),
-                reason=_wire_str(print_data.get("reason")),
-                at=time.monotonic(),
-            )
+        sequence_id = block.get("sequence_id")
+        ack = CommandAck(
+            command=str(block["command"]),
+            sequence_id="" if sequence_id is None else str(sequence_id),
+            result=_wire_str(block["result"]),
+            reason=_wire_str(block.get("reason")),
+            at=time.monotonic(),
         )
+        self.state.command_acks.append(ack)
+        self._hand_over(self._on_command_ack, ack)
 
-    def ack_for(self, command: str, sequence_id: str) -> CommandAck | None:
-        """The newest ACK on ``state.command_acks`` for the send ``(command, sequence_id)``,
-        or ``None`` when none has arrived (yet — or it already rolled out of the bounded
-        log).
+    def _hand_over(self, callback: Callable[..., None] | None, *args: object) -> None:
+        """Hand one transport fact to its injected registry callback (the printer-event hub's
+        producers: ``_record_command_ack``, ``_step_feed``, the ``report_epoch`` stamp,
+        ``note_disconnected``). Guarded:
+        no farm-side failure may break the MQTT callback chain (invariant 10)."""
+        if callback is None:
+            return
+        try:
+            callback(*args)
+        except Exception:  # noqa: BLE001 — the transport must never break on a farm-side handler
+            logger.exception("[%s] printer-event hand-over failed", self.serial_number)
 
-        ``sequence_id`` is the id this client's publisher sent (:meth:`last_sent_sequence_id`).
-        The ids are this client's own counter, not globally unique: another LAN client
-        numbering its own sends could in principle echo a colliding id for the same
-        command. The log is appended on the MQTT network thread, so it is copied in one
-        ``tuple()`` call (atomic under the GIL) before the Python-level scan — iterating
-        the live deque would raise if an ACK landed mid-scan.
+    def ack_for(self, sequence_id: str) -> CommandAck | None:
+        """The newest ACK on ``state.command_acks`` for the send ``sequence_id``, or ``None`` when
+        none has arrived (yet — or it already rolled out of the bounded log). Called only by
+        ``services/printer_action`` (``TestPrinterActionOwnership``).
+
+        ``sequence_id`` is the ``printer_action`` row id the publisher sent: unique across printers
+        and restarts, so the id alone names the send. The log is appended on the MQTT network thread,
+        so it is copied in one ``tuple()`` call (atomic under the GIL) before the Python-level scan —
+        iterating the live deque would raise if an ACK landed mid-scan.
         """
         for ack in reversed(tuple(self.state.command_acks)):
-            if ack.command == command and ack.sequence_id == sequence_id:
+            if ack.sequence_id == sequence_id:
                 return ack
         return None
-
-    async def await_ack(self, sent: SentCommand, budget_s: float, poll_s: float) -> CommandAck | None:
-        """Wait up to ``budget_s`` for the firmware's ACK of ``sent`` — the one wait every
-        reader of a published command's answer shares (the ``/hms/execute-action`` route,
-        the plate-check driver), over :meth:`ack_for` (invariant 14: a reader finds its OWN
-        ACK by sequence id).
-
-        Polls every ``poll_s`` — the log is appended on the MQTT network thread, so polling
-        is the whole mechanism — and reads once before the first sleep, so an ACK that
-        landed between the publish and this call is found at once. Returns the ACK
-        (:attr:`CommandAck.succeeded` reads it), or ``None`` when none arrived within the
-        budget: the silent drop. A ``sent`` without a ``sequence_id`` (the system-topic
-        ``uiop`` close) has no readable ACK and returns ``None`` at once; a caller that must
-        tell "sent" from "dropped" checks ``sent.sequence_id`` first.
-        """
-        if sent.sequence_id is None:
-            return None
-        deadline = time.monotonic() + budget_s
-        while True:
-            ack = self.ack_for(sent.command, sent.sequence_id)
-            if ack is not None:
-                return ack
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return None
-            await asyncio.sleep(min(poll_s, remaining))
-
-    def _next_sequence_id(self) -> str:
-        """Allocate the next ``sequence_id`` for a publish: increment this client's counter
-        and return it as the wire's string. BambuStudio's ``command_ams_control`` sends
-        ``m_sequence_id++`` — the vendor shape, and what lets an ACK name its send."""
-        self._sequence_id += 1
-        return str(self._sequence_id)
-
-    def last_sent_sequence_id(self, command: str) -> str | None:
-        """The ``sequence_id`` of this client's most recent publish of the wire command
-        ``command`` (``"ams_change_filament"``, ``"ams_control"``, ``"pause"``,
-        ``"resume"``, ``"clean_print_error"``), or ``None`` when it never published one.
-
-        Recorded by the publishers themselves at the publish, so a caller reading it in
-        the same synchronous stretch as its own publish reads its own send's id.
-        """
-        return self._last_sent_sequence.get(command)
 
     def _deliver_command_result(self, print_data: dict) -> None:
         """Hand an AMS write's firmware ACK to ``on_ams_command_result``.
@@ -2565,7 +2603,7 @@ class BambuMQTTClient:
         """
         return slot_exist_bit_set(self._last_tray_exist_bits, ams_id, tray_id)
 
-    def _note_exist_bits_trust(self, bits: int | None) -> bool:
+    def _note_exist_bits_trust(self, bits: int | None, *, fresh: bool) -> bool:
         """Fold this push's ``tray_exist_bits`` into the streak; may the farm act on it?
 
         THE trust authority for the mask, and the only stateful part of reading it —
@@ -2578,10 +2616,13 @@ class BambuMQTTClient:
           in this slot", and believing that destroys nothing: the worst case is a
           removal noticed one push late.
         * an ALL-ZERO mask — trusted once :data:`_ZERO_EXIST_BITS_TRUST_PUSHES`
-          consecutive bits-carrying pushes have said the same thing. Zero is the value
-          that authorizes emptying every slot on the printer, and it is also what a boot
-          frame or a truncated report degrades to, so it must be corroborated by
-          repetition before it may release a binding.
+          consecutive FRESH bits-carrying pushes have said the same thing. Zero is the
+          value that authorizes emptying every slot on the printer, and it is also what a
+          boot frame or a truncated report degrades to, so it must be corroborated by
+          repetition before it may release a binding. ``fresh`` is
+          ``live_reading.is_fresh`` read before this push applies: a push of a session
+          whose first report has not landed (a reconnect) breaks the run instead of
+          extending it, so a streak never spans two sessions.
 
         Mutates the streak; call EXACTLY ONCE per push, before anything reads the mask.
         """
@@ -2591,6 +2632,9 @@ class BambuMQTTClient:
         if bits != 0:
             self._zero_exist_bits_streak = 0
             return True
+        if not fresh:
+            self._zero_exist_bits_streak = 0
+            return False
         self._zero_exist_bits_streak = min(self._zero_exist_bits_streak + 1, _ZERO_EXIST_BITS_TRUST_PUSHES)
         return self._zero_exist_bits_streak >= _ZERO_EXIST_BITS_TRUST_PUSHES
 
@@ -2626,7 +2670,9 @@ class BambuMQTTClient:
             t,
         )
 
-    def _normalize_cleared_trays(self, ams_data, *, push_carried_bits: bool, trusted_bits: int | None = None) -> None:
+    def _normalize_cleared_trays(
+        self, ams_data, *, push_carried_bits: bool, fresh: bool, trusted_bits: int | None = None
+    ) -> None:
         """Give minimal state-9 tray partials the asserted-cleared shape, IN PLACE.
 
         SECOND DUTY (2026-08-10, deploy-night finding): resolve a PERSISTENT in-push
@@ -2640,14 +2686,18 @@ class BambuMQTTClient:
         tray-level state is the latch-prone side — the same staleness that built the
         phantom-mint estate — while the mask has been verified correct on every
         sampled printer, in both polarities). A contradiction that repeats across
-        :data:`_CONTRADICTED_STATE_TRUST_PUSHES` consecutive trusted pushes is not a
-        race, it is the latch — and the mask wins, exactly as the merged/display copy
+        :data:`_CONTRADICTED_STATE_TRUST_PUSHES` consecutive trusted, FRESH pushes is not
+        a race, it is the latch — and the mask wins, exactly as the merged/display copy
         has always resolved it (``apply_tray_exist_bits`` demotes with in-push bits).
         The tray is rewritten to the asserted-cleared shape so BOTH lanes read one
         interpretation. Never applied to a tray asserting IDENTITY (a real tag/uuid is
         stronger evidence a roll is physically there than the mask's absence claim —
         that contradiction stays UNKNOWN for a human/read to settle), and the streak
-        resets on any push where the contradiction does not hold.
+        resets on any trusted push where the contradiction does not hold. An untrusted or
+        bits-less push (``trusted_bits is None``) is NEUTRAL to the bank: it asserts
+        nothing about the contradiction, so it neither grants EMPTY nor voids what trusted
+        frames banked. A push of a session not yet reporting (``fresh`` False — a
+        reconnect) empties the bank: a streak never spans two sessions.
 
         Runs immediately BEFORE the raw pre-merge hand-off so the spool pipeline
         observes the same clear the merge is about to apply to the display copy.
@@ -2710,6 +2760,11 @@ class BambuMQTTClient:
         merged_units = self.state.raw_data.get("ams") or []
         merged_by_id = {u.get("id"): u for u in merged_units if isinstance(u, dict)}
 
+        if not fresh:
+            # A frame of a session whose first report has not landed (a reconnect) is no
+            # frame of the live session's run: the bank restarts with the session.
+            self._bit_state_contradiction_streak.clear()
+
         for unit in units:
             if not isinstance(unit, dict):
                 continue
@@ -2728,7 +2783,7 @@ class BambuMQTTClient:
                     continue
                 tray_id = tray.get("id")
                 # --- persistent bit-vs-state contradiction (second duty, docstring) ---
-                if trusted_bits is not None:
+                if trusted_bits is not None and fresh:
                     slot_bit = slot_exist_bit(trusted_bits, ams_id, tray_id)
                     state_val = parse_tray_state(tray.get("state"))
                     key_a, key_t = parse_int_field(ams_id), parse_int_field(tray_id)
@@ -2806,6 +2861,11 @@ class BambuMQTTClient:
         # verdict, one meaning, everywhere. It is also what separates a veto backed by the
         # firmware's current mask from one backed by the cache (see _note_evidence_owed).
         push_carried_bits = False
+        # Is this push a frame of the LIVE session (its first report already applied)? Read
+        # once, before anything below applies the push: only fresh frames count toward the
+        # two corroboration streaks (_ZERO_EXIST_BITS_TRUST_PUSHES,
+        # _CONTRADICTED_STATE_TRUST_PUSHES), so a reconnect's frames never extend a run.
+        fresh = is_fresh(self.state)
         if isinstance(ams_data, dict):
             if "ams" in ams_data:
                 ams_list = ams_data["ams"]
@@ -2821,7 +2881,7 @@ class BambuMQTTClient:
             # field. Only overwrite when this push carries a mask the trust verdict
             # accepts (a partial without one keeps the last truth).
             _exist_bits = parse_tray_exist_bits(ams_data.get("tray_exist_bits"))
-            push_carried_bits = self._note_exist_bits_trust(_exist_bits)
+            push_carried_bits = self._note_exist_bits_trust(_exist_bits, fresh=fresh)
             # Triage surface: what the wire SAID, kept whether or not it was trusted,
             # beside the verdict — so an operator reading /status can see a mask being
             # withheld instead of inferring it from behaviour (2026-08-10: a whole
@@ -2841,7 +2901,6 @@ class BambuMQTTClient:
             # IMPORTANT: Parse ams_status FIRST before tray_now, so we have fresh status
             # when checking if we're in filament change mode for tray_now disambiguation
             if "ams_status" in ams_data:
-                self._push_carried_posture = True
                 raw_ams_status = ams_data["ams_status"]
                 if isinstance(raw_ams_status, str):
                     try:
@@ -3072,7 +3131,7 @@ class BambuMQTTClient:
                 logger.debug("[%s] tray_now updated: %s", self.serial_number, self.state.tray_now)
 
             # tray_tar rides the same dict (and the P1S partial update). Recorded raw —
-            # no disambiguation: it is movement evidence for services/ams_command, never
+            # no disambiguation: it is movement evidence for services/command_outcome, never
             # a feeder id. An absent field keeps the last value, as tray_now does.
             if "tray_tar" in ams_data:
                 self.state.tray_tar = parse_int_field(ams_data["tray_tar"])
@@ -3088,7 +3147,7 @@ class BambuMQTTClient:
         elif isinstance(ams_data, list):
             # A bare unit list structurally cannot carry the mask, so it breaks the
             # all-zero streak exactly like a dict push that omits the field.
-            self._note_exist_bits_trust(None)
+            self._note_exist_bits_trust(None, fresh=fresh)
             ams_list = ams_data
         else:
             logger.warning("[%s] Unexpected AMS data format: %s", self.serial_number, type(ams_data))
@@ -3105,6 +3164,7 @@ class BambuMQTTClient:
             ams_data,
             push_carried_bits=push_carried_bits,
             trusted_bits=self._last_tray_exist_bits if push_carried_bits else None,
+            fresh=fresh,
         )
 
         # RAW pre-merge hand-off — the LAST point at which the wire dicts still say only
@@ -3377,6 +3437,15 @@ class BambuMQTTClient:
                 continue
             previous = self._previous_dry_times.get(ams_id, 0)
             self._previous_dry_times[ams_id] = current
+            target = self._drying_targets.get(ams_id)
+            if target is not None and target.get("awaiting_start"):
+                if current > 0:
+                    # The unit REPORTS the cycle: from here its own dry_time decides (ams_unit_drying).
+                    target["awaiting_start"] = False
+                elif target.get("session") != self.state.connection_epoch:
+                    # A later session's report says the unit is not drying: the start never ran (or
+                    # ended unseen across the gap) — nothing is awaited any more.
+                    self._drying_targets.pop(ams_id, None)
             if previous > 0 and current == 0:
                 logger.info(
                     "[%s] AMS %d drying complete (dry_time %d → 0)",
@@ -3545,20 +3614,24 @@ class BambuMQTTClient:
         the last event of each kind under a process-global sequence."""
         return self._feed.reading
 
-    def _step_feed(self, boundary: JobBoundary) -> None:
+    def _step_feed(self, boundary: JobBoundary, *, session_report: bool) -> None:
         """Step the feed state with THIS push — its one caller (``test_code_quality``), once per
         status push, after every field is applied and the job baseline is set — and project the
-        reading onto the state. Total: it rides the status callback (invariant 10)."""
+        reading onto the state. Total: it rides the status callback (invariant 10).
+
+        ``session_report``: this push carries ``gcode_state`` — it is the session's report the
+        ``report_epoch`` stamp below marks applied — so it is a live reading even on the session's
+        FIRST report, before the stamp lands (``live_reading.reads_live(applying_report=...)``): the
+        level the session-start re-evaluation reads (a paused print fed from a slot) is there when
+        ``FirstFreshReport`` is handed over, never one report later."""
         try:
             frame = FeedFrame.of(
                 self.state,
-                live=reads_live(self.state),
-                posture_carried=self._push_carried_posture,
+                live=reads_live(self.state, applying_report=session_report),
                 posture=ams_mid_filament_change(self.state),
                 # The job-gated layer: a predecessor's republished layer is never this job's.
                 layer=self.job_peaks().layer_num,
                 job_active=self._was_running and not self._completion_triggered,
-                farm_acting=self._farm_acting_now(),
                 boundary=boundary,
             )
             before = self._feed.reading
@@ -3567,6 +3640,11 @@ class BambuMQTTClient:
             self._log_feed(before, after)
         except Exception:  # noqa: BLE001 — the status callback must never break on the feed state
             logger.exception("[%s] feed state step failed", self.serial_number)
+            return
+        # Each event THIS step produced, to the registry (``printer_events.FeedEventReported``) —
+        # after the projection, so a handler reading the client sees the state the event came with.
+        for event in after.events:
+            self._hand_over(self._on_feed_event, event, after)
 
     def _log_feed(self, before: FeedReading, after: FeedReading) -> None:
         """One INFO line per feed-state transition, per event and per new tray-change segment —
@@ -3588,10 +3666,8 @@ class BambuMQTTClient:
                 after.phase.value,
                 " ".join(f"{key}={value}" for key, value in detail.items() if value is not None) or "-",
             )
-        for kind in ("roll_drained", "load_landed", "auto_switched", "air_began"):
-            event = getattr(after, kind)
-            if event is not None and event != getattr(before, kind):
-                logger.info("[%s] Feed event %s: %s", self.serial_number, kind, event)
+        for event in after.events:
+            logger.info("[%s] Feed event %s: %s", self.serial_number, event.kind, event)
         grew = after.feeder_log[: len(before.feeder_log)] == before.feeder_log
         # A job boundary resets the record: every entry of the new one is new.
         for extruder, tray, layer in after.feeder_log[len(before.feeder_log) :] if grew else after.feeder_log:
@@ -3602,17 +3678,6 @@ class BambuMQTTClient:
                 layer,
                 extruder,
             )
-
-    def _farm_acting_now(self) -> bool:
-        """The injected provider's answer for this push (False with none, or when it fails — a
-        landing then reads as no farm motion's, the direction that keeps it evidence)."""
-        if self._farm_acting is None:
-            return False
-        try:
-            return bool(self._farm_acting())
-        except Exception:  # noqa: BLE001 — a provider failure must not break the status callback
-            logger.debug("[%s] farm-acting provider failed", self.serial_number, exc_info=True)
-            return False
 
     def _project_feed(self, reading: FeedReading) -> None:
         """THE one writer of ``PrinterState.tray_change_log`` and ``last_loaded_tray`` — both
@@ -3628,6 +3693,9 @@ class BambuMQTTClient:
 
         # Update state fields
         if "gcode_state" in data:
+            if data["gcode_state"] in _JOB_OVER_GCODE_STATES and data["gcode_state"] != _previous_state:
+                # Up BEFORE the job-over state is visible to any reader (``_terminal_pending``).
+                self._terminal_pending = True
             self.state.state = data["gcode_state"]
         if "gcode_file" in data:
             self.state.gcode_file = data["gcode_file"]
@@ -4963,7 +5031,7 @@ class BambuMQTTClient:
             boundary = JobBoundary.ATTACH
         else:
             boundary = JobBoundary.NONE
-        self._step_feed(boundary)
+        self._step_feed(boundary, session_report="gcode_state" in data)
 
         # Detect print completion (FINISH = success, FAILED = error, IDLE = aborted)
         # Use _was_running flag in addition to _previous_gcode_state for more robust detection
@@ -5118,9 +5186,15 @@ class BambuMQTTClient:
 
         # This session's report has now been APPLIED (PrinterState.report_epoch). Stamped
         # last so a reader that sees it sees the whole report and the lifecycle it drove,
-        # and before the broadcast so a consumer gated on it fires on this very push.
+        # and before the broadcast so a consumer gated on it fires on this very push. The
+        # stamp's FIRST landing in a session is the session-start fact the printer-event hub
+        # re-publishes (``printer_events.FirstFreshReport``): handed over once per session,
+        # ahead of this push's broadcast, so the session's re-evaluation is scheduled first.
         if "gcode_state" in data:
+            first_of_session = self.state.report_epoch != self.state.connection_epoch
             self.state.report_epoch = self.state.connection_epoch
+            if first_of_session:
+                self._hand_over(self._on_session_report, self.state.connection_epoch)
 
         if self.on_state_change:
             self.on_state_change(self.state)
@@ -5148,8 +5222,10 @@ class BambuMQTTClient:
             return
         self._dev_mode_probed = True
         self._dev_mode_probe_time = time.monotonic()
-        self._sequence_id += 1
-        seq = str(self._sequence_id)
+        # A transport probe, not an action (a no-op re-send of the slot's own config, sent on the
+        # MQTT thread before anything farm-side runs): it carries the reads' "0", and every other
+        # ``ams_filament_setting`` carries its action's id, so "0" on that command is this probe's.
+        seq = "0"
         self._dev_mode_probe_seq = seq
 
         # Build probe command: re-send current external slot config (no-op on success)
@@ -5202,10 +5278,9 @@ class BambuMQTTClient:
     def _request_version(self):
         """Request firmware version info from printer."""
         if self._client:
-            self._sequence_id += 1
             message = {
                 "info": {
-                    "sequence_id": str(self._sequence_id),
+                    "sequence_id": "0",
                     "command": "get_version",
                 }
             }
@@ -5263,10 +5338,9 @@ class BambuMQTTClient:
     def _request_accessories(self):
         """Request accessories info (nozzle type, etc.) from printer."""
         if self._client:
-            self._sequence_id += 1
             message = {
                 "system": {
-                    "sequence_id": str(self._sequence_id),
+                    "sequence_id": "0",
                     "command": "get_accessories",
                     "accessory_type": "none",
                 }
@@ -5281,13 +5355,12 @@ class BambuMQTTClient:
         so we send a dummy request on connect to 'prime' the system.
         """
         if self._client:
-            self._sequence_id += 1
             command = {
                 "print": {
                     "command": "extrusion_cali_get",
                     "filament_id": "",
                     "nozzle_diameter": "0.4",
-                    "sequence_id": str(self._sequence_id),
+                    "sequence_id": "0",
                 }
             }
             logger.debug("[%s] Sending K-profile priming request", self.serial_number)
@@ -5353,8 +5426,10 @@ class BambuMQTTClient:
         use_ams: bool = True,
         nozzle_offset_cali: bool = False,
         nozzle_mapping: str | None = None,
+        *,
+        sequence_id: str,
     ):
-        """Start a print job on the printer.
+        """Start a print job on the printer. ``sequence_id`` is the send's action id.
 
         The file should already be uploaded to the printer's root directory via FTP.
 
@@ -5506,9 +5581,10 @@ class BambuMQTTClient:
             # the archive even before the printer echoes subtask_id back (#1485).
             self.last_dispatch_subtask_id = submission_id
 
+            self._last_project_file_sequence = sequence_id
             command = {
                 "print": {
-                    "sequence_id": "20000",
+                    "sequence_id": sequence_id,
                     "command": "project_file",
                     "param": f"Metadata/plate_{plate_id}.gcode",
                     "url": f"ftp://{filename}",
@@ -5603,17 +5679,23 @@ class BambuMQTTClient:
                 )
             return False
 
-    def stop_print(self) -> bool:
-        """Stop the current print job."""
+    def stop_print(self, *, sequence_id: str) -> bool:
+        """Stop the current print job. ``sequence_id`` is the send's action id."""
         if self._client and self.state.connected:
-            command = {"print": {"command": "stop", "sequence_id": "0"}}
+            command = {"print": {"command": "stop", "sequence_id": sequence_id}}
             self._client.publish(self.topic_publish, json.dumps(command), qos=1)
             logger.info("[%s] Sent stop print command", self.serial_number)
             return True
         return False
 
     def set_xcam_option(
-        self, module_name: str, enabled: bool, print_halt: bool = True, sensitivity: str = "medium"
+        self,
+        module_name: str,
+        enabled: bool,
+        print_halt: bool = True,
+        sensitivity: str = "medium",
+        *,
+        sequence_id: str,
     ) -> bool:
         """Set an xcam (AI detection) option on the printer.
 
@@ -5632,9 +5714,7 @@ class BambuMQTTClient:
 
         # auto_recovery_step_loss uses a different command format (print.print_option)
         if module_name == "auto_recovery_step_loss":
-            return self._set_print_option("auto_recovery", enabled)
-
-        self._sequence_id += 1
+            return self._set_print_option("auto_recovery", enabled, sequence_id=sequence_id)
 
         # Build the xcam control command (exact OrcaSlicer format)
         # Key findings from OrcaSlicer source:
@@ -5645,7 +5725,7 @@ class BambuMQTTClient:
         command = {
             "xcam": {
                 "command": "xcam_control_set",
-                "sequence_id": str(self._sequence_id),
+                "sequence_id": sequence_id,
                 "module_name": module_name,
                 "control": enabled,
                 "enable": enabled,  # old protocol compatibility
@@ -5708,7 +5788,7 @@ class BambuMQTTClient:
 
         return True
 
-    def _set_print_option(self, option_name: str, enabled: bool) -> bool:
+    def _set_print_option(self, option_name: str, enabled: bool, *, sequence_id: str) -> bool:
         """Set a print option using the print.print_option command.
 
         This is different from xcam_control_set and is used for options like:
@@ -5728,12 +5808,10 @@ class BambuMQTTClient:
         if not self._client or not self.state.connected:
             return False
 
-        self._sequence_id += 1
-
         command = {
             "print": {
                 "command": "print_option",
-                "sequence_id": str(self._sequence_id),
+                "sequence_id": sequence_id,
                 option_name: enabled,
             }
         }
@@ -5754,13 +5832,13 @@ class BambuMQTTClient:
 
         return True
 
-    def set_ams_filament_backup(self, enabled: bool) -> bool:
+    def set_ams_filament_backup(self, enabled: bool, *, sequence_id: str) -> bool:
         """Toggle AMS Filament Backup (a.k.a. auto-switch / auto-refill).
 
         Mirrors BambuStudio's "AMS Filament Backup" checkbox. Verified payload
         shape from H2D capture 2026-06-20.
         """
-        return self._set_print_option("auto_switch_filament", enabled)
+        return self._set_print_option("auto_switch_filament", enabled, sequence_id=sequence_id)
 
     def start_calibration(
         self,
@@ -5769,6 +5847,8 @@ class BambuMQTTClient:
         motor_noise: bool = False,
         nozzle_offset: bool = False,
         high_temp_heatbed: bool = False,
+        *,
+        sequence_id: str,
     ) -> bool:
         """Start printer calibration with selected options.
 
@@ -5809,12 +5889,10 @@ class BambuMQTTClient:
             logger.warning("[%s] No calibration options selected", self.serial_number)
             return False
 
-        self._sequence_id += 1
-
         command = {
             "print": {
                 "command": "calibration",
-                "sequence_id": str(self._sequence_id),
+                "sequence_id": sequence_id,
                 "option": option,
             }
         }
@@ -5839,60 +5917,6 @@ class BambuMQTTClient:
             self._client.loop_stop()
             self._client = None
             self.note_disconnected()
-
-    @staticmethod
-    def _command_verb(command: dict) -> str:
-        """Best-effort extraction of a Bambu command's nested ``command`` verb.
-
-        Payloads are shaped ``{"print": {"command": "stop", ...}}`` /
-        ``{"xcam": {...}}`` etc. Used only for log context, so it never raises.
-        """
-        try:
-            for value in command.values():
-                if isinstance(value, dict) and "command" in value:
-                    return str(value["command"])
-        except AttributeError:
-            pass
-        return "unknown"
-
-    def send_command(self, command: dict) -> bool:
-        """Send a command to the printer.
-
-        Returns True once the command is published, False when the MQTT client is
-        missing/disconnected (the command is dropped) or the broker rejects the
-        publish. A drop is WARNING-logged with the command verb + serial so a
-        silent no-op can never hide a lost printer command.
-        """
-        if not self._client or not self.state.connected:
-            logger.warning(
-                "[%s] Dropped MQTT command '%s' — client not connected",
-                self.serial_number,
-                self._command_verb(command),
-            )
-            return False
-        # Log outgoing message if logging is enabled. Snapshotted for the same reason as
-        # the inbound side: a caller that reuses or post-mutates its command dict must
-        # not be able to rewrite what the log says it sent.
-        if self._logging_enabled:
-            self._message_log.append(
-                MQTTLogEntry(
-                    timestamp=datetime.now(timezone.utc).isoformat(),
-                    topic=self.topic_publish,
-                    direction="out",
-                    payload=copy.deepcopy(command),
-                )
-            )
-        info = self._client.publish(self.topic_publish, json.dumps(command), qos=1)
-        rc = getattr(info, "rc", mqtt.MQTT_ERR_SUCCESS)
-        if rc != mqtt.MQTT_ERR_SUCCESS:
-            logger.warning(
-                "[%s] MQTT publish for command '%s' rejected (rc=%s)",
-                self.serial_number,
-                self._command_verb(command),
-                rc,
-            )
-            return False
-        return True
 
     def enable_logging(self, enabled: bool = True):
         """Enable or disable MQTT message logging."""
@@ -5929,24 +5953,40 @@ class BambuMQTTClient:
         except ValueError:
             pass
 
-    def publish_raw(self, topic: str, payload: bytes | str, qos: int = 1) -> bool:
-        """Publish a pre-formed payload directly to the printer's MQTT broker.
-
-        Used by the VP MQTT bridge to forward slicer-originated commands without
-        going through send_command's sequence-id mangling. Returns False if the
-        underlying paho client isn't ready.
+    def publish_forwarded(self, frame: dict, *, sequence_id: str) -> bool:
+        """Publish a slicer's own frame, forwarded by a virtual printer's bridge, under the record's
+        ``sequence_id`` (``services/printer_action.slicer_forward``). Every block of the frame that carries a
+        ``sequence_id`` — or, when none does, the block naming the command — carries the action's id, so the
+        firmware's reply names the record's row and never a farm action that happens to share the slicer's
+        own number (the bridge hands the slicer its id back on the reply). Returns whether it went out.
         """
-        if self._client is None:
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot forward a slicer frame: not connected", self.serial_number)
             return False
+        wire = copy.deepcopy(frame)
+        blocks = [block for block in wire.values() if isinstance(block, dict)]
+        stamped = [block for block in blocks if "sequence_id" in block] or [
+            block for block in blocks if "command" in block
+        ][:1]
+        for block in stamped:
+            block["sequence_id"] = sequence_id
         try:
-            info = self._client.publish(topic, payload, qos=qos)
-            return info.rc == mqtt.MQTT_ERR_SUCCESS
-        except Exception:
-            logger.exception("[%s] publish_raw failed for topic=%s", self.serial_number, topic)
+            info = self._client.publish(self.topic_publish, json.dumps(wire), qos=1)
+        except Exception:  # noqa: BLE001 — a publish that raised is a frame that did not go out
+            logger.exception("[%s] forwarding a slicer frame failed", self.serial_number)
             return False
+        return getattr(info, "rc", mqtt.MQTT_ERR_SUCCESS) == mqtt.MQTT_ERR_SUCCESS
 
     def send_drying_command(
-        self, ams_id: int, temp: int, duration: int, mode: int = 1, filament: str = "", rotate_tray: bool = False
+        self,
+        ams_id: int,
+        temp: int,
+        duration: int,
+        mode: int = 1,
+        filament: str = "",
+        rotate_tray: bool = False,
+        *,
+        sequence_id: str,
     ):
         """Send AMS drying start/stop command.
 
@@ -5960,10 +6000,9 @@ class BambuMQTTClient:
         """
         if not self._client:
             return False
-        self._sequence_id += 1
         command = {
             "print": {
-                "sequence_id": str(self._sequence_id),
+                "sequence_id": sequence_id,
                 "command": "ams_filament_drying",
                 "ams_id": ams_id,
                 "temp": temp,
@@ -5989,29 +6028,36 @@ class BambuMQTTClient:
             wire_json,
         )
         # Track the active-cycle target so the badge can show "PETG @ 65°C"
-        # while drying. Bambu only echoes dry_time on subsequent pushes. The
-        # latched_until deadline lets ams_unit_drying report "drying" in the window
-        # before the first dry_time push arrives (duration is in HOURS).
+        # while drying. Bambu only echoes dry_time on subsequent pushes;
+        # ``awaiting_start`` lets ams_unit_drying report "drying" from this command
+        # until the unit reports its cycle. A stop (mode 0) changes nothing here:
+        # the unit's own answer does — the stop's success echo
+        # (``_handle_drying_echo``) or its reported dry_time falling to 0.
         if mode == 1:
-            duration_s = (int(duration) * 3600) if duration else _DRYING_LATCH_DEFAULT_S
             self._drying_targets[ams_id] = {
                 "filament": filament or "",
                 "temp": int(temp),
-                "latched_until": time.monotonic() + duration_s + _DRYING_LATCH_SLACK_S,
+                "awaiting_start": True,
+                "session": self.state.connection_epoch,
+                "latched_until": _drying_latch_until(int(duration or 0) * 3600),
             }
-        else:
-            self._drying_targets.pop(ams_id, None)
         return True
 
     def ams_unit_drying(self, ams_id: int) -> bool:
         """True while AMS unit ``ams_id`` is running a drying cycle.
 
-        Drying is signalled by the per-unit ``dry_time`` (minutes remaining) > 0 —
-        ``ams_status_main`` has no drying value (enum 0..4). The merged unit's
-        ``dry_time`` is the primary signal; a monotonic ``latched_until`` backstop
-        (seeded by ``send_drying_command`` or the drying echo) covers the window
-        before the first ``dry_time`` push and a unit row that momentarily omits the
-        field. Every AMS write path consults this: a config write / re-read into a
+        Drying is the unit's REPORTED state (2026-10-11 — never a deadline): the
+        per-unit ``dry_time`` (minutes remaining) > 0 — ``ams_status_main`` has no
+        drying value (enum 0..4); the merged unit keeps the last reported value across a
+        partial that omits it. The one bridge is a start the unit has not reported yet
+        (``awaiting_start``, seeded by ``send_drying_command`` or the mode-1 echo),
+        ended by the unit's own answer: its ``dry_time`` reported positive (then the
+        report decides), the start's fail echo, or a later session's report of the unit
+        not drying — and, when none of those comes, by the client latch
+        (``latched_until``: cycle duration + ``_DRYING_LATCH_SLACK_S``, or
+        ``_DRYING_LATCH_DEFAULT_S`` with no duration), so a start nobody answers can
+        never refuse every AMS write forever. A reported ``dry_time: 0`` is never
+        overridden by a latch — the stop is the mode-0 echo or that report. Every AMS write path consults this: a config write / re-read into a
         drying unit disengages the tray and raises HMS 0700_C069. External/virtual
         trays (254/255) have no unit row and no latch → naturally False. Never
         raises — a malformed ``raw_data`` must not crash a write path.
@@ -6039,26 +6085,44 @@ class BambuMQTTClient:
         except Exception:  # noqa: BLE001 — malformed raw_data must never crash a write path
             pass
         target = self._drying_targets.get(ams_id)
-        if target:
-            deadline = target.get("latched_until")
-            if isinstance(deadline, (int, float)) and time.monotonic() < deadline:
-                return True
-            # Expired latch: drop it so a stale entry can't keep refusing writes.
+        if not (target and target.get("awaiting_start")):
+            return False
+        deadline = target.get("latched_until")
+        if isinstance(deadline, (int, float)) and time.monotonic() >= deadline:
+            # The self-heal fallback: no event answered the start within its cycle + slack. Drop the
+            # entry so a stale start can no longer refuse the unit's writes (production's latch expiry).
             self._drying_targets.pop(ams_id, None)
-        return False
+            logger.warning(
+                "[%s] AMS %d drying start never reported (no dry_time, no echo) within its latch — "
+                "the unit reads not drying",
+                self.serial_number,
+                ams_id,
+            )
+            return False
+        return True
 
     def _handle_drying_echo(self, print_data: dict) -> None:
-        """Seed / clear the drying latch from an ``ams_filament_drying`` echo.
+        """Seed / clear the drying start from an ``ams_filament_drying`` echo — the unit's answer.
 
         A touchscreen-started drying cycle echoes here with no prior
-        ``send_drying_command`` to seed the badge cache, so mode 1 seeds
-        ``_drying_targets`` (filament/temp for the UI badge + a monotonic latch) and
-        mode 0 clears it. An echo with no ``ams_id`` is ignored — the per-unit
-        ``dry_time`` covers that case within seconds. ``duration`` is in HOURS.
+        ``send_drying_command`` to seed the badge cache, so a mode-1 success seeds
+        ``_drying_targets`` (filament/temp for the UI badge + ``awaiting_start``) and a
+        mode-0 success clears it (the stop). A mode-1 FAIL echo is the start refused:
+        nothing is awaited. An echo with no ``ams_id`` is ignored — the per-unit
+        ``dry_time`` covers that case. ``duration`` is in HOURS.
         """
-        if print_data.get("result") != "success":
-            return
         if "ams_id" not in print_data:
+            return
+        if print_data.get("result") != "success":
+            try:
+                refused_start = int(print_data.get("mode")) == 1
+            except (TypeError, ValueError):
+                refused_start = False
+            if refused_start:
+                try:
+                    self._drying_targets.pop(int(print_data["ams_id"]), None)
+                except (TypeError, ValueError):
+                    pass
             return
         try:
             ams_id = int(print_data["ams_id"])
@@ -6073,18 +6137,19 @@ class BambuMQTTClient:
             return
         if mode == 1:
             try:
-                duration_s = int(print_data.get("duration") or 0) * 3600
-            except (TypeError, ValueError):
-                duration_s = 0
-            duration_s = duration_s or _DRYING_LATCH_DEFAULT_S
-            try:
                 temp = int(print_data.get("temp") or 0)
             except (TypeError, ValueError):
                 temp = 0
+            try:
+                duration_s = int(print_data.get("duration") or 0) * 3600
+            except (TypeError, ValueError):
+                duration_s = 0
             self._drying_targets[ams_id] = {
                 "filament": print_data.get("filament") or "",
                 "temp": temp,
-                "latched_until": time.monotonic() + duration_s + _DRYING_LATCH_SLACK_S,
+                "awaiting_start": True,
+                "session": self.state.connection_epoch,
+                "latched_until": _drying_latch_until(duration_s),
             }
 
     def _handle_kprofile_response(self, data: dict):
@@ -6208,8 +6273,7 @@ class BambuMQTTClient:
             return []
 
         for attempt in range(max_retries):
-            # Set up response event for this attempt
-            self._sequence_id += 1
+            # Set up response event for this attempt (a read: matched by nozzle, carries "0")
             self._pending_kprofile_response = asyncio.Event()
             self._kprofile_response_data = None
             self._expected_kprofile_nozzle = nozzle_diameter  # Track which nozzle response we expect
@@ -6220,7 +6284,7 @@ class BambuMQTTClient:
                     "command": "extrusion_cali_get",
                     "filament_id": "",
                     "nozzle_diameter": nozzle_diameter,
-                    "sequence_id": str(self._sequence_id),
+                    "sequence_id": "0",
                 }
             }
 
@@ -6263,6 +6327,8 @@ class BambuMQTTClient:
         setting_id: str | None = None,
         slot_id: int = 0,
         cali_idx: int | None = None,
+        *,
+        sequence_id: str,
     ) -> bool:
         """Set/update a K-profile on the printer.
 
@@ -6283,8 +6349,6 @@ class BambuMQTTClient:
         if not self._client or not self.state.connected:
             logger.warning("[%s] Cannot set K-profile: not connected", self.serial_number)
             return False
-
-        self._sequence_id += 1
 
         # Build the filament entry - printer uses cali_idx for profile identification
         # For new profiles (slot_id=0), use cali_idx=-1 to tell printer to create new slot
@@ -6320,7 +6384,7 @@ class BambuMQTTClient:
                 "command": "extrusion_cali_set",
                 "filaments": [filament_entry],
                 "nozzle_diameter": nozzle_diameter,
-                "sequence_id": str(self._sequence_id),
+                "sequence_id": sequence_id,
             }
         }
 
@@ -6336,6 +6400,8 @@ class BambuMQTTClient:
         self,
         profiles: list[dict],
         nozzle_diameter: str = "0.4",
+        *,
+        sequence_id: str,
     ) -> bool:
         """Set multiple K-profiles in a single command (for dual-nozzle).
 
@@ -6352,8 +6418,6 @@ class BambuMQTTClient:
             return False
 
         import random
-
-        self._sequence_id += 1
 
         filament_entries = []
         for p in profiles:
@@ -6390,7 +6454,7 @@ class BambuMQTTClient:
                 "command": "extrusion_cali_set",
                 "filaments": filament_entries,
                 "nozzle_diameter": nozzle_diameter,
-                "sequence_id": str(self._sequence_id),
+                "sequence_id": sequence_id,
             }
         }
 
@@ -6408,6 +6472,8 @@ class BambuMQTTClient:
         nozzle_diameter: str = "0.4",
         extruder_id: int = 0,
         setting_id: str | None = None,
+        *,
+        sequence_id: str,
     ) -> bool:
         """Delete a K-profile from the printer.
 
@@ -6426,8 +6492,6 @@ class BambuMQTTClient:
             logger.warning("[%s] Cannot delete K-profile: not connected", self.serial_number)
             return False
 
-        self._sequence_id += 1
-
         # Dual-nozzle K-profile delete uses the extruder_id/nozzle_id format;
         # single-nozzle printers (X1C/P1/A1/P2S/H2S) need the setting_id form.
         # Prefer runtime detection from device.extruder.info; fall back to
@@ -6442,7 +6506,7 @@ class BambuMQTTClient:
             command = {
                 "print": {
                     "command": "extrusion_cali_del",
-                    "sequence_id": str(self._sequence_id),
+                    "sequence_id": sequence_id,
                     "extruder_id": extruder_id,
                     "nozzle_id": nozzle_id,
                     "filament_id": filament_id,
@@ -6456,7 +6520,7 @@ class BambuMQTTClient:
             command = {
                 "print": {
                     "command": "extrusion_cali_del",
-                    "sequence_id": str(self._sequence_id),
+                    "sequence_id": sequence_id,
                     "filament_id": filament_id,
                     "cali_idx": cali_idx,
                     "setting_id": setting_id if setting_id else "",
@@ -6479,41 +6543,35 @@ class BambuMQTTClient:
     # Printer Control Commands
     # =========================================================================
 
-    def pause_print(self) -> bool:
+    def pause_print(self, *, sequence_id: str) -> bool:
         """Pause the current print job.
 
-        Sequenced: the frame carries a real id (:meth:`_next_sequence_id`), recorded for
-        :meth:`last_sent_sequence_id`; the firmware's echo lands on ``state.command_acks``.
+        Sequenced: the frame carries its action's id (``services/printer_action``); the firmware's
+        echo lands on ``state.command_acks``.
         """
         if not self._client or not self.state.connected:
             logger.warning("[%s] Cannot pause print: not connected", self.serial_number)
             return False
-
-        seq = self._next_sequence_id()
-        command = {"print": {"command": "pause", "sequence_id": seq}}
+        command = {"print": {"command": "pause", "sequence_id": sequence_id}}
         self._client.publish(self.topic_publish, json.dumps(command), qos=1)
-        self._last_sent_sequence["pause"] = seq
-        logger.info("[%s] Sent pause print command (seq=%s)", self.serial_number, seq)
+        logger.info("[%s] Sent pause print command (sequence_id=%s)", self.serial_number, sequence_id)
         return True
 
-    def resume_print(self) -> bool:
+    def resume_print(self, *, sequence_id: str) -> bool:
         """Resume a paused print job.
 
-        Sequenced: the frame carries a real id (:meth:`_next_sequence_id`), recorded for
-        :meth:`last_sent_sequence_id`; the firmware's echo lands on ``state.command_acks``.
+        Sequenced: the frame carries its action's id (``services/printer_action``); the firmware's
+        echo lands on ``state.command_acks``.
         """
         if not self._client or not self.state.connected:
             logger.warning("[%s] Cannot resume print: not connected", self.serial_number)
             return False
-
-        seq = self._next_sequence_id()
-        command = {"print": {"command": "resume", "sequence_id": seq}}
+        command = {"print": {"command": "resume", "sequence_id": sequence_id}}
         self._client.publish(self.topic_publish, json.dumps(command), qos=1)
-        self._last_sent_sequence["resume"] = seq
-        logger.info("[%s] Sent resume print command (seq=%s)", self.serial_number, seq)
+        logger.info("[%s] Sent resume print command (sequence_id=%s)", self.serial_number, sequence_id)
         return True
 
-    def clean_print_error(self) -> bool:
+    def clean_print_error(self, *, sequence_id: str) -> bool:
         """Publish the printer's clean-print-error command — the ONE publisher of that
         frame in this module (pinned by a source count in ``test_bambu_mqtt.py``).
 
@@ -6529,24 +6587,21 @@ class BambuMQTTClient:
         if not self._client or not self.state.connected:
             logger.warning("[%s] Cannot clean print error: not connected", self.serial_number)
             return False
-
-        seq = self._next_sequence_id()
-        command = {"print": {"command": "clean_print_error", "sequence_id": seq}}
+        command = {"print": {"command": "clean_print_error", "sequence_id": sequence_id}}
         self._client.publish(self.topic_publish, json.dumps(command), qos=1)
-        self._last_sent_sequence["clean_print_error"] = seq
-        logger.info("[%s] Sent clean print error command (seq=%s)", self.serial_number, seq)
+        logger.info("[%s] Sent clean print error command (sequence_id=%s)", self.serial_number, sequence_id)
         return True
 
-    def clear_hms_errors(self) -> bool:
+    def clear_hms_errors(self, *, sequence_id: str) -> bool:
         """Clear HMS/print errors on the printer and locally: :meth:`clean_print_error`,
         then the local wipe the REST route's caller expects to see at once."""
-        if not self.clean_print_error():
+        if not self.clean_print_error(sequence_id=sequence_id):
             return False
         self.state.hms_errors = []
         logger.info("[%s] Cleared HMS errors locally", self.serial_number)
         return True
 
-    def skip_objects(self, object_ids: list[int]) -> bool:
+    def skip_objects(self, object_ids: list[int], *, sequence_id: str) -> bool:
         """Skip specific objects during a print.
 
         This command tells the printer to skip printing the specified objects.
@@ -6579,8 +6634,7 @@ class BambuMQTTClient:
             logger.warning("[%s] Invalid object IDs: %s", self.serial_number, e)
             return False
 
-        self._sequence_id += 1
-        command = {"print": {"sequence_id": str(self._sequence_id), "command": "skip_objects", "obj_list": obj_list}}
+        command = {"print": {"sequence_id": sequence_id, "command": "skip_objects", "obj_list": obj_list}}
         self._client.publish(self.topic_publish, json.dumps(command), qos=1)
         logger.info("[%s] Sent skip_objects command: %s", self.serial_number, obj_list)
 
@@ -6591,7 +6645,7 @@ class BambuMQTTClient:
 
         return True
 
-    def send_gcode(self, gcode: str) -> bool:
+    def send_gcode(self, gcode: str, *, sequence_id: str) -> bool:
         """Send G-code command(s) to the printer.
 
         Multiple commands can be separated by newlines.
@@ -6606,14 +6660,13 @@ class BambuMQTTClient:
             logger.warning("[%s] Cannot send G-code: not connected", self.serial_number)
             return False
 
-        self._sequence_id += 1
-        command = {"print": {"command": "gcode_line", "param": gcode, "sequence_id": str(self._sequence_id)}}
+        command = {"print": {"command": "gcode_line", "param": gcode, "sequence_id": sequence_id}}
         # Use QoS 1 for reliable delivery (at least once)
         self._client.publish(self.topic_publish, json.dumps(command), qos=1)
         logger.debug("[%s] Sent G-code: %s...", self.serial_number, gcode[:50])
         return True
 
-    def set_bed_temperature(self, target: int) -> bool:
+    def set_bed_temperature(self, target: int, *, sequence_id: str) -> bool:
         """Set the bed target temperature.
 
         Args:
@@ -6622,9 +6675,9 @@ class BambuMQTTClient:
         Returns:
             True if command was sent, False otherwise
         """
-        return self.send_gcode(f"M140 S{target}")
+        return self.send_gcode(f"M140 S{target}", sequence_id=sequence_id)
 
-    def set_nozzle_temperature(self, target: int, nozzle: int = 0) -> bool:
+    def set_nozzle_temperature(self, target: int, nozzle: int = 0, *, sequence_id: str) -> bool:
         """Set the nozzle target temperature.
 
         Args:
@@ -6636,7 +6689,7 @@ class BambuMQTTClient:
         """
         # Use M104 for non-blocking
         # Always use T parameter for H2D compatibility
-        result = self.send_gcode(f"M104 T{nozzle} S{target}")
+        result = self.send_gcode(f"M104 T{nozzle} S{target}", sequence_id=sequence_id)
         # H2D quirk: left nozzle (nozzle=1) target isn't reported in MQTT
         # Track it locally so we can display it correctly
         if result and nozzle == 1:
@@ -6645,7 +6698,7 @@ class BambuMQTTClient:
             logger.info("[%s] Tracking LEFT nozzle target locally: %s°C", self.serial_number, target)
         return result
 
-    def set_chamber_temperature(self, target: int) -> bool:
+    def set_chamber_temperature(self, target: int, *, sequence_id: str) -> bool:
         """Set the chamber target temperature.
 
         Args:
@@ -6655,7 +6708,7 @@ class BambuMQTTClient:
             True if command was sent, False otherwise
         """
         # M141 sets chamber temperature
-        result = self.send_gcode(f"M141 S{target}")
+        result = self.send_gcode(f"M141 S{target}", sequence_id=sequence_id)
         # Track chamber target locally (MQTT reports encoded values that need filtering)
         if result:
             self.state.temperatures["chamber_target"] = float(target)
@@ -6668,7 +6721,7 @@ class BambuMQTTClient:
             )
         return result
 
-    def set_print_speed(self, mode: int) -> bool:
+    def set_print_speed(self, mode: int, *, sequence_id: str) -> bool:
         """Set the print speed mode.
 
         Args:
@@ -6685,12 +6738,12 @@ class BambuMQTTClient:
             logger.warning("[%s] Invalid speed mode: %s", self.serial_number, mode)
             return False
 
-        command = {"print": {"command": "print_speed", "param": str(mode), "sequence_id": "0"}}
+        command = {"print": {"command": "print_speed", "param": str(mode), "sequence_id": sequence_id}}
         self._client.publish(self.topic_publish, json.dumps(command), qos=1)
         logger.info("[%s] Set print speed mode to %s", self.serial_number, mode)
         return True
 
-    def set_fan_speed(self, fan: int, speed: int) -> bool:
+    def set_fan_speed(self, fan: int, speed: int, *, sequence_id: str) -> bool:
         """Set fan speed.
 
         Args:
@@ -6705,9 +6758,9 @@ class BambuMQTTClient:
             return False
 
         speed = max(0, min(255, speed))  # Clamp to 0-255
-        return self.send_gcode(f"M106 P{fan} S{speed}")
+        return self.send_gcode(f"M106 P{fan} S{speed}", sequence_id=sequence_id)
 
-    def set_fan_percent(self, fan: int, percent: int) -> bool:
+    def set_fan_percent(self, fan: int, percent: int, *, sequence_id: str) -> bool:
         """Set a fan speed by PERCENT — the ONE origin of the percent→PWM conversion.
 
         The wire speaks PWM (``M106 P<fan> S<0-255>``, :meth:`set_fan_speed`) while every
@@ -6723,9 +6776,9 @@ class BambuMQTTClient:
             True if the command was sent, False otherwise
         """
         percent = max(0, min(100, percent))
-        return self.set_fan_speed(fan, round(percent * 255 / 100))
+        return self.set_fan_speed(fan, round(percent * 255 / 100), sequence_id=sequence_id)
 
-    def set_airduct_mode(self, mode: str) -> bool:
+    def set_airduct_mode(self, mode: str, *, sequence_id: str) -> bool:
         """Set air conditioning mode (cooling or heating).
 
         Args:
@@ -6741,19 +6794,14 @@ class BambuMQTTClient:
             logger.warning("[%s] Cannot set airduct mode: not connected", self.serial_number)
             return False
 
-        self._sequence_id += 1
         mode_id = 0 if mode == "cooling" else 1
-        command = {
-            "print": {"command": "set_airduct", "modeId": mode_id, "sequence_id": str(self._sequence_id), "submode": -1}
-        }
+        command = {"print": {"command": "set_airduct", "modeId": mode_id, "sequence_id": sequence_id, "submode": -1}}
         # Use QoS 1 for reliable delivery
         self._client.publish(self.topic_publish, json.dumps(command), qos=1)
-        logger.info(
-            "[%s] Set airduct mode to %s (modeId=%s, seq=%s)", self.serial_number, mode, mode_id, self._sequence_id
-        )
+        logger.info("[%s] Set airduct mode to %s (modeId=%s, seq=%s)", self.serial_number, mode, mode_id, sequence_id)
         return True
 
-    def set_chamber_light(self, on: bool) -> bool:
+    def set_chamber_light(self, on: bool, *, sequence_id: str) -> bool:
         """Turn chamber light on or off.
 
         Args:
@@ -6769,7 +6817,6 @@ class BambuMQTTClient:
         mode = "on" if on else "off"
         # Control both chamber lights (some printers like H2D have two)
         for led_node in ["chamber_light", "chamber_light2"]:
-            self._sequence_id += 1
             command = {
                 "system": {
                     "command": "ledctrl",
@@ -6779,14 +6826,14 @@ class BambuMQTTClient:
                     "led_off_time": 500,
                     "loop_times": 0,
                     "interval_time": 0,
-                    "sequence_id": str(self._sequence_id),
+                    "sequence_id": sequence_id,
                 }
             }
             self._client.publish(self.topic_publish, json.dumps(command), qos=1)
-        logger.info("[%s] Set chamber lights %s (seq=%s)", self.serial_number, "on" if on else "off", self._sequence_id)
+        logger.info("[%s] Set chamber lights %s (seq=%s)", self.serial_number, "on" if on else "off", sequence_id)
         return True
 
-    def select_extruder(self, extruder: int) -> bool:
+    def select_extruder(self, extruder: int, *, sequence_id: str) -> bool:
         """Select the active extruder for dual-nozzle printers (H2D).
 
         Args:
@@ -6807,17 +6854,14 @@ class BambuMQTTClient:
         # Command format captured from OrcaSlicer:
         # {"print": {"command": "select_extruder", "extruder_index": 0, "sequence_id": "..."}}
         # extruder_index: 0 = RIGHT, 1 = LEFT
-        self._sequence_id += 1
-        command = {
-            "print": {"command": "select_extruder", "extruder_index": extruder, "sequence_id": str(self._sequence_id)}
-        }
+        command = {"print": {"command": "select_extruder", "extruder_index": extruder, "sequence_id": sequence_id}}
         self._client.publish(self.topic_publish, json.dumps(command), qos=1)
         logger.info(
             "[%s] Sent select_extruder command: extruder_index=%s (0=right, 1=left)", self.serial_number, extruder
         )
         return True
 
-    def home_axes(self, axes: str = "XYZ") -> bool:
+    def home_axes(self, axes: str = "XYZ", *, sequence_id: str) -> bool:
         """Run the printer's full auto-home sequence, model-aware.
 
         The ``axes`` argument is ignored — a full home is always run.
@@ -6840,10 +6884,10 @@ class BambuMQTTClient:
         from backend.app.utils.printer_models import DUAL_NOZZLE_FULL_HOME, is_dual_nozzle_model
 
         if self._is_dual_nozzle or is_dual_nozzle_model(self.model):
-            return self.send_gcode("\n".join(DUAL_NOZZLE_FULL_HOME))
-        return self.send_gcode("G28")
+            return self.send_gcode("\n".join(DUAL_NOZZLE_FULL_HOME), sequence_id=sequence_id)
+        return self.send_gcode("G28", sequence_id=sequence_id)
 
-    def move_axis(self, axis: str, distance: float, speed: int = 3000) -> bool:
+    def move_axis(self, axis: str, distance: float, speed: int = 3000, *, sequence_id: str) -> bool:
         """Move an axis by a relative distance.
 
         Args:
@@ -6861,9 +6905,9 @@ class BambuMQTTClient:
 
         # G91 = relative mode, G0 = rapid move, G90 = back to absolute
         gcode = f"G91\nG0 {axis}{distance:.2f} F{speed}\nG90"
-        return self.send_gcode(gcode)
+        return self.send_gcode(gcode, sequence_id=sequence_id)
 
-    def disable_motors(self) -> bool:
+    def disable_motors(self, *, sequence_id: str) -> bool:
         """Disable all stepper motors.
 
         Warning: This will cause the printer to lose its position.
@@ -6872,17 +6916,17 @@ class BambuMQTTClient:
         Returns:
             True if command was sent, False otherwise
         """
-        return self.send_gcode("M18")
+        return self.send_gcode("M18", sequence_id=sequence_id)
 
-    def enable_motors(self) -> bool:
+    def enable_motors(self, *, sequence_id: str) -> bool:
         """Enable all stepper motors.
 
         Returns:
             True if command was sent, False otherwise
         """
-        return self.send_gcode("M17")
+        return self.send_gcode("M17", sequence_id=sequence_id)
 
-    def ams_load_filament(self, tray_id: int, extruder_id: int | None = None) -> bool:
+    def ams_load_filament(self, tray_id: int, extruder_id: int | None = None, *, sequence_id: str) -> bool:
         """Load filament from a specific AMS tray.
 
         Args:
@@ -6933,12 +6977,10 @@ class BambuMQTTClient:
         # A load is motion, not an identify — it never arms the identify gate.
         if self._refuse_ams_write("ams_change_filament (load)", ams_id) is not None:
             return False
-
-        seq = self._next_sequence_id()
         command = {
             "print": {
                 "command": "ams_change_filament",
-                "sequence_id": seq,
+                "sequence_id": sequence_id,
                 "ams_id": ams_id,
                 "slot_id": slot_id,
                 "target": tray_id,
@@ -6950,7 +6992,6 @@ class BambuMQTTClient:
         command_json = json.dumps(command)
         logger.info("[%s] Publishing ams_change_filament command: %s", self.serial_number, command_json)
         self._client.publish(self.topic_publish, command_json, qos=1)
-        self._last_sent_sequence["ams_change_filament"] = seq
         logger.info("[%s] Loading filament from tray %s (AMS %s slot %s)", self.serial_number, tray_id, ams_id, slot_id)
 
         # Track this load request for H2D dual-nozzle disambiguation
@@ -6961,7 +7002,7 @@ class BambuMQTTClient:
 
         return True
 
-    def ams_unload_filament(self) -> bool:
+    def ams_unload_filament(self, *, sequence_id: str) -> bool:
         """Unload the currently loaded filament.
 
         Returns:
@@ -7000,12 +7041,10 @@ class BambuMQTTClient:
         nozzle_temp = int(self.state.temperatures.get("nozzle", 210))
         if nozzle_temp < 180:
             nozzle_temp = 210  # Default to PLA temp if nozzle is cold
-
-        seq = self._next_sequence_id()
         command = {
             "print": {
                 "command": "ams_change_filament",
-                "sequence_id": seq,
+                "sequence_id": sequence_id,
                 "ams_id": ams_id,
                 "slot_id": 255,  # 255 = unload marker
                 "target": 255,  # 255 = unload destination
@@ -7017,7 +7056,6 @@ class BambuMQTTClient:
         command_json = json.dumps(command)
         logger.info("[%s] Publishing ams_change_filament (unload) command: %s", self.serial_number, command_json)
         self._client.publish(self.topic_publish, command_json, qos=1)
-        self._last_sent_sequence["ams_change_filament"] = seq
         logger.info("[%s] Unloading filament (tray_now was %s)", self.serial_number, tray_now)
 
         # Clear tracked load request since we're unloading
@@ -7027,7 +7065,7 @@ class BambuMQTTClient:
 
         return True
 
-    def ams_control(self, action: str, *, request_pushall: bool = False) -> bool:
+    def ams_control(self, action: str, *, sequence_id: str, request_pushall: bool = False) -> bool:
         """Control AMS operations — the ONE publisher of the ``ams_control`` frame.
 
         Args:
@@ -7044,8 +7082,8 @@ class BambuMQTTClient:
                 must reflect the new error list immediately.
 
         The frame carries a real incrementing ``sequence_id`` — BambuStudio's
-        ``command_ams_control`` sends ``m_sequence_id++`` — recorded for
-        :meth:`last_sent_sequence_id`, so the echo on ``state.command_acks`` can be
+        ``command_ams_control`` sends ``m_sequence_id++`` — the action's id
+        (``services/printer_action``), so the echo on ``state.command_acks`` can be
         matched to this send. An invalid action is refused before an id is allocated.
 
         Returns:
@@ -7058,16 +7096,13 @@ class BambuMQTTClient:
         if action not in ("resume", "reset", "pause", "done", "abort"):
             logger.warning("[%s] Invalid AMS action: %s", self.serial_number, action)
             return False
-
-        seq = self._next_sequence_id()
-        command = {"print": {"command": "ams_control", "param": action, "sequence_id": seq}}
+        command = {"print": {"command": "ams_control", "param": action, "sequence_id": sequence_id}}
         self._client.publish(self.topic_publish, json.dumps(command), qos=1)
-        self._last_sent_sequence["ams_control"] = seq
         if request_pushall:
             self._client.publish(
                 self.topic_publish, json.dumps({"pushing": {"command": "pushall", "sequence_id": "0"}}), qos=1
             )
-        logger.info("[%s] AMS control: %s (seq=%s)", self.serial_number, action, seq)
+        logger.info("[%s] AMS control: %s (sequence_id=%s)", self.serial_number, action, sequence_id)
         return True
 
     def _ams_write_refusal(self, ams_id: int) -> str | None:
@@ -7160,7 +7195,7 @@ class BambuMQTTClient:
                 return False
             await asyncio.sleep(0.5)
 
-    def ams_refresh_tray(self, ams_id: int, tray_id: int) -> tuple[bool, str]:
+    def ams_refresh_tray(self, ams_id: int, tray_id: int, *, sequence_id: str) -> tuple[bool, str]:
         """Trigger RFID re-read for a specific AMS tray.
 
         Args:
@@ -7204,7 +7239,9 @@ class BambuMQTTClient:
 
         # Use ams_get_rfid command to trigger RFID re-read
         # This command is used by Bambu Studio to re-read the RFID tag
-        command = {"print": {"command": "ams_get_rfid", "ams_id": ams_id, "slot_id": tray_id, "sequence_id": "0"}}
+        command = {
+            "print": {"command": "ams_get_rfid", "ams_id": ams_id, "slot_id": tray_id, "sequence_id": sequence_id}
+        }
         self._client.publish(self.topic_publish, json.dumps(command), qos=1)
         # Arm the per-printer identify gate: the read runs one slot at a time, so no
         # further identify may go out until it settles (or ams_status leaves 2).
@@ -7225,6 +7262,8 @@ class BambuMQTTClient:
         nozzle_temp_max: int,
         setting_id: str = "",
         operation: str = "ams_filament_setting",
+        *,
+        sequence_id: str,
     ) -> bool:
         """Set AMS tray filament settings (type, color, temperature).
 
@@ -7309,7 +7348,7 @@ class BambuMQTTClient:
                 "tray_color": tray_color,
                 "nozzle_temp_min": nozzle_temp_min,
                 "nozzle_temp_max": nozzle_temp_max,
-                "sequence_id": "0",
+                "sequence_id": sequence_id,
             }
         }
 
@@ -7326,7 +7365,7 @@ class BambuMQTTClient:
         self._last_ams_cmd_time = time.monotonic()
         return True
 
-    def reset_ams_slot(self, ams_id: int, tray_id: int) -> bool:
+    def reset_ams_slot(self, ams_id: int, tray_id: int, *, sequence_id: str) -> bool:
         """Reset an AMS slot to empty/unconfigured state.
 
         A reset IS a filament setting — the BLANK identity — so it publishes through
@@ -7353,6 +7392,7 @@ class BambuMQTTClient:
             nozzle_temp_max=0,
             setting_id="",
             operation="reset_ams_slot",
+            sequence_id=sequence_id,
         )
         if published:
             logger.info("[%s] Reset AMS slot: AMS %s, tray %s", self.serial_number, ams_id, tray_id)
@@ -7365,6 +7405,8 @@ class BambuMQTTClient:
         cali_idx: int,
         filament_id: str,
         nozzle_diameter: str = "0.4",
+        *,
+        sequence_id: str,
     ) -> bool:
         """Set calibration profile (K value) for an AMS slot.
 
@@ -7435,7 +7477,7 @@ class BambuMQTTClient:
                 "ams_id": mqtt_ams_id,
                 "tray_id": mqtt_tray_id,
                 "slot_id": slot_id,
-                "sequence_id": "0",
+                "sequence_id": sequence_id,
             }
         }
 
@@ -7457,6 +7499,8 @@ class BambuMQTTClient:
         setting_id: str = "",
         name: str = "",
         cali_idx: int = -1,
+        *,
+        sequence_id: str,
     ) -> bool:
         """Directly set K value (pressure advance) for a tray.
 
@@ -7500,7 +7544,7 @@ class BambuMQTTClient:
                 "command": "extrusion_cali_set",
                 "filaments": [filament_entry],
                 "nozzle_diameter": nozzle_diameter,
-                "sequence_id": str(self._sequence_id),
+                "sequence_id": sequence_id,
             }
         }
 
@@ -7510,7 +7554,7 @@ class BambuMQTTClient:
         self._client.publish(self.topic_publish, command_json, qos=1)
         return True
 
-    def set_timelapse(self, enable: bool) -> bool:
+    def set_timelapse(self, enable: bool, *, sequence_id: str) -> bool:
         """Enable or disable timelapse recording.
 
         Args:
@@ -7526,7 +7570,11 @@ class BambuMQTTClient:
         command = {"pushing": {"command": "pushall", "sequence_id": "0"}}
         # First send the timelapse setting
         timelapse_cmd = {
-            "print": {"command": "gcode_line", "param": f"M981 S{1 if enable else 0} P20000", "sequence_id": "0"}
+            "print": {
+                "command": "gcode_line",
+                "param": f"M981 S{1 if enable else 0} P20000",
+                "sequence_id": sequence_id,
+            }
         }
         self._client.publish(self.topic_publish, json.dumps(timelapse_cmd), qos=1)
         # Request status update
@@ -7534,7 +7582,7 @@ class BambuMQTTClient:
         logger.info("[%s] Set timelapse %s", self.serial_number, "enabled" if enable else "disabled")
         return True
 
-    def set_liveview(self, enable: bool) -> bool:
+    def set_liveview(self, enable: bool, *, sequence_id: str) -> bool:
         """Enable or disable live view / camera streaming.
 
         Args:
@@ -7548,7 +7596,11 @@ class BambuMQTTClient:
             return False
 
         command = {
-            "xcam": {"command": "ipcam_record_set", "control": "enable" if enable else "disable", "sequence_id": "0"}
+            "xcam": {
+                "command": "ipcam_record_set",
+                "control": "enable" if enable else "disable",
+                "sequence_id": sequence_id,
+            }
         }
         self._client.publish(self.topic_publish, json.dumps(command), qos=1)
         # Request status update
@@ -7557,7 +7609,7 @@ class BambuMQTTClient:
         logger.info("[%s] Set liveview %s", self.serial_number, "enabled" if enable else "disabled")
         return True
 
-    def execute_hms_action(self, print_error: str, action: str, job_id: str) -> SentCommand | None:
+    def execute_hms_action(self, print_error: str, action: str, job_id: str, *, sequence_id: str) -> bool:
         """Press one of the printer's dialog buttons — the ONE owner of the dialog-button
         frames (AST-pinned: ``test_code_quality.TestHmsDialogFrameOwnership``).
 
@@ -7595,24 +7647,24 @@ class BambuMQTTClient:
         ``job_id`` field is deliberately NOT read: what it carries on a LAN print has
         never been observed on this fleet.
 
-        Every print-topic frame carries a real ``sequence_id`` (:meth:`_next_sequence_id`,
-        recorded under its command for :meth:`last_sent_sequence_id`) and is followed by a
-        pushall, so the modal's status query reflects the printer's answer. The answer
-        itself is read with :meth:`await_ack`.
+        Every print-topic frame carries the press's ``sequence_id`` — its action's id
+        (``services/printer_action``, the one caller) — and is followed by a pushall, so the
+        modal's status query reflects the printer's answer. The answer itself is the action's
+        (the ACK read into ``printer_action``).
 
         ``STOP_PRINTING`` is refused here (2026-09-24): an operator stopping a print from
         the HMS dialog is the operator's Stop, whose one owner is
         ``print_control.stop_as_operator`` (the durable stop request AND the stop); the
         route sends it there.
 
-        Returns the :class:`SentCommand` whose ACK answers the press, or ``None`` when
-        nothing went out: offline, an unknown or refused action, a refused ``err``, or a
-        button the printer's own screen handles (``CHECK_ASSISTANT`` and the like).
+        Returns True when a frame went out, False when nothing did: offline, an unknown or
+        refused action, a refused ``err``, or a button the printer's own screen handles
+        (``CHECK_ASSISTANT`` and the like).
         """
 
         if not self._client or not self.state.connected:
             logger.warning("[%s] Cannot execute HMS action: not connected", self.serial_number)
-            return None
+            return False
 
         # Always re-push the full state after a command so the modal's underlying
         # status query reflects the new error list (or absence) on the next tick.
@@ -7621,22 +7673,14 @@ class BambuMQTTClient:
                 self.topic_publish, json.dumps({"pushing": {"command": "pushall", "sequence_id": "0"}}), qos=1
             )
 
-        def send(frame: dict) -> SentCommand:
-            # One print-topic frame with a real sequence id, recorded like the other
-            # controls, then the pushall.
-            seq = self._next_sequence_id()
-            command = frame["command"]
-            self._client.publish(self.topic_publish, json.dumps({"print": {**frame, "sequence_id": seq}}), qos=1)
-            self._last_sent_sequence[command] = seq
+        def send(frame: dict) -> bool:
+            # One print-topic frame under the press's sequence id, then the pushall.
+            self._client.publish(
+                self.topic_publish, json.dumps({"print": {**frame, "sequence_id": sequence_id}}), qos=1
+            )
             pushall()
-            logger.info("[%s] HMS action %s sent %s (seq=%s)", self.serial_number, action, frame, seq)
-            return SentCommand(command=command, sequence_id=seq)
-
-        def sent_by(published: bool, command: str) -> SentCommand | None:
-            # A frame one of the sequenced publishers sent: the id it recorded is this send's.
-            if not published:
-                return None
-            return SentCommand(command=command, sequence_id=self.last_sent_sequence_id(command))
+            logger.info("[%s] HMS action %s sent %s (seq=%s)", self.serial_number, action, frame, sequence_id)
+            return True
 
         def dialog_err() -> str | None:
             err = _decimal_dialog_err(print_error)
@@ -7658,31 +7702,31 @@ class BambuMQTTClient:
                 | HMSAction.PROCEED
                 | HMSAction.DBL_CHECK_RESUME
             ):
-                sent = sent_by(self.resume_print(), "resume")
-                if sent is not None:
+                sent = self.resume_print(sequence_id=sequence_id)
+                if sent:
                     pushall()
                 return sent
 
             case HMSAction.PROBLEM_SOLVED_RESUME | HMSAction.RESUME_PRINTING_PROBELM_SOLVED:
                 err = dialog_err()
                 if err is None:
-                    return None
+                    return False
                 return send({"command": "resume", "err": err, "param": "reserve", "job_id": job_id})
 
             case HMSAction.IGNORE_RESUME | HMSAction.IGNORE_NO_REMINDER_NEXT_TIME | HMSAction.DONT_REMIND_NEXT_TIME:
                 err = dialog_err()
                 if err is None:
-                    return None
+                    return False
                 return send({"command": "ignore", "err": err, "param": "reserve", "job_id": job_id})
 
             case HMSAction.NO_REMINDER_NEXT_TIME:
                 err = dialog_err()
                 if err is None:
-                    return None
+                    return False
                 return send({"command": "idle_ignore", "err": err, "type": 0})
 
             case HMSAction.FILAMENT_EXTRUDED | HMSAction.DBL_CHECK_DONE:
-                return sent_by(self.ams_control("done", request_pushall=True), "ams_control")
+                return self.ams_control("done", sequence_id=sequence_id, request_pushall=True)
 
             case (
                 HMSAction.RETRY_FILAMENT_EXTRUDED
@@ -7690,26 +7734,27 @@ class BambuMQTTClient:
                 | HMSAction.RETRY_PROBLEM_SOLVED
                 | HMSAction.DBL_CHECK_RETRY
             ):
-                return sent_by(self.ams_control("resume", request_pushall=True), "ams_control")
+                return self.ams_control("resume", sequence_id=sequence_id, request_pushall=True)
 
             case HMSAction.ABORT:
-                return sent_by(self.ams_control("abort", request_pushall=True), "ams_control")
+                return self.ams_control("abort", sequence_id=sequence_id, request_pushall=True)
 
             # The dialog's OK: the ONE clean-print-error publisher (frame only — the
             # modal re-reads the printer's own list off the pushall), then the pushall.
             case HMSAction.OK_BUTTON:
-                sent = sent_by(self.clean_print_error(), "clean_print_error")
-                if sent is not None:
+                sent = self.clean_print_error(sequence_id=sequence_id)
+                if sent:
                     pushall()
                 return sent
 
             case HMSAction.DBL_CHECK_OK:
-                if not self.clean_print_error():
-                    return None
+                if not self.clean_print_error(sequence_id=sequence_id):
+                    return False
                 pushall()
                 # The dialog close rides the SYSTEM topic, whose echo is never recorded as an
-                # ACK, so this press answers "sent". `err` is the 8-char short code as the
-                # frontend sent it, uppercased the way BambuStudio sends it.
+                # ACK (the press's answer is the clean-print-error frame's ACK, above). `err` is
+                # the 8-char short code as the frontend sent it, uppercased the way BambuStudio
+                # sends it.
                 self._client.publish(
                     self.topic_publish,
                     json.dumps(
@@ -7728,7 +7773,7 @@ class BambuMQTTClient:
                     qos=1,
                 )
                 pushall()
-                return SentCommand(command="uiop", sequence_id=None)
+                return True
 
             case HMSAction.REFRESH_NOZZLE:
                 return send({"command": "refresh_nozzle"})
@@ -7748,7 +7793,7 @@ class BambuMQTTClient:
                     "print_control.stop_as_operator's — nothing sent",
                     self.serial_number,
                 )
-                return None
+                return False
 
             case (
                 HMSAction.CHECK_ASSISTANT
@@ -7762,8 +7807,8 @@ class BambuMQTTClient:
                 # UI-only actions — the printer's own screen handles these; the modal
                 # still surfaces them so the user has parity with Studio. No frame exists.
                 logger.info("[%s] HMS action %s is screen-only — nothing sent", self.serial_number, action)
-                return None
+                return False
 
             case _:
                 logger.warning("[%s] Unknown HMS action '%s'", self.serial_number, action)
-                return None
+                return False

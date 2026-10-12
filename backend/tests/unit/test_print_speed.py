@@ -4,7 +4,7 @@ Tests POST /api/v1/printers/{printer_id}/print-speed?mode=N
 where mode is 1=silent, 2=standard, 3=sport, 4=ludicrous.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 from httpx import AsyncClient
@@ -74,4 +74,4 @@ class TestPrintSpeedAPI:
             result = response.json()
             assert result["success"] is True
             assert expected_name in result["message"]
-            mock_client.set_print_speed.assert_called_once_with(mode)
+            mock_client.set_print_speed.assert_called_once_with(mode, sequence_id=ANY)

@@ -133,8 +133,8 @@ def test_hydration_never_kicks():
     """``cause="hydrate"`` skips persist, broadcast AND kick.
 
     The state was just READ from the DB, and a kick would wake the scheduler
-    mid-startup — before ``reconcile_pending_ejects_on_startup`` has decided what the
-    rebuilt records mean. Both hydration entry points are pinned, including the eject
+    mid-startup — before each printer's session start (``reconcile_pending_eject``) has
+    decided what the rebuilt records mean. Both hydration entry points are pinned, including the eject
     one, whose ``before`` view is empty and would otherwise look like an edge.
     """
     with patch("backend.app.services.dispatch_kick.dispatch_kick") as mock_dk:

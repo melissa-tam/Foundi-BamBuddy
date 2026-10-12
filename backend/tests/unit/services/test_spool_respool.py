@@ -21,7 +21,7 @@ from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_k_profile import SpoolKProfile
 from backend.app.models.spool_usage_history import SpoolUsageHistory
-from backend.app.services import hms_edges, spool_binding, spool_respool
+from backend.app.services import hms_edges, printer_action, spool_binding, spool_respool
 from backend.app.services.bambu_mqtt import BambuMQTTClient, HMSError
 from backend.app.services.hms_errors import hms_short_code
 from backend.app.services.spool_respool import (
@@ -33,7 +33,6 @@ from backend.app.services.spool_respool import (
     mark_spent_on_runout,
     mark_spent_on_slot_runout,
     maybe_auto_or_prompt_respool,
-    note_commanded_load,
     rebroadcast_unresolved_respool_prompts,
     respool_tag,
     should_evaluate_respool,
@@ -130,8 +129,8 @@ def _record_physical_cycle(printer_id, ams_id=0, tray_id=0, *, age_s=0.0):
 
 @pytest.fixture
 def fake_clock(monkeypatch):
-    """Drive spool_respool._monotonic so its monotonic windows — the commanded-load
-    TTL and the 10 s remain-jump corroboration — advance without wall-clock waits."""
+    """Drive spool_respool._monotonic so its monotonic windows — the 10 s remain-jump
+    corroboration and the contradiction scan's throttle — advance without wall-clock waits."""
     clock = {"t": 1000.0}
     monkeypatch.setattr(spool_respool, "_monotonic", lambda: clock["t"])
     return clock
@@ -648,6 +647,24 @@ def _natural_runout(feeding, printer_id, *, subtask_id="job-A"):
     return _runout(_empty_bay(), subtask_id=subtask_id)
 
 
+async def _live_job(db, printer_id, *, started_minutes_ago):
+    """The printer's live print — its ``printing`` archive (``print_binding``'s record of the job a
+    runout happens in), begun ``started_minutes_ago``."""
+    from backend.app.models.archive import PrintArchive
+
+    db.add(
+        PrintArchive(
+            printer_id=printer_id,
+            filename="job.3mf",
+            file_path="/tmp/job.3mf",
+            file_size=1,
+            status="printing",
+            started_at=datetime.utcnow() - timedelta(minutes=started_minutes_ago),
+        )
+    )
+    await db.commit()
+
+
 async def _seed_released_row(db, printer_id, ams_id, tray_id, **kwargs):
     """A row that was bound to the slot and then RELEASED through the real unbind writer.
 
@@ -759,6 +776,7 @@ async def test_mark_spent_stands_aside_when_the_incumbent_was_seated_after_the_b
     aside and tier 2 resolves the row that actually left.
     """
     printer = await printer_factory()
+    await _live_job(db_session, printer.id, started_minutes_ago=60)  # the job the roll ran dry in
     drained = await _seed_released_row(db_session, printer.id, 0, 0, weight_used=900.0)
     await _backdate_release(db_session, drained, minutes=3)  # the measured firmware gap
     fresh = await _seed_bound_row(db_session, printer.id, 0, 0, weight_used=0)
@@ -820,17 +838,67 @@ async def test_a_residue_bound_elsewhere_is_no_victim_and_never_hands_tier_1_to_
 
 
 @pytest.mark.asyncio
-async def test_a_clear_older_than_the_episode_window_leaves_tier_1_alone(db_session, printer_factory, feeding):
-    """The window is what says WHICH of a slot's clears the arriving evidence is about.
+async def test_no_live_job_a_clear_inside_the_window_hands_the_stamp_to_tier_2(db_session, printer_factory, feeding):
+    """No live job (production's window, restored 2026-10-12): the bay cleared three minutes ago and
+    a fresh roll was seated since — tier 1 stands aside and the roll that left takes the stamp."""
+    printer = await printer_factory()
+    drained = await _seed_released_row(db_session, printer.id, 0, 0, weight_used=900.0)
+    await _backdate_release(db_session, drained, minutes=3)
+    fresh = await _seed_bound_row(db_session, printer.id, 0, 0, weight_used=0)
 
-    Outside it the farm asserts nothing new: the incumbent has been seated far longer than
-    any bay-clear→HMS gap the firmware has ever shown, so it is the roll that has been
-    feeding, and it is the one the runout is about. Pinned as the deliberate cost it is —
-    the alternative reading (an HMS half an hour late) has never been observed.
-    """
+    marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, _natural_runout(feeding, printer.id))
+
+    assert marked is not None and marked.id == drained.id
+    assert (await db_session.get(Spool, drained.id)).spent_at is not None
+    assert (await db_session.get(Spool, fresh.id)).spent_at is None
+
+
+@pytest.mark.asyncio
+async def test_no_live_job_a_clear_older_than_the_window_leaves_tier_1_alone(db_session, printer_factory, feeding):
+    """The window is what says WHICH of a slot's clears the arriving evidence is about when no job
+    bounds the episode. Outside it the farm asserts nothing new: the incumbent is the roll that has
+    been feeding, and it is the one the runout is about."""
     printer = await printer_factory()
     departed = await _seed_released_row(db_session, printer.id, 0, 0, weight_used=400.0)
     await _backdate_release(db_session, departed, minutes=(spool_respool._BAY_CLEAR_TO_RUNOUT_GAP_S / 60) + 5)
+    incumbent = await _seed_bound_row(db_session, printer.id, 0, 0, weight_used=800.0)
+
+    marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, _natural_runout(feeding, printer.id))
+
+    assert marked is not None and marked.id == incumbent.id
+    assert (await db_session.get(Spool, departed.id)).spent_at is None
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_clear_moment_stamps_nothing_and_warns(db_session, printer_factory, feeding, caplog):
+    """Invariant 11: the residue's release moment is unknown, so which roll drained is unknowable —
+    no stamp on either row, and a WARNING says why."""
+    from sqlalchemy import update
+
+    printer = await printer_factory()
+    departed = await _seed_released_row(db_session, printer.id, 0, 0, weight_used=400.0)
+    await db_session.execute(update(Spool).where(Spool.id == departed.id).values(last_location_at=None))
+    await db_session.commit()
+    incumbent = await _seed_bound_row(db_session, printer.id, 0, 0, weight_used=800.0)
+
+    with caplog.at_level(logging.WARNING, logger=_RESPOOL_LOGGER):
+        marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, _natural_runout(feeding, printer.id))
+
+    assert marked is None
+    assert (await db_session.get(Spool, departed.id)).spent_at is None
+    assert (await db_session.get(Spool, incumbent.id)).spent_at is None
+    assert any("spent stamp withheld" in r.getMessage() and "UNKNOWN moment" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_clear_before_the_live_job_leaves_tier_1_alone(db_session, printer_factory, feeding):
+    """The JOB is what says WHICH of a slot's clears the arriving evidence is about: a clear from before
+    the live job began is another episode, however recent — the incumbent seated since is the roll that
+    has been feeding, and it is the one the runout is about. No window decides it (2026-10-11)."""
+    printer = await printer_factory()
+    departed = await _seed_released_row(db_session, printer.id, 0, 0, weight_used=400.0)
+    await _backdate_release(db_session, departed, minutes=30)
+    await _live_job(db_session, printer.id, started_minutes_ago=10)
     incumbent = await _seed_bound_row(db_session, printer.id, 0, 0, weight_used=800.0)
 
     marked = await mark_spent_on_runout(db_session, printer.id, {"0700_8011"}, _natural_runout(feeding, printer.id))
@@ -887,6 +955,11 @@ class TestBayClearEligibility:
 
     SLOT = {"printer_id": 1, "ams_id": 0, "tray_id": 0}
 
+    @staticmethod
+    def _job(minutes_ago: float):
+        """When the printer's live job began (its ``printing`` archive's ``started_at``)."""
+        return datetime.utcnow() - timedelta(minutes=minutes_ago)
+
     def _residue(self, *, minutes_ago: float, slot=(1, 0, 0)) -> Spool:
         printer_id, ams_id, tray_id = slot
         return Spool(
@@ -907,22 +980,78 @@ class TestBayClearEligibility:
             created_at=datetime.utcnow() - timedelta(minutes=minutes_ago),
         )
 
-    def test_seated_after_a_clear_inside_the_window_is_disqualified(self):
-        """T7/T8: the bay emptied three minutes ago and this roll arrived after it."""
+    def test_seated_after_a_clear_inside_the_live_job_is_disqualified(self):
+        """T7/T8: the bay emptied three minutes ago, inside the job the runout word arrives in, and
+        this roll arrived after it."""
         assert (
             spool_respool._bound_after_the_bay_cleared(
-                self._binding(minutes_ago=1), self._residue(minutes_ago=3), **self.SLOT
+                self._binding(minutes_ago=1),
+                self._residue(minutes_ago=3),
+                **self.SLOT,
+                live_job_started_at=self._job(60),
             )
             is True
         )
 
-    def test_a_clear_outside_the_window_is_a_different_episode(self):
-        """T6: every incumbent was bound after SOME clear — the window says which one
-        this runout is about, and an ancient one is not it."""
+    def test_no_live_job_a_clear_inside_the_window_is_disqualified(self):
+        """With no live job to bound the episode, production's measured window says which clear the
+        runout is about (restored 2026-10-12): three minutes ago is inside it."""
+        assert (
+            spool_respool._bound_after_the_bay_cleared(
+                self._binding(minutes_ago=1), self._residue(minutes_ago=3), **self.SLOT, live_job_started_at=None
+            )
+            is True
+        )
+
+    def test_no_live_job_a_clear_outside_the_window_is_a_different_episode(self):
+        """T6 with no live job: every incumbent was bound after SOME clear — the window says which
+        one this runout is about, and one past it is not it."""
         outside = (spool_respool._BAY_CLEAR_TO_RUNOUT_GAP_S / 60) + 1
         assert (
             spool_respool._bound_after_the_bay_cleared(
-                self._binding(minutes_ago=1), self._residue(minutes_ago=outside), **self.SLOT
+                self._binding(minutes_ago=1), self._residue(minutes_ago=outside), **self.SLOT, live_job_started_at=None
+            )
+            is False
+        )
+
+    def test_no_live_job_the_window_edge_is_inclusive(self):
+        """A clear just inside the window still pairs (``<=``), one just past it does not."""
+        inside = (spool_respool._BAY_CLEAR_TO_RUNOUT_GAP_S - 5) / 60
+        past = (spool_respool._BAY_CLEAR_TO_RUNOUT_GAP_S + 5) / 60
+        for minutes, expected in ((inside, True), (past, False)):
+            assert (
+                spool_respool._bound_after_the_bay_cleared(
+                    self._binding(minutes_ago=0.01),
+                    self._residue(minutes_ago=minutes),
+                    **self.SLOT,
+                    live_job_started_at=None,
+                )
+                is expected
+            ), minutes
+
+    def test_a_live_job_overrides_the_window(self):
+        """With a live job the JOB decides, never the window: a clear 30 min ago inside a job begun an
+        hour ago still pairs (the window alone would have refused it)."""
+        assert (
+            spool_respool._bound_after_the_bay_cleared(
+                self._binding(minutes_ago=20),
+                self._residue(minutes_ago=30),
+                **self.SLOT,
+                live_job_started_at=self._job(60),
+            )
+            is True
+        )
+
+    def test_a_clear_before_the_live_job_began_is_a_different_episode(self):
+        """T6: every incumbent was bound after SOME clear — the job says which one this runout is
+        about. An old occupant left before the job began; the incumbent seated since is the roll that
+        ran dry — the order of the events, never their age."""
+        assert (
+            spool_respool._bound_after_the_bay_cleared(
+                self._binding(minutes_ago=30),
+                self._residue(minutes_ago=2 * 24 * 60),
+                **self.SLOT,
+                live_job_started_at=self._job(10),
             )
             is False
         )
@@ -932,7 +1061,10 @@ class TestBayClearEligibility:
         (``bind_spool_to_slot(..., bind_moment=...)``), and that is what keeps it eligible."""
         assert (
             spool_respool._bound_after_the_bay_cleared(
-                self._binding(minutes_ago=40), self._residue(minutes_ago=3), **self.SLOT
+                self._binding(minutes_ago=40),
+                self._residue(minutes_ago=3),
+                **self.SLOT,
+                live_job_started_at=self._job(60),
             )
             is False
         )
@@ -943,7 +1075,10 @@ class TestBayClearEligibility:
         returner = self._residue(minutes_ago=2)  # its own release, from this same slot
         assert (
             spool_respool._bound_after_the_bay_cleared(
-                self._binding(minutes_ago=1, spool=returner), self._residue(minutes_ago=6), **self.SLOT
+                self._binding(minutes_ago=1, spool=returner),
+                self._residue(minutes_ago=6),
+                **self.SLOT,
+                live_job_started_at=self._job(60),
             )
             is False
         )
@@ -954,7 +1089,10 @@ class TestBayClearEligibility:
         elsewhere = self._residue(minutes_ago=2, slot=(1, 0, 2))
         assert (
             spool_respool._bound_after_the_bay_cleared(
-                self._binding(minutes_ago=1, spool=elsewhere), self._residue(minutes_ago=6), **self.SLOT
+                self._binding(minutes_ago=1, spool=elsewhere),
+                self._residue(minutes_ago=6),
+                **self.SLOT,
+                live_job_started_at=self._job(60),
             )
             is True
         )
@@ -969,14 +1107,38 @@ class TestBayClearEligibility:
     def test_a_missing_half_keeps_tier_1(self, assignment, residue, why):
         binding = self._binding(minutes_ago=1) if assignment == "binding" else None
         left = self._residue(minutes_ago=3) if residue == "residue" else None
-        assert spool_respool._bound_after_the_bay_cleared(binding, left, **self.SLOT) is False, why
+        assert (
+            spool_respool._bound_after_the_bay_cleared(binding, left, **self.SLOT, live_job_started_at=self._job(60))
+            is False
+        ), why
 
-    def test_an_unstamped_column_decides_nothing(self):
-        """Neither half may be inferred: a NULL breadcrumb is silence, and silence keeps
-        the ordinary path rather than redirecting a permanent stamp onto a guess."""
+    @pytest.mark.parametrize("live_job", [True, False], ids=["live_job", "no_live_job"])
+    def test_an_unknown_clear_moment_is_unknowable(self, live_job):
+        """A NULL breadcrumb on the residue: which clear this runout explains cannot be said, so the
+        answer is UNKNOWN (None) and the caller stamps nothing — invariant 11: a missed stamp
+        self-heals forward, a false one is permanent. Neither half is inferred."""
         residue = self._residue(minutes_ago=3)
         residue.last_location_at = None
-        assert spool_respool._bound_after_the_bay_cleared(self._binding(minutes_ago=1), residue, **self.SLOT) is False
+        assert (
+            spool_respool._bound_after_the_bay_cleared(
+                self._binding(minutes_ago=1),
+                residue,
+                **self.SLOT,
+                live_job_started_at=self._job(60) if live_job else None,
+            )
+            is None
+        )
+
+    def test_an_unstamped_bind_moment_keeps_tier_1(self):
+        """The incumbent's bind moment unknown: nothing argues against the incumbent (production)."""
+        binding = self._binding(minutes_ago=1)
+        binding.created_at = None
+        assert (
+            spool_respool._bound_after_the_bay_cleared(
+                binding, self._residue(minutes_ago=3), **self.SLOT, live_job_started_at=None
+            )
+            is False
+        )
 
 
 @pytest.mark.asyncio
@@ -1145,11 +1307,12 @@ async def test_the_same_switch_read_again_departs_nothing(feeding):
 
 @pytest.mark.asyncio
 async def test_the_farms_own_load_is_never_a_firmware_runout(
-    db_session, printer_factory, feeding, own_session_factory, caplog
+    db_session, printer_factory, feeding, own_session_factory, caplog, monkeypatch
 ):
-    """The farm's swap or refill lands its OWN load (``ams_command.load`` marks it before the
-    publish): the switch it completes departs nothing, so the departed roll is never stamped
-    — the 006 false-stamp mode, now matched against the switch's ARRIVED tray."""
+    """The farm's swap or refill lands its OWN load (the record holds it — ``printer_action``'s
+    outstanding load of that tray, durable across a restart): the switch it completes departs
+    nothing, so the departed roll is never stamped — the 006 false-stamp mode, matched against the
+    switch's ARRIVED tray through ``printer_action.landed_by_command``."""
     printer = await printer_factory()
     departed = await _bind_at(db_session, printer.id, 0, 0, weight_used=500.0)
     client = feeding(printer.id)
@@ -1158,9 +1321,12 @@ async def test_the_farms_own_load_is_never_a_firmware_runout(
     departures: dict[str, list[int]] = {}
     sample = _sampling(printer.id, client, departures)
 
+    commanded: set[int] = set()
+    monkeypatch.setattr(printer_action, "landed_by_command", lambda pid, tray: pid == printer.id and tray in commanded)
+
     def after(step: str) -> None:
         if step == "posture":
-            note_commanded_load(printer.id, switch.landed)  # the farm's load, published into the change
+            commanded.add(switch.landed)  # the farm's load, published into the change
         sample(step)
 
     with caplog.at_level(logging.INFO, logger=_RESPOOL_LOGGER):
@@ -1169,25 +1335,6 @@ async def test_the_farms_own_load_is_never_a_firmware_runout(
     assert _departed(departures) == {}
     assert "landed the farm's own commanded load" in caplog.text
     assert (await db_session.get(Spool, departed.id)).spent_at is None
-
-
-@pytest.mark.asyncio
-async def test_a_stale_commanded_load_no_longer_suppresses(feeding, fake_clock):
-    """A commanded-load marker older than ``_COMMANDED_LOAD_TTL_S`` is not the farm's load:
-    a firmware switch onto that tray later departs its roll as any switch does."""
-    printer_id = 4302
-    note_commanded_load(printer_id, 1)
-    fake_clock["t"] += spool_respool._COMMANDED_LOAD_TTL_S + 1
-    client = feeding(printer_id)
-    feed_wire.start_print(client, 0)
-    departures: dict[str, list[int]] = {}
-    feed_wire.run_auto_switch(
-        client,
-        AutoSwitch("stale-marker", drained=0, pre_flip=None, landed=1, layer=30),
-        after=_sampling(printer_id, client, departures),
-    )
-
-    assert _departed(departures) == {"settled": [0]}
 
 
 @pytest.mark.parametrize("first", ["hms_edge", "backup_swap"])
@@ -2307,9 +2454,7 @@ async def _runout_incident(db, printer_id, *, external):
         codes=frozenset({"07FF_8011" if external else "0700_8011"}),
         fingerprint="runout",
         item_id=None,
-        settings=spool_recovery.RecoverySettings(
-            enabled=True, max_attempts=2, step_timeout_s=0.05, protect_layers=7, offline_bound_s=60.0
-        ),
+        settings=spool_recovery.RecoverySettings(enabled=True, max_attempts=2, step_bound_s=90, protect_layers=7),
         jammed_global_tray=254 if external else 0,
         kind=spool_recovery.KIND_RUNOUT,
         external=external,

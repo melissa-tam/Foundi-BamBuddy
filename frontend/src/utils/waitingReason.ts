@@ -80,6 +80,14 @@ export function waitingReasonText(reason: string | null, t: (k: string) => strin
       // ("Library file missing") would not tell the operator that restoring or
       // re-uploading the file is what releases the hold.
       return t('productionRuns.detail.waiting.libraryFileMissing');
+    case 'upload_stalled':
+      // The FTPS upload stalled on the transport (a timeout, a dropped connection): a wait, never
+      // a failure — the next dispatch uploads the file again.
+      return t('productionRuns.detail.waiting.uploadStalled');
+    case 'printer_not_connected':
+      // The printer's session was down when its unit's dispatch began: a wait, never a failure — the
+      // unit dispatches again once the printer reconnects.
+      return t('productionRuns.detail.waiting.printerNotConnected');
     case 'stagger_hold':
       return t('productionRuns.detail.waiting.staggerHold');
     case 'spool_jam_recovering':

@@ -290,6 +290,15 @@ DEFAULT_TEMPLATES = [
         "title_template": "AMS stuck mid filament-change",
         "body_template": "{printer_name}: AMS parked mid filament-change for {minutes} min with no print running. Press Continue on the printer, or unload from the printer card.",
     },
+    # The attention owner's page (2026-10-11, ``farm_stall``): the farm is waiting on the printer past
+    # the page bound. ``{detail}`` is the whole sentence in the printer's terms — what was sent or what the
+    # printer reads, and for how long; nothing here is decided by the wait.
+    {
+        "event_type": "printer_waiting",
+        "name": "Waiting on the Printer",
+        "title_template": "Waiting on {printer_name}",
+        "body_template": "{printer_name}: {detail}",
+    },
     {
         "event_type": "storage_low",
         "name": "USB Storage Low (auto-cleanup)",

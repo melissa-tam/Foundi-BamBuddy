@@ -946,6 +946,35 @@ class TestBareTraySpentGuard:
         env.apply.assert_awaited_once()  # default-mint pushes config
         assert (printer.id, 0, 0) not in spool_tagless._pending_physical_cycles  # consumed
 
+    async def test_the_spent_cycle_replacement_write_rides_the_slot_epoch(self, db_session, printer_factory, env):
+        """The replacement's config write is the bare arm's own write: counted on the slot's epoch before
+        the publish, so the firmware's ``fail`` ack ends it (``autoconfig_ended``) — the answer the
+        recovery driver's forced-sweep wait reads. Before 2026-10-11 it rode no epoch, and a refused
+        write left that wait with nothing to hear."""
+        printer = await printer_factory()
+        await self._seed_spent_ams_auto(db_session, printer.id)
+        spool_tagless._pending_physical_cycles.add((printer.id, 0, 0))
+
+        assert await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare(), force=True)
+        assert spool_tagless.autoconfig_ended(printer.id, 0, 0) is None  # open: the write is in flight
+
+        spool_tagless.on_ams_command_result(
+            printer.id, {"command": "ams_filament_setting", "result": "fail", "ams_id": 0, "tray_id": 0}
+        )
+
+        assert spool_tagless.autoconfig_ended(printer.id, 0, 0) == "config_refused"
+
+    async def test_a_replacement_whose_write_did_not_go_out_answers_false(self, db_session, printer_factory, env):
+        printer = await printer_factory()
+        await self._seed_spent_ams_auto(db_session, printer.id)
+        spool_tagless._pending_physical_cycles.add((printer.id, 0, 0))
+        env.apply.return_value = False  # the client refused the write at publish
+
+        assert (
+            await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare(), force=True)
+            is False
+        )
+
 
 # --- Fresh-roll prompt ------------------------------------------------------
 
@@ -1611,6 +1640,26 @@ class TestMidPrintIsNotGated:
             await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare(), force=True) is True
         )
         env.apply.assert_awaited_once()
+
+    async def test_a_forced_write_the_client_refused_at_publish_answers_false(
+        self, db_session, printer_factory, env, monkeypatch
+    ):
+        """A forced write the client refused at publish (drying, the identify gate, no session —
+        ``apply_spool_to_slot_via_mqtt`` False) is NOT in flight: the call answers False, so the
+        recovery driver's forced sweep does not wait on it (it re-scans at once). The strike ladder
+        still counts the attempt (its commit point)."""
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id, 0, 0, material="PETG", rgba="112233FF")
+        self._printer_state(monkeypatch, "PAUSE")
+        self._gain(monkeypatch, 1.0)
+        env.apply.return_value = False
+
+        assert (
+            await spool_tagless.maybe_autoconfigure_bare_tray(db_session, printer.id, 0, 0, _bare(), force=True)
+            is False
+        )
+        env.apply.assert_awaited_once()
+        assert spool_tagless._autoconfig_epochs[(printer.id, 0, 0)].publishes == 1
 
     async def test_paused_re_push_of_a_tracked_slot_is_immediate(self, db_session, printer_factory, env, monkeypatch):
         """The other half of the jam flow: the backup spool is ALREADY our ams_auto row

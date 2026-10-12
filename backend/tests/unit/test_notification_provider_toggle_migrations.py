@@ -54,9 +54,7 @@ _TOGGLES = (
         event="backup_group_split",
         default=1,
         template_name="AMS Backup Group Split",
-        placeholders=frozenset(
-            {"printer_name", "slot", "partner_slot", "dimension", "picked_value", "partner_value"}
-        ),
+        placeholders=frozenset({"printer_name", "slot", "partner_slot", "dimension", "picked_value", "partner_value"}),
     ),
     _Toggle(event="cooldown_escalation", default=1),
     _Toggle(
@@ -114,15 +112,10 @@ async def test_migration_column_default_matches_event_class(toggle: _Toggle, eng
         await run_migrations(conn)
     async with engine.begin() as conn:
         await conn.execute(
-            text(
-                f"INSERT INTO {_TABLE} (name, provider_type, config) "
-                "VALUES ('migrated', 'webhook', '{}')"
-            )
+            text(f"INSERT INTO {_TABLE} (name, provider_type, config) VALUES ('migrated', 'webhook', '{{}}')")
         )
     async with engine.connect() as conn:
-        row = (
-            await conn.execute(text(f"SELECT {toggle.column} FROM {_TABLE} WHERE name = 'migrated'"))
-        ).fetchone()
+        row = (await conn.execute(text(f"SELECT {toggle.column} FROM {_TABLE} WHERE name = 'migrated'"))).fetchone()
     assert row[0] == toggle.default
 
 

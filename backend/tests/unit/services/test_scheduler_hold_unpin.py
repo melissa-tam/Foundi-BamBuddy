@@ -771,3 +771,70 @@ async def test_normal_assignment_still_notifies(cq_scheduler, db_session, printe
     await cq_scheduler.check_queue()  # tick 2 — picked → notify fires
 
     assert sched_mod.notification_service.on_queue_job_assigned.await_count == 1
+
+
+# --------------------------------------------------------------------------- #
+# R19 (2026-10-12): a POOLED unit skips the printer that stalled its upload
+# --------------------------------------------------------------------------- #
+async def test_a_pooled_unit_skips_the_printer_that_stalled_its_upload(
+    cq_scheduler, db_session, printer_factory, monkeypatch
+):
+    """An upload stall on A (``farm_policy.record_upload_stall``) sends the pooled unit to B on the next
+    tick — the REAL finder, the stall set read ONCE per tick however many pooled units are pending. Its retry
+    is not spent: the unit itself is the one that dispatches."""
+    from backend.app.services import farm_policy
+
+    a = await printer_factory(model="H2S", name="US-A")
+    b = await printer_factory(model="H2S", name="US-B")
+    a_id, b_id = a.id, b.id
+    statuses = {a_id: SimpleNamespace(sdcard=True, state="IDLE"), b_id: SimpleNamespace(sdcard=True, state="IDLE")}
+    monkeypatch.setattr(ps_module.printer_manager, "get_status", MagicMock(side_effect=lambda pid: statuses.get(pid)))
+
+    pool = encode_printer_ids([a_id, b_id])
+    unit = await _model_item(db_session, target_model=None, target_printer_ids=pool, pos=1)
+    others = [await _model_item(db_session, target_model=None, target_printer_ids=pool, pos=p) for p in (2, 3)]
+    unit_id = unit.id
+    await farm_policy.record_upload_stall(db_session, printer_id=a_id, queue_item_id=unit_id)
+
+    reads = AsyncMock(side_effect=farm_policy.upload_stalled_printers)
+    monkeypatch.setattr(farm_policy, "upload_stalled_printers", reads)
+    await cq_scheduler.check_queue()
+
+    assert reads.await_count == 1  # one bulk read for three pooled units
+    db_session.expire_all()
+    row = (
+        await db_session.execute(
+            select(PrintQueueItem.printer_id, PrintQueueItem.status, PrintQueueItem.retry_count).where(
+                PrintQueueItem.id == unit_id
+            )
+        )
+    ).one()
+    # Dispatched on B (then failed on "no source file" — these units carry none), never on A.
+    assert (row.printer_id, row.status, row.retry_count) == (b_id, "failed", 0)
+    assert others  # the other pooled units shared the tick's one read
+
+
+async def test_a_pooled_unit_whose_only_member_stalled_it_waits_and_says_why(
+    cq_scheduler, db_session, printer_factory, monkeypatch
+):
+    from backend.app.services import farm_policy
+
+    a = await printer_factory(model="H2S", name="US-SOLO")
+    a_id = a.id
+    monkeypatch.setattr(
+        ps_module.printer_manager, "get_status", MagicMock(return_value=SimpleNamespace(sdcard=True, state="IDLE"))
+    )
+    unit = await _model_item(db_session, target_model=None, target_printer_ids=encode_printer_ids([a_id]), pos=1)
+    unit_id = unit.id
+    await farm_policy.record_upload_stall(db_session, printer_id=a_id, queue_item_id=unit_id)
+
+    await cq_scheduler.check_queue()
+
+    db_session.expire_all()
+    row = (
+        await db_session.execute(
+            select(PrintQueueItem.status, PrintQueueItem.waiting_reason).where(PrintQueueItem.id == unit_id)
+        )
+    ).one()
+    assert row.status == "pending"
+    assert row.waiting_reason == "Upload stalled: US-SOLO"

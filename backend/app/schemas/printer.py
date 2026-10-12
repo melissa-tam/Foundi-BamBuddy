@@ -14,9 +14,9 @@ from pydantic import BaseModel, Field, field_validator
 RecheckOutcome = Literal["unchanged", "minted", "identified", "queued", "empty", "restored"]
 
 #: The CLOSED set of answers an operator's AMS Load / Unload click can get —
-#: ``services/ams_command.command_for_operator`` returns exactly one, and
+#: ``services/printer_action.command_for_operator`` returns exactly one, and
 #: ``api/routes/printers.py`` only maps it (the two refusals to 400 / 409, every wire
-#: answer to 200). The six wire answers are ``ams_command.Answer``, measured by the ONE
+#: answer to 200). The six wire answers are ``command_outcome.MotionReading``, measured by the ONE
 #: classifier (``held`` = the firmware acknowledged the command and nothing moved: it
 #: sits behind the paused print's filament change); the two refusals are the only
 #: pre-publish refusals kept (no client, or a failed publish; a standing runout hold).
@@ -33,41 +33,15 @@ AmsCommandOutcome = Literal[
     "session_changed",
 ]
 
-#: The posture FAMILY an operator's AMS command was sent into (``ams_command.PostureFamily``,
+#: The posture FAMILY an operator's AMS command was sent into (``command_outcome.PostureFamily``,
 #: pinned equal by ``test_printers_api``): ``mid_change`` — inside the paused print's own filament
 #: change, where a command the firmware acknowledges is held behind it; ``outside_change`` — every
 #: other posture. A client keys its posture-specific copy off it; ``None`` for a refusal.
 AmsPostureFamily = Literal["mid_change", "outside_change"]
 
-#: An AMS MOTION command, as a client names it (``ams_command.Command`` — the only publisher of the
-#: ledger's command steps; pinned equal by ``test_printer_manager``): the motion the "Toolhead
-#: empty" chip speaks of (:class:`ToolheadRefillState`).
+#: An AMS MOTION command, as a client names it (``command_outcome.MotionCommand`` — the only publisher of the
+#: ledger's command steps; pinned equal by ``test_printer_manager``).
 AmsMotionCommand = Literal["load", "unload"]
-
-#: What a Resume would do about an EMPTY toolhead — K7's closed reason (``refill_verdict.
-#: RefillReason``, pinned equal by ``test_printer_manager``): ``owed`` — the farm refills it, then
-#: resumes; the firmware feeds it itself (``before_first_layer`` — the start block's own load;
-#: ``change_in_flight``, ``runout_demand``, ``last_layer``, ``eject_sweep``, ``power_loss_prompt``);
-#: ``unconfirmed`` — a RUNNING print reads empty and the firmware's own sequence has not shown yet
-#: (the first frames of a runout auto-switch read exactly so; the farm acts on nothing until it
-#: does, or the print is on air); refused (``maintenance``, ``command_pending``, ``physical``,
-#: ``unknown``); ``fed`` never reaches a client (the field rides an empty feed only).
-#: :class:`ToolheadState`.
-ToolheadRefillReason = Literal[
-    "owed",
-    "fed",
-    "maintenance",
-    "physical",
-    "runout_demand",
-    "power_loss_prompt",
-    "before_first_layer",
-    "last_layer",
-    "change_in_flight",
-    "command_pending",
-    "eject_sweep",
-    "unconfirmed",
-    "unknown",
-]
 
 #: The CLOSED set of reasons the resume of a paused print is REFUSED (K9, 2026-10-10 —
 #: ``spool_recovery.resume_paused_print``; the route maps each to a 409). The verb's own two —
@@ -674,26 +648,10 @@ class PrintOptionsResponse(BaseModel):
     filament_tangle_detect: bool = False
 
 
-class ToolheadRefillState(BaseModel):
-    """The farm's refill of an EMPTY toolhead, as the card's "Toolhead empty" chip reads it.
-
-    ``phase`` — ``loading``: a refill (or a recovery driver's load) is in flight on this printer;
-    ``failed``: the open row's last command did not reach its end. ``command`` — the motion the phase
-    speaks of: ``load`` while loading; the failed step's own command when failed (a failed UNLOAD is
-    an unload, never "Load failed"). ``slot`` — the slot it is loading or failed on (an unload names
-    no target: the row's slot); ``answer`` — what the AMS answered the failed command
-    (``no_movement`` / ``acted``), ``None`` while loading."""
-
-    phase: Literal["loading", "failed"]
-    command: AmsMotionCommand
-    slot: str | None = None
-    answer: str | None = None
-
-
 class ToolheadState(BaseModel):
-    """The printer's ACTIVE extruder feed (``tray_fields.toolhead_feed``, K1) and the farm's refill
-    of it — a DERIVED projection, built by ``printer_manager.toolhead_payload`` for both ``/status``
-    branches and the WS frame.
+    """The printer's ACTIVE extruder feed (``tray_fields.toolhead_feed``, K1) — a DERIVED projection,
+    built by ``printer_manager.toolhead_payload`` for both ``/status`` branches and the WS frame; what
+    the card's slot rings read (the hold chip is :class:`HoldChipState`'s).
 
     ``feed`` — ``fed`` (a real AMS feeder) / ``external`` (the external spool) / ``empty``
     (nothing fed) / ``unknown`` (nothing read); ``active_tray`` — the feed state's EFFECTIVE feeder
@@ -701,17 +659,34 @@ class ToolheadState(BaseModel):
     the external spool — during a drained roll's tail the DRAINING roll (a ``tray_now`` pre-flip to
     the backup is not fed yet); ``None`` when nothing is fed or nothing is read;
     ``was_feeding_tray`` — while a job is RUNNING or PAUSEd and nothing is fed, the job's last real
-    feeder (``FeedReading.last_loaded``; 254 the external spool), else ``None``; ``refill`` — set
-    only while the feed reads empty or unknown and the farm is loading it or could not;
-    ``refill_reason`` — set only while the feed reads EMPTY: what a Resume would do about it
-    (:data:`ToolheadRefillReason`, the T3 verdict — a client keys its "Toolhead empty" copy off it and
-    never re-derives the verdict). A client derives no feeder of its own from ``tray_now``."""
+    feeder (``FeedReading.last_loaded``; 254 the external spool), else ``None``. A client derives no
+    feeder of its own from ``tray_now``."""
 
     feed: Literal["fed", "external", "empty", "unknown"]
     active_tray: int | None = None
     was_feeding_tray: int | None = None
-    refill: ToolheadRefillState | None = None
-    refill_reason: ToolheadRefillReason | None = None
+
+
+class HoldChipCopy(BaseModel):
+    """One translatable sentence of the hold chip: an i18n key (every locale) and its interpolation
+    values."""
+
+    key: str
+    values: dict[str, str] = {}
+
+
+class HoldChipState(BaseModel):
+    """The printer card's hold chip — THE verdict (``services/hold_chip``, 2026-10-11): which hold it
+    names (``variant``: an incident row, or the toolhead), ``tone`` (``acting`` amber — the farm still
+    acts; ``held`` red — a person's turn), the pill's noun (``label``), the tooltip's sentences in
+    reading order and a raw qualifier the tooltip ends with (the hold's slot). A client renders it and
+    decides nothing; same builder for both ``/status`` branches and the WS frame."""
+
+    variant: Literal["incident", "toolhead"]
+    tone: Literal["acting", "held"]
+    label: HoldChipCopy
+    tooltip: list[HoldChipCopy] = []
+    qualifier: str | None = None
 
 
 class PrinterStatus(BaseModel):
@@ -831,9 +806,12 @@ class PrinterStatus(BaseModel):
     # on the printer's plate-check dialog through the farm, and when the farm stops the print
     # if nobody does. Same builder for both ``/status`` branches and the WS frame.
     plate_check_exit: PlateCheckExit | None = None
-    # The ACTIVE extruder's feed and the farm's refill of it (K10/C3c, 2026-10-10): what the card's
-    # "Toolhead empty" chip reads. Same builder for both ``/status`` branches and the WS frame.
+    # The ACTIVE extruder's feed (K10/C3c, 2026-10-10): what the card's slot rings read. Same builder
+    # for both ``/status`` branches and the WS frame.
     toolhead: ToolheadState | None = None
+    # The hold chip (2026-10-11): the ONE verdict of which hold the card names, its tone and words
+    # (``services/hold_chip``). Same builder for both ``/status`` branches and the WS frame.
+    hold_chip: HoldChipState | None = None
     # AMS drying support
     supports_drying: bool = False
     # AMS "Print While Drying" — drying mid-print. Verified per Bambu wiki release notes;
@@ -965,7 +943,7 @@ class SlotRecheckResponse(BaseModel):
 class AmsCommandResponse(BaseModel):
     """What ``POST /printers/{id}/ams/load`` and ``/ams/unload`` answer with a 200.
 
-    ``outcome`` is the wire's measured answer (``ams_command.classify``) — the UI keys its
+    ``outcome`` is the wire's measured answer (``command_outcome.classify``) — the UI keys its
     toast off it. ``message`` is the non-UI-client fallback sentence only. Closed type for
     ``SlotRecheckResponse``'s reason: a bare ``str`` would let a new outcome reach a client
     unannounced.
@@ -973,7 +951,7 @@ class AmsCommandResponse(BaseModel):
 
     outcome: AmsCommandOutcome
     message: str
-    #: the posture family the command was sent into (``ams_command.AmsCommandResult.family``) —
+    #: the posture family the command was sent into (``printer_action.AmsCommandResult.family``) —
     #: ``None`` only for a refusal, which never reaches a 200
     family: AmsPostureFamily | None = None
 

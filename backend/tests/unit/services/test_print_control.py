@@ -19,6 +19,7 @@ import pytest
 
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.services import print_control
+from backend.tests._fixtures.printer_action import route_verbs_mp
 
 pytestmark = pytest.mark.asyncio
 
@@ -37,7 +38,7 @@ def wire(monkeypatch):
     sent: list[int] = []
     live = SimpleNamespace(subtask_id=None)
     monkeypatch.setattr(print_control.printer_manager, "get_status", lambda _pid: live)
-    monkeypatch.setattr(print_control.printer_manager, "stop_print", lambda pid: sent.append(pid) or True)
+    route_verbs_mp(monkeypatch, stop=lambda pid: sent.append(pid) or True)
     return SimpleNamespace(sent=sent, live=live)
 
 
@@ -112,7 +113,7 @@ async def test_the_request_is_committed_before_the_stop_is_published(db_session,
         return result
 
     monkeypatch.setattr(print_control, "run_with_retry", _committing)
-    monkeypatch.setattr(print_control.printer_manager, "stop_print", lambda _pid: order.append("published") or True)
+    route_verbs_mp(monkeypatch, stop=lambda _pid: order.append("published") or True)
 
     await print_control.stop_as_operator(5)
 
@@ -123,7 +124,7 @@ async def test_an_undelivered_stop_keeps_the_request_and_reports_it(db_session, 
     """The operator asked; the printer-card route reports the 502. The request stands until
     the unit ends or is re-armed."""
     item = await _unit(db_session, printer_id=6, subtask="SUB-6")
-    monkeypatch.setattr(print_control.printer_manager, "stop_print", MagicMock(return_value=False))
+    route_verbs_mp(monkeypatch, stop=MagicMock(return_value=False))
 
     assert await print_control.stop_as_operator(6) is False
 
@@ -148,7 +149,7 @@ async def test_a_request_that_cannot_be_written_never_blocks_the_stop(db_session
 
 async def test_a_raising_publisher_is_an_undelivered_stop(db_session, wire, monkeypatch):
     item = await _unit(db_session, printer_id=8, subtask="SUB-8")
-    monkeypatch.setattr(print_control.printer_manager, "stop_print", MagicMock(side_effect=OSError("socket")))
+    route_verbs_mp(monkeypatch, stop=MagicMock(side_effect=OSError("socket")))
 
     assert await print_control.stop_as_operator(8) is False
 

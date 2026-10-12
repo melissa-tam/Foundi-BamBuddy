@@ -28,6 +28,14 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
 
+# THE provider event vocabulary, read off the model's ``on_*`` columns — the response dict and the create
+# kwargs below derive from it, so a column can never again be added without reaching the API (2026-10-11:
+# 15 farm event toggles were write-only because these two lists were hand-kept). The schemas carry one
+# field per column (``schemas.notification``), pinned equal by ``test_notification_provider_events``.
+PROVIDER_EVENT_FIELDS: tuple[str, ...] = tuple(
+    column.name for column in NotificationProvider.__table__.columns if column.name.startswith("on_")
+)
+
 
 def _provider_to_dict(provider: NotificationProvider) -> dict:
     """Convert a NotificationProvider model to a response dictionary."""
@@ -37,52 +45,8 @@ def _provider_to_dict(provider: NotificationProvider) -> dict:
         "provider_type": provider.provider_type,
         "enabled": provider.enabled,
         "config": json.loads(provider.config) if isinstance(provider.config, str) else provider.config,
-        # Print lifecycle events
-        "on_print_start": provider.on_print_start,
-        "on_print_complete": provider.on_print_complete,
-        "on_print_failed": provider.on_print_failed,
-        "on_print_stopped": provider.on_print_stopped,
-        "on_print_progress": provider.on_print_progress,
-        "on_print_missing_spool_assignment": provider.on_print_missing_spool_assignment,
-        # Printer status events
-        "on_printer_offline": provider.on_printer_offline,
-        "on_printer_error": provider.on_printer_error,
-        "on_ai_failure_detection": provider.on_ai_failure_detection,
-        "on_filament_low": provider.on_filament_low,
-        "on_maintenance_due": provider.on_maintenance_due,
-        # AMS environmental alarms (regular AMS)
-        "on_ams_humidity_high": provider.on_ams_humidity_high,
-        "on_ams_temperature_high": provider.on_ams_temperature_high,
-        # AMS-HT environmental alarms
-        "on_ams_ht_humidity_high": provider.on_ams_ht_humidity_high,
-        "on_ams_ht_temperature_high": provider.on_ams_ht_temperature_high,
-        # Build plate detection
-        "on_plate_not_empty": provider.on_plate_not_empty,
-        # Bed cooled
-        "on_bed_cooled": provider.on_bed_cooled,
-        # First layer complete
-        "on_first_layer_complete": provider.on_first_layer_complete,
-        # Print queue events
-        "on_queue_job_added": provider.on_queue_job_added,
-        "on_queue_job_assigned": provider.on_queue_job_assigned,
-        "on_queue_job_started": provider.on_queue_job_started,
-        "on_queue_job_waiting": provider.on_queue_job_waiting,
-        "on_queue_job_skipped": provider.on_queue_job_skipped,
-        "on_queue_job_failed": provider.on_queue_job_failed,
-        "on_queue_completed": provider.on_queue_completed,
-        # Farm production events
-        "on_first_article_pending": provider.on_first_article_pending,
-        "on_printer_quarantined": provider.on_printer_quarantined,
-        "on_run_paused": provider.on_run_paused,
-        "on_run_completed": provider.on_run_completed,
-        "on_foreign_job_detected": provider.on_foreign_job_detected,
-        "on_model_mismatch": provider.on_model_mismatch,
-        "on_run_unit_stopped": provider.on_run_unit_stopped,
-        "on_print_stalled": provider.on_print_stalled,
-        "on_storage_low": provider.on_storage_low,
-        "on_run_aborted": provider.on_run_aborted,
-        "on_run_resumed": provider.on_run_resumed,
-        "on_first_article_approved": provider.on_first_article_approved,
+        # Every event toggle, derived from the model's columns (one source — :data:`PROVIDER_EVENT_FIELDS`)
+        **{field: getattr(provider, field) for field in PROVIDER_EVENT_FIELDS},
         # Quiet hours
         "quiet_hours_enabled": provider.quiet_hours_enabled,
         "quiet_hours_start": provider.quiet_hours_start,
@@ -131,52 +95,8 @@ async def create_notification_provider(
         provider_type=provider_data.provider_type.value,
         enabled=provider_data.enabled,
         config=json.dumps(provider_data.config),
-        # Print lifecycle events
-        on_print_start=provider_data.on_print_start,
-        on_print_complete=provider_data.on_print_complete,
-        on_print_failed=provider_data.on_print_failed,
-        on_print_stopped=provider_data.on_print_stopped,
-        on_print_progress=provider_data.on_print_progress,
-        on_print_missing_spool_assignment=provider_data.on_print_missing_spool_assignment,
-        # Printer status events
-        on_printer_offline=provider_data.on_printer_offline,
-        on_printer_error=provider_data.on_printer_error,
-        on_ai_failure_detection=provider_data.on_ai_failure_detection,
-        on_filament_low=provider_data.on_filament_low,
-        on_maintenance_due=provider_data.on_maintenance_due,
-        # AMS environmental alarms (regular AMS)
-        on_ams_humidity_high=provider_data.on_ams_humidity_high,
-        on_ams_temperature_high=provider_data.on_ams_temperature_high,
-        # AMS-HT environmental alarms
-        on_ams_ht_humidity_high=provider_data.on_ams_ht_humidity_high,
-        on_ams_ht_temperature_high=provider_data.on_ams_ht_temperature_high,
-        # Build plate detection
-        on_plate_not_empty=provider_data.on_plate_not_empty,
-        # Bed cooled
-        on_bed_cooled=provider_data.on_bed_cooled,
-        # First layer complete
-        on_first_layer_complete=provider_data.on_first_layer_complete,
-        # Print queue events
-        on_queue_job_added=provider_data.on_queue_job_added,
-        on_queue_job_assigned=provider_data.on_queue_job_assigned,
-        on_queue_job_started=provider_data.on_queue_job_started,
-        on_queue_job_waiting=provider_data.on_queue_job_waiting,
-        on_queue_job_skipped=provider_data.on_queue_job_skipped,
-        on_queue_job_failed=provider_data.on_queue_job_failed,
-        on_queue_completed=provider_data.on_queue_completed,
-        # Farm production events
-        on_first_article_pending=provider_data.on_first_article_pending,
-        on_printer_quarantined=provider_data.on_printer_quarantined,
-        on_run_paused=provider_data.on_run_paused,
-        on_run_completed=provider_data.on_run_completed,
-        on_foreign_job_detected=provider_data.on_foreign_job_detected,
-        on_model_mismatch=provider_data.on_model_mismatch,
-        on_run_unit_stopped=provider_data.on_run_unit_stopped,
-        on_print_stalled=provider_data.on_print_stalled,
-        on_storage_low=provider_data.on_storage_low,
-        on_run_aborted=provider_data.on_run_aborted,
-        on_run_resumed=provider_data.on_run_resumed,
-        on_first_article_approved=provider_data.on_first_article_approved,
+        # Every event toggle, derived from the model's columns (one source — :data:`PROVIDER_EVENT_FIELDS`)
+        **provider_data.model_dump(include=set(PROVIDER_EVENT_FIELDS)),
         # Quiet hours
         quiet_hours_enabled=provider_data.quiet_hours_enabled,
         quiet_hours_start=provider_data.quiet_hours_start,

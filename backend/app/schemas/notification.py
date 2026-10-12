@@ -22,7 +22,15 @@ class ProviderType(StrEnum):
 
 
 class NotificationProviderBase(BaseModel):
-    """Base schema for notification providers."""
+    """Base schema for notification providers.
+
+    The ``on_*`` event fields are the API's half of ONE vocabulary whose other half is the
+    model's ``on_*`` columns (``models.notification.NotificationProvider``): every column has its
+    field here (same default) and in :class:`NotificationProviderUpdate`, and the route derives its
+    response dict and create kwargs from the model's columns (``api/routes/notifications``) — a
+    column added without its field fails ``test_notification_provider_events`` instead of silently
+    never persisting (2026-10-11: 15 farm event toggles were write-only that way).
+    """
 
     name: str = Field(..., min_length=1, max_length=100, description="User-defined name")
     provider_type: ProviderType = Field(..., description="Type of notification provider")
@@ -69,6 +77,10 @@ class NotificationProviderBase(BaseModel):
     # Event triggers - First layer complete
     on_first_layer_complete: bool = Field(default=False, description="Notify when first layer completes")
 
+    # Event triggers - Stock
+    on_stock_reorder_alert: bool = Field(default=False, description="Notify when a SKU hits its reorder point")
+    on_stock_break_alert: bool = Field(default=False, description="Notify when stock will run out before replenishment")
+
     # Event triggers - Print queue
     on_queue_job_added: bool = Field(default=False, description="Notify when job is added to queue")
     on_queue_job_assigned: bool = Field(default=False, description="Notify when model-based job is assigned to printer")
@@ -98,6 +110,43 @@ class NotificationProviderBase(BaseModel):
     on_storage_low: bool = Field(
         default=True, description="Notify when a printer's USB fills up and the farm runs auto-cleanup"
     )
+    on_print_paused_stalled: bool = Field(
+        default=True, description="Notify when a printing unit's printer sits unattended-PAUSEd past the grace window"
+    )
+    on_foreign_print_paused: bool = Field(
+        default=True, description="Notify when a print the farm did not dispatch sits PAUSEd past the grace window"
+    )
+    on_spent_contradiction: bool = Field(
+        default=True, description="Notify when a spool the ledger calls spent still reads substantially full"
+    )
+    on_zero_gram_charge: bool = Field(
+        default=True, description="Notify when a completed print on a tagless feeder charged zero grams"
+    )
+    on_backup_group_split: bool = Field(
+        default=True, description="Notify when a dispatch picked a tray with no firmware backup partner"
+    )
+    on_ams_wedged_idle: bool = Field(
+        default=True, description="Notify when an idle printer's AMS sits parked mid filament-change"
+    )
+    on_printer_waiting: bool = Field(
+        default=True,
+        description="Notify when a printer has not carried out a command, or sits in a state the farm waits on, "
+        "past the page bound",
+    )
+    on_power_loss_recovery: bool = Field(
+        default=True, description="Notify on power-loss recovery holds and the per-outage fleet summary"
+    )
+    on_spool_recovery_succeeded: bool = Field(default=False, description="Notify when a mid-print jam auto-recovered")
+    on_spool_recovery_failed: bool = Field(
+        default=True, description="Notify when jam recovery escalated and the printer is left paused"
+    )
+    on_spool_out_of_rotation: bool = Field(
+        default=True, description="Notify when a spool is taken out of rotation after a feed fault"
+    )
+    on_spool_recovery_self_healed: bool = Field(
+        default=False, description="Notify when a feed fault cleared by a firmware retry on the same spool"
+    )
+    on_cooldown_escalation: bool = Field(default=True, description="Notify when a post-print eject cooldown runs long")
 
     # Event triggers - Farm production (manual/lifecycle events)
     on_run_aborted: bool = Field(default=True, description="Notify when a production run is aborted by the operator")
@@ -179,6 +228,10 @@ class NotificationProviderUpdate(BaseModel):
     # Event triggers - First layer complete
     on_first_layer_complete: bool | None = None
 
+    # Event triggers - Stock
+    on_stock_reorder_alert: bool | None = None
+    on_stock_break_alert: bool | None = None
+
     # Event triggers - Print queue
     on_queue_job_added: bool | None = None
     on_queue_job_assigned: bool | None = None
@@ -198,6 +251,19 @@ class NotificationProviderUpdate(BaseModel):
     on_run_unit_stopped: bool | None = None
     on_print_stalled: bool | None = None
     on_storage_low: bool | None = None
+    on_print_paused_stalled: bool | None = None
+    on_foreign_print_paused: bool | None = None
+    on_spent_contradiction: bool | None = None
+    on_zero_gram_charge: bool | None = None
+    on_backup_group_split: bool | None = None
+    on_ams_wedged_idle: bool | None = None
+    on_printer_waiting: bool | None = None
+    on_power_loss_recovery: bool | None = None
+    on_spool_recovery_succeeded: bool | None = None
+    on_spool_recovery_failed: bool | None = None
+    on_spool_out_of_rotation: bool | None = None
+    on_spool_recovery_self_healed: bool | None = None
+    on_cooldown_escalation: bool | None = None
 
     # Event triggers - Farm production (manual/lifecycle events)
     on_run_aborted: bool | None = None

@@ -15,7 +15,7 @@ from backend.app.services.plate_occupancy import DepositEvidence, PlateRefusal
 from backend.app.services.terminal_outcome import (
     PLATE_CHECK_DEADLINE_STOP,
     PLATE_CHECK_RETRY_STOP,
-    PLATE_RECHECK_WINDOW_S,
+    PLATE_CHECK_RETRY_STOP_NAMES,
     PlateCheckFacts,
     build_terminal_outcome,
     farm_retries,
@@ -482,6 +482,71 @@ class TestPrintedWithoutFilament:
         assert outcome.printer_message is None
 
 
+# The farm's AIR stop (operator ruling 2026-10-12): a print that laid down layer 61 of 120 with nothing fed was
+# stopped by the farm at layer 63; the H2S answered the remote stop FAILED and echoed it as a screen cancel.
+_SHAPE_AIR_STOP = {
+    "status": "failed",
+    "peaks_reliable": True,
+    "last_layer_num": 63,
+    "last_progress": 52.0,
+    "total_layers": 120,
+    "first_unfed_layer": 61,
+    "user_cancel_observed": True,
+}
+
+
+class TestTheFarmsAirStop:
+    """``air_stop``: on PROOF of air — a layer printed with nothing fed, the feed state's AIR — the farm
+    STOPS the ruined print and the unit is RETRIED (operator ruling 2026-10-12: "printing on air = ruined
+    print already"). The ORDINARY failed disposition: recorded ``failed`` with the category
+    ``printed_without_filament`` and the measured sentence, never a requeue verdict, never an operator
+    stop, the charge to the fed extent."""
+
+    _ROW = {"kind": "toolhead_refill", "job_id": _JOB, "printer_messages": []}
+
+    @pytest.mark.parametrize("raw", ["failed", "aborted", "cancelled"])
+    def test_the_air_stop_is_a_failed_print_without_filament(self, raw):
+        outcome = _from_payload({**_SHAPE_AIR_STOP, "status": raw}, "air_stop", holds=[self._ROW], hms=[])
+        assert outcome.recorded_status == "failed"
+        assert outcome.failure_category == "printed_without_filament"
+        assert outcome.printer_message == "Printed without filament from layer 61 of 120"
+        assert outcome.verdict == "air_stop"
+        assert outcome.operator_stopped is False
+
+    def test_a_first_article_is_failed_too_and_keeps_its_retry(self):
+        outcome = _from_payload(_SHAPE_AIR_STOP, "air_stop", first_article=True, hms=[])
+        assert outcome.recorded_status == "failed"
+
+    def test_a_stop_on_air_that_deposited_nothing_is_still_a_failure(self):
+        """An air stop is a failed print, never "nothing happened": ahead of the no-deposit rule."""
+        payload = {**_SHAPE_AIR_STOP, "last_layer_num": 0, "last_progress": 0.0}
+        assert _from_payload(payload, "air_stop", hms=[]).recorded_status == "failed"
+
+    def test_the_charge_is_the_fed_extent(self):
+        """The existing ``printed_unfed`` rule: partial, ending at the first layer printed on air."""
+        assert _from_payload(_SHAPE_AIR_STOP, "air_stop", hms=[]).charge == "partial"
+
+    def test_a_payload_with_no_measured_layer_still_says_why(self):
+        """The ledger is the proof; a synthesised terminal carries no measured layer."""
+        payload = {key: value for key, value in _SHAPE_AIR_STOP.items() if key != "first_unfed_layer"}
+        outcome = _from_payload(payload, "air_stop", hms=[])
+        assert outcome.recorded_status == "failed"
+        assert outcome.printer_message == "Printed without filament"
+
+    def test_a_completed_terminal_keeps_its_own_reading(self):
+        """The stop lost the race to a finishing job: the FINISH rule speaks (on air → failed)."""
+        payload = {**_SHAPE_AIR_STOP, "status": "completed", "last_layer_num": 120, "last_progress": 100.0}
+        outcome = _from_payload(payload, "air_stop", hms=[])
+        assert outcome.recorded_status == "failed"
+        assert outcome.failure_category == "printed_without_filament"
+
+    def test_an_eject_or_dry_run_is_never_an_air_stop(self):
+        assert _from_payload(_SHAPE_AIR_STOP, "air_stop", eject=True, hms=[]).recorded_status == "failed"
+        assert _from_payload(_SHAPE_AIR_STOP, "air_stop", eject=True, hms=[]).failure_category is None
+        dry = _from_payload(_SHAPE_AIR_STOP, "air_stop", dry_run=True, hms=[])
+        assert dry.failure_category is None
+
+
 def _refused(plate_check, *, deposited, resolved_item_id=7):
     """A ``plate_refused`` terminal of THIS job, whose plate-check hold recorded the printer's words.
     ``resolved_item_id`` is the unit the terminal itself resolved (the one a retry requeues)."""
@@ -558,6 +623,27 @@ class TestPlateCheckRetryOrEscalate:
         assert PlateCheckFacts(last_stop=(PLATE_CHECK_RETRY_STOP, "not_taken"), item_id=1).farm_stopped is False
         assert PlateCheckFacts(last_stop=None, item_id=1).farm_stopped is False
 
+    @pytest.mark.parametrize(
+        ("action", "farm_stopped"),
+        [("outstanding", True), ("reached", True), ("taken_over", False), ("refused", False), ("void", False)],
+    )
+    @pytest.mark.parametrize("ledger", [None, "unconfirmed", "taken", "not_taken"])
+    def test_farm_stopped_reads_the_stops_action_when_it_names_one(self, action, farm_stopped, ledger):
+        """R3 (2026-10-12): the stop's ACTION credits it, whatever its ledger token says — a terminal
+        after the fallback (``unconfirmed``, the action still outstanding, or reached late) is the farm's
+        stop and retries; a person's own Stop took it over and escalates."""
+        facts = PlateCheckFacts(last_stop=(PLATE_CHECK_RETRY_STOP, ledger), item_id=1, stop_action=action)
+        assert facts.farm_stopped is farm_stopped
+        assert farm_retries(facts, evidence=_evidence(deposited=False)) is farm_stopped
+
+    def test_the_stop_action_tokens_are_the_records_answers(self):
+        from typing import get_args
+
+        from backend.app.services.command_outcome import Answer
+        from backend.app.services.terminal_outcome import PlateCheckStopAction
+
+        assert set(get_args(PlateCheckStopAction)) == {answer.value for answer in Answer} | {"outstanding"}
+
     def test_a_job_with_no_plate_check_episode_escalates(self):
         assert farm_retries(None, evidence=_evidence(deposited=False)) is False
         assert _refused(None, deposited=False).plate_refusal is not None
@@ -603,5 +689,8 @@ class TestPlateCheckRetryOrEscalate:
         assert outcome.plate_refusal is None
         assert outcome.verdict == "operator_ui"
 
-    def test_the_window_is_the_2026_09_04_derivation(self):
-        assert PLATE_RECHECK_WINDOW_S == 3600.0
+    def test_the_retry_rung_is_read_under_every_name_it_was_written_with(self):
+        """The lineage (``requeue.retries_a_plate_check_retry``) reads an ancestor's retry stop off its
+        ledger — ``retry_stop`` since 2026-10-05, the bare ``stop`` before it (each was the second
+        rung's). The 60-minute window it replaced (2026-10-11) is gone."""
+        assert frozenset({PLATE_CHECK_RETRY_STOP, "stop"}) == PLATE_CHECK_RETRY_STOP_NAMES

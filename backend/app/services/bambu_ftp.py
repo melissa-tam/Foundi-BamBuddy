@@ -8,12 +8,13 @@ import tempfile
 import threading
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from ftplib import FTP, FTP_TLS  # nosec B402
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Literal, TypeVar
 
 if TYPE_CHECKING:
     from backend.app.models.printer import Printer
@@ -67,6 +68,46 @@ class DeleteResult(Enum):
     DELETED = "deleted"
     NOT_FOUND = "not_found"
     FAILED = "failed"
+
+
+#: Why an FTPS upload did not land (:class:`UploadResult`).
+UploadFailure = Literal["permanent", "stall"]
+
+
+@dataclass(frozen=True)
+class UploadResult:
+    """What one FTPS upload answered — truthy only when the file landed (``if not uploaded`` keeps
+    reading as before).
+
+    ``failure`` says WHY it did not (2026-10-11, owner 9 / Lane G of the event-not-clock plan):
+
+    * ``permanent`` — the server's own negative answer (an ``error_perm`` 5xx reply: 553 "could not
+      create file", 552 full, 550) or a local file that cannot be read. Re-sending the same upload cannot
+      succeed, so the dispatch FAILS the unit, as it always has.
+    * ``stall`` — the transport: a socket timeout, a dropped connection, a transient (4xx) reply, a
+      connect that did not complete, the overall timeout. The printer never refused the file; it is
+      re-uploaded on a later dispatch and a stall never spends the unit's retry, but it is a strike
+      against the printer (``farm_policy.record_upload_stall``: two with no completed print between
+      quarantine it; ``print_scheduler``'s ``upload_stalled`` handling).
+
+    ``detail`` is the operator-readable cause for the log line."""
+
+    ok: bool
+    failure: UploadFailure | None = None
+    detail: str = ""
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+#: The one successful answer.
+UPLOADED = UploadResult(ok=True)
+
+
+def upload_stalled(result: object) -> bool:
+    """Did this upload fail on the TRANSPORT (:class:`UploadResult` ``stall``)? Anything else — a landed
+    file, the server's refusal, a bare ``False`` — is not a stall."""
+    return isinstance(result, UploadResult) and result.failure == "stall"
 
 
 class FileNotOnPrinterError(Exception):
@@ -477,9 +518,15 @@ class BambuFTPClient:
         remote_path: str,
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> bool:
-        """Upload a file to the printer with optional progress callback."""
+        """Upload a file to the printer with optional progress callback.
+
+        Returns whether the file landed; on a failure :attr:`last_upload_failure` names its class
+        (:class:`UploadResult`): the server's 5xx reply or an unreadable local file is ``permanent``,
+        everything the transport does (timeouts, dropped connections, a transient 4xx) is a ``stall``."""
+        self.last_upload_failure: UploadFailure | None = None
         if not self._ftp:
             logger.warning("upload_file: FTP not connected")
+            self.last_upload_failure = "stall"
             return False
 
         try:
@@ -641,9 +688,12 @@ class BambuFTPClient:
                 logger.error("FTP 550 error - File/directory not found or permission denied")
             elif error_code == "552":
                 logger.error("FTP 552 error - Storage quota exceeded (SD card full?)")
+            self.last_upload_failure = "permanent"
             return False
         except (OSError, ftplib.Error) as e:
             logger.error("FTP upload failed for %s: %s (type: %s)", remote_path, e, type(e).__name__)
+            # A local file that cannot be read is no transport fault: re-uploading it fails the same way.
+            self.last_upload_failure = "stall" if local_path.exists() else "permanent"
             return False
 
     def upload_bytes(self, data: bytes, remote_path: str) -> bool:
@@ -1055,8 +1105,10 @@ async def upload_file_async(
     progress_callback: Callable[[int, int], None] | None = None,
     socket_timeout: float | None = None,
     printer_model: str | None = None,
-) -> bool:
-    """Async wrapper for uploading a file with timeout and progress callback.
+) -> UploadResult:
+    """Async wrapper for uploading a file with timeout and progress callback. Answers an
+    :class:`UploadResult` (truthy when the file landed; a failure says whether it was the server's
+    refusal or a transport stall).
 
     For A1/A1 Mini printers, automatically tries prot_p first, then falls back
     to prot_c if the upload fails. The working mode is cached for future uploads.
@@ -1074,7 +1126,7 @@ async def upload_file_async(
     loop = asyncio.get_event_loop()
     is_a1 = printer_model in BambuFTPClient.A1_MODELS if printer_model else False
 
-    def _upload(force_prot_c: bool = False) -> bool:
+    def _upload(force_prot_c: bool = False) -> UploadResult:
         mode_str = "prot_c" if force_prot_c else "prot_p"
         logger.info(
             f"FTP connecting to {ip_address} for upload (model={printer_model}, "
@@ -1086,15 +1138,16 @@ async def upload_file_async(
         if client.connect():
             logger.info("FTP connected to %s", ip_address)
             try:
-                result = client.upload_file(local_path, remote_path, progress_callback)
-                if result:
+                if client.upload_file(local_path, remote_path, progress_callback):
                     # Cache the working mode
                     BambuFTPClient.cache_mode(ip_address, mode_str)
-                return result
+                    return UPLOADED
+                failure = client.last_upload_failure or "stall"
+                return UploadResult(ok=False, failure=failure, detail=f"upload {failure}")
             finally:
                 client.disconnect()
         logger.warning("FTP connection failed to %s", ip_address)
-        return False
+        return UploadResult(ok=False, failure="stall", detail="the FTPS connection did not complete")
 
     try:
         # Check if we have a cached mode for this printer
@@ -1109,7 +1162,7 @@ async def upload_file_async(
         result = await asyncio.wait_for(loop.run_in_executor(None, lambda: _upload(False)), timeout=timeout)
 
         if result:
-            return True
+            return result
 
         # Upload failed - for A1 models, try prot_c fallback
         if is_a1:
@@ -1117,11 +1170,11 @@ async def upload_file_async(
             result = await asyncio.wait_for(loop.run_in_executor(None, lambda: _upload(True)), timeout=timeout)
             return result
 
-        return False
+        return result
 
     except TimeoutError:
         logger.warning("FTP upload timed out after %ss for %s", timeout, remote_path)
-        return False
+        return UploadResult(ok=False, failure="stall", detail=f"the upload timed out after {timeout:.0f}s")
 
 
 async def list_files_async(
@@ -1343,19 +1396,23 @@ async def with_ftp_retry(
         **kwargs: Keyword arguments for the operation
 
     Returns:
-        Result of the operation, or None if all attempts fail
+        Result of the operation; when every attempt fails, the LAST failure the operation answered (a
+        falsy result keeps what it says — an :class:`UploadResult` names a stall or a refusal), or None
+        when every attempt raised
     """
     last_error = None
+    last_result: T | None = None
 
     for attempt in range(max_retries + 1):
         try:
             result = await operation(*args, **kwargs)
             # Check for "falsy" success indicators
-            if result not in (False, None, []):
+            if result not in (False, None, []) and not (isinstance(result, UploadResult) and not result.ok):
                 if attempt > 0:
                     logger.info("%s succeeded on attempt %s/%s", operation_name, attempt + 1, max_retries + 1)
                 return result
             # Operation returned failure indicator
+            last_result = result
             if attempt > 0:
                 logger.info("%s attempt %s/%s returned failure", operation_name, attempt + 1, max_retries + 1)
         except Exception as e:
@@ -1372,4 +1429,4 @@ async def with_ftp_retry(
     logger.error("%s failed after %s attempts", operation_name, max_retries + 1)
     if last_error:
         logger.debug("Last error: %s", last_error)
-    return None
+    return last_result
