@@ -55,6 +55,7 @@ class TestStorageLocationRoundtrips:
             {
                 "id": 1,
                 "material": "PLA",
+                "label_weight": 1000,
                 "storage_location": "Drybox #1",
                 "created_at": now,
                 "updated_at": now,

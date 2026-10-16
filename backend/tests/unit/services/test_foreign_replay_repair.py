@@ -183,6 +183,7 @@ class _Seed:
                 {
                     "id": spool_id,
                     "material": "PETG",
+                    "label_weight": 1000,
                     "weight_used": weight_used,
                     "weight_used_baseline": baseline,
                     "weight_locked": locked,

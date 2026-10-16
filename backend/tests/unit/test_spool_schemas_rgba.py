@@ -98,6 +98,7 @@ class TestSpoolResponseRgbaLeniency:
         base = {
             "id": 1,
             "material": "PLA",
+            "label_weight": 1000,
             "created_at": datetime.fromisoformat("2026-01-01T00:00:00"),
             "updated_at": datetime.fromisoformat("2026-01-01T00:00:00"),
         }
