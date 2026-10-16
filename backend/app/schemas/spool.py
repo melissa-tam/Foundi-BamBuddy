@@ -96,7 +96,7 @@ class SpoolBase(BaseModel):
     def _validate_effect_type(cls, v: str | None) -> str | None:
         return normalize_effect_type(v)
 
-    label_weight: int = 1000
+    label_weight: int
     core_weight: int = 250
     core_weight_catalog_id: int | None = None
     weight_used: float = 0
@@ -129,7 +129,9 @@ class SpoolBase(BaseModel):
 
 
 class SpoolCreate(SpoolBase):
-    pass
+    # Unset = the default-weight setting, filled at the mint by ``spool_defaults``
+    # (a positive figure wins). Never a schema literal: the setting is the one origin.
+    label_weight: int | None = None
 
 
 class SpoolBulkCreate(BaseModel):

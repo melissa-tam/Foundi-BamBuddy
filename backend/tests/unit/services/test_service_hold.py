@@ -178,6 +178,7 @@ def _occupy(printer_id: int, policy) -> None:
             ),
             policy=policy,
             raise_gate=True,
+            origin="farm_deposit",
         ),
     )
 

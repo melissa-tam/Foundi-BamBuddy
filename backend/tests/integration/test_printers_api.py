@@ -3648,7 +3648,7 @@ class TestApplyPaAfterRefresh:
         from backend.app.models.spool_k_profile import SpoolKProfile
 
         printer = await printer_factory()
-        spool = Spool(material="PLA", color_name="Red", rgba="FF0000FF")
+        spool = Spool(label_weight=1000, material="PLA", color_name="Red", rgba="FF0000FF")
         db_session.add(spool)
         await db_session.flush()
         db_session.add(
@@ -3697,7 +3697,7 @@ class TestApplyPaAfterRefresh:
         from backend.app.models.spool_assignment import SpoolAssignment
 
         printer = await printer_factory()
-        spool = Spool(material="PLA")
+        spool = Spool(label_weight=1000, material="PLA")
         db_session.add(spool)
         await db_session.flush()
         db_session.add(
@@ -3922,7 +3922,7 @@ class TestApplyPaAfterRefresh:
         from backend.app.models.spool_k_profile import SpoolKProfile
 
         printer = await printer_factory()
-        spool = Spool(material="PLA")
+        spool = Spool(label_weight=1000, material="PLA")
         db_session.add(spool)
         await db_session.flush()
         db_session.add(
@@ -3981,7 +3981,7 @@ class TestApplyPaAfterRefresh:
         from backend.app.models.spool_k_profile import SpoolKProfile
 
         printer = await printer_factory()
-        spool = Spool(material="PLA")
+        spool = Spool(label_weight=1000, material="PLA")
         db_session.add(spool)
         await db_session.flush()
         db_session.add(
@@ -4048,7 +4048,7 @@ class TestApplyPaAfterRefresh:
         from backend.app.models.spool_k_profile import SpoolKProfile
 
         printer = await printer_factory()
-        spool = Spool(material="PLA")
+        spool = Spool(label_weight=1000, material="PLA")
         db_session.add(spool)
         await db_session.flush()
         db_session.add(
@@ -4120,6 +4120,7 @@ class TestApplyPaAfterRefresh:
         printer = await printer_factory()
         # Spool with tray_uuid matching the one _build_h2d_state puts on the tray
         spool = Spool(
+            label_weight=1000,
             material="PLA",
             color_name="Red",
             rgba="FF0000FF",
@@ -4176,7 +4177,7 @@ class TestApplyPaAfterRefresh:
 
         printer = await printer_factory()
         # Spool indexed by tag_uid, not tray_uuid
-        spool = Spool(material="PLA", tag_uid="AABBCC1122334400")
+        spool = Spool(label_weight=1000, material="PLA", tag_uid="AABBCC1122334400")
         db_session.add(spool)
         await db_session.flush()
         db_session.add(
@@ -4228,7 +4229,7 @@ class TestApplyPaAfterRefresh:
 
         printer = await printer_factory()
         # Decoy spool with no tag info — must NOT match
-        spool = Spool(material="PLA")
+        spool = Spool(label_weight=1000, material="PLA")
         db_session.add(spool)
         await db_session.flush()
         db_session.add(
@@ -4354,7 +4355,7 @@ class TestConfigureAmsSlotPersistsKProfile:
         from backend.app.models.spool_k_profile import SpoolKProfile
 
         printer = await printer_factory(model="H2D")
-        spool = Spool(material="PLA", color_name="Red", rgba="FF0000FF")
+        spool = Spool(label_weight=1000, material="PLA", color_name="Red", rgba="FF0000FF")
         db_session.add(spool)
         await db_session.flush()
         db_session.add(
@@ -4532,7 +4533,7 @@ class TestConfigureAmsSlotPersistsKProfile:
         from backend.app.models.spool_k_profile import SpoolKProfile
 
         printer = await printer_factory(model="H2D")
-        spool = Spool(material="PLA", color_name="Red", rgba="FF0000FF")
+        spool = Spool(label_weight=1000, material="PLA", color_name="Red", rgba="FF0000FF")
         db_session.add(spool)
         await db_session.flush()
         db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=printer.id, ams_id=0, tray_id=3))
@@ -4718,7 +4719,7 @@ class TestConfigureAmsSlotPersistsKProfile:
         from backend.app.models.spool_k_profile import SpoolKProfile
 
         printer = await printer_factory(model="H2D")
-        spool = Spool(material="PLA")
+        spool = Spool(label_weight=1000, material="PLA")
         db_session.add(spool)
         await db_session.flush()
         # Note: SpoolmanSlotAssignment can't store ams_id=255 with tray_id=1
@@ -4784,7 +4785,7 @@ class TestConfigureAmsSlotPersistsKProfile:
         from backend.app.models.spool_k_profile import SpoolKProfile
 
         printer = await printer_factory(model="H2D")
-        spool = Spool(material="PLA")
+        spool = Spool(label_weight=1000, material="PLA")
         db_session.add(spool)
         await db_session.flush()
         db_session.add(

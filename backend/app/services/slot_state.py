@@ -1136,6 +1136,7 @@ def _mint_spec_from_tray(obs: TrayObservation, *, replace_existing: bool = False
         "remain": obs.remain,
         "nozzle_temp_min": obs.nozzle_temp_min,
         "nozzle_temp_max": obs.nozzle_temp_max,
+        "tray_weight": obs.tray_weight,
         "replace_existing": replace_existing,
     }
 

@@ -294,18 +294,15 @@ class TestCameraAPI:
         # Create a fake JPEG (starts with FFD8)
         fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
 
-        with patch("backend.app.api.routes.camera.capture_camera_frame", new_callable=AsyncMock) as mock_capture:
-            mock_capture.return_value = True
+        # The capture is the still owner's one implementation (``services/camera_stills``).
+        with patch(
+            "backend.app.services.camera.capture_camera_frame_bytes", new_callable=AsyncMock, return_value=fake_jpeg
+        ) as mock_capture:
+            response = await async_client.get(f"/api/v1/printers/{printer.id}/camera/snapshot")
 
-            # Mock the file read
-            with patch("builtins.open", create=True) as mock_open:
-                mock_open.return_value.__enter__.return_value.read.return_value = fake_jpeg
-
-                with patch("pathlib.Path.exists", return_value=True), patch("pathlib.Path.unlink"):
-                    _response = await async_client.get(f"/api/v1/printers/{printer.id}/camera/snapshot")
-
-        # Note: The actual test might fail due to file operations, but this tests the endpoint structure
-        # In production tests, we'd mock more comprehensively
+        assert response.status_code == 200
+        assert response.content == fake_jpeg
+        mock_capture.assert_awaited_once()
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -313,11 +310,8 @@ class TestCameraAPI:
         """Verify 503 when camera capture fails."""
         printer = await printer_factory()
 
-        with patch("backend.app.api.routes.camera.capture_camera_frame", new_callable=AsyncMock) as mock_capture:
-            mock_capture.return_value = False
-
-            with patch("pathlib.Path.exists", return_value=False), patch("pathlib.Path.unlink"):
-                response = await async_client.get(f"/api/v1/printers/{printer.id}/camera/snapshot")
+        with patch("backend.app.services.camera.capture_camera_frame_bytes", new_callable=AsyncMock, return_value=None):
+            response = await async_client.get(f"/api/v1/printers/{printer.id}/camera/snapshot")
 
         assert response.status_code == 503
         assert "Failed to capture" in response.json()["detail"]
@@ -342,13 +336,33 @@ class TestCameraAPI:
         with (
             patch("backend.app.api.routes.camera._active_streams", active_streams),
             patch("backend.app.api.routes.camera._last_frames", last_frames),
-            patch("backend.app.api.routes.camera.capture_camera_frame", new_callable=AsyncMock) as mock_capture,
+            patch("backend.app.services.camera.capture_camera_frame_bytes", new_callable=AsyncMock) as mock_capture,
         ):
             response = await async_client.get(f"/api/v1/printers/{printer.id}/camera/snapshot")
 
         assert response.status_code == 200
         assert response.content == fake_jpeg
         # The fresh-capture path must NOT have been taken — that's the whole point.
+        mock_capture.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_camera_snapshot_opens_no_second_socket_beside_a_stream_with_no_frame_yet(
+        self, async_client: AsyncClient, printer_factory
+    ):
+        """#1348: a viewer's stream is registered but has buffered no frame yet (startup race,
+        mid-reconnect). A fresh socket beside it would kick the viewer off on single-connection
+        firmwares, so the snapshot answers 503 instead of opening one."""
+        printer = await printer_factory()
+
+        with (
+            patch("backend.app.api.routes.camera._active_streams", {f"{printer.id}-fanout": MagicMock()}),
+            patch("backend.app.api.routes.camera._last_frames", {}),
+            patch("backend.app.services.camera.capture_camera_frame_bytes", new_callable=AsyncMock) as mock_capture,
+        ):
+            response = await async_client.get(f"/api/v1/printers/{printer.id}/camera/snapshot")
+
+        assert response.status_code == 503
         mock_capture.assert_not_called()
 
     @pytest.mark.asyncio
@@ -479,7 +493,7 @@ class TestCameraAPI:
         """Verify check plate returns proper structure when OpenCV available."""
         printer = await printer_factory()
 
-        # Mock PlateDetectionResult to avoid camera timeout
+        # Mock the PlateVerdict to avoid camera timeout
         mock_result = MagicMock()
         mock_result.is_empty = True
         mock_result.confidence = 0.95
@@ -587,7 +601,9 @@ class TestCameraAPI:
             response = await async_client.get(f"/api/v1/printers/{printer.id}/camera/check-plate")
 
         assert response.status_code == 200
-        assert mock_check.await_args.kwargs["use_external"] is True
+        # Omitted → forwarded as None: ``camera_stills.CameraSource.of`` takes the printer's own
+        # external-camera setting (the one origin of the #1359 rule, pinned in test_camera_stills).
+        assert mock_check.await_args.kwargs["use_external"] is None
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -622,7 +638,7 @@ class TestCameraAPI:
             response = await async_client.get(f"/api/v1/printers/{printer.id}/camera/check-plate")
 
         assert response.status_code == 200
-        assert mock_check.await_args.kwargs["use_external"] is False
+        assert mock_check.await_args.kwargs["use_external"] is None
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -646,7 +662,7 @@ class TestCameraAPI:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/camera/plate-detection/calibrate")
 
         assert response.status_code == 200
-        assert mock_calibrate.await_args.kwargs["use_external"] is True
+        assert mock_calibrate.await_args.kwargs["use_external"] is None
 
     @pytest.mark.asyncio
     @pytest.mark.integration

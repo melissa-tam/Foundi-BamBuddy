@@ -49,7 +49,7 @@ async def _spool_columns(conn) -> set[str]:
 async def _make_spool(session: AsyncSession, material: str = "PETG", **kwargs):
     from backend.app.models.spool import Spool
 
-    spool = Spool(material=material, created_at=_FIXED_CREATED, **kwargs)
+    spool = Spool(material=material, created_at=_FIXED_CREATED, **{"label_weight": 1000, **kwargs})
     session.add(spool)
     await session.flush()
     return spool

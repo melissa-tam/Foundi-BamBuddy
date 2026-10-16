@@ -25,6 +25,7 @@ from backend.app.api.routes import (
     auth,
     bug_report,
     camera,
+    camera_stills as camera_stills_routes,
     cloud,
     discovery,
     eject_profiles,
@@ -1609,8 +1610,9 @@ async def on_ams_change(printer_id: int, ams_data: list):
                                 remain_val = int(remain_raw)
                             except (TypeError, ValueError):
                                 remain_val = -1
-                            if 1 <= remain_val <= 100:
-                                lw = existing_assignment.spool.label_weight or 1000
+                            # A remain% scales the row's OWN label; no label, nothing to scale.
+                            lw = existing_assignment.spool.label_weight or 0
+                            if 1 <= remain_val <= 100 and lw > 0:
                                 new_used = round(lw * (100 - remain_val) / 100.0, 1)
                                 current_used = existing_assignment.spool.weight_used or 0
                                 if new_used > current_used + 1:
@@ -2237,70 +2239,24 @@ async def on_print_start(printer_id: int, data: dict):
         if printer and printer.plate_detection_enabled:
             logger.info("[PLATE CHECK] ENTERING plate detection code for printer %s", printer_id)
             try:
-                from backend.app.services.plate_detection import check_plate_empty
+                from backend.app.services.plate_detection import chamber_light_for_read, check_plate_empty
 
-                # Build ROI tuple from printer settings if available
-                roi = None
-                if all(
-                    [
-                        printer.plate_detection_roi_x is not None,
-                        printer.plate_detection_roi_y is not None,
-                        printer.plate_detection_roi_w is not None,
-                        printer.plate_detection_roi_h is not None,
-                    ]
-                ):
-                    roi = (
-                        printer.plate_detection_roi_x,
-                        printer.plate_detection_roi_y,
-                        printer.plate_detection_roi_w,
-                        printer.plate_detection_roi_h,
-                    )
-
-                # Auto-turn on chamber light if it's off for better detection
-                light_was_off = False
-                client = printer_manager.get_client(printer_id)
-                if client and client.state:
-                    light_was_off = not client.state.chamber_light
-                    if light_was_off:
-                        logger.info("[PLATE CHECK] Turning on chamber light for printer %s", printer_id)
-                        await printer_action.send(
-                            printer_id,
-                            printer_action.Command(
-                                "ledctrl", lambda live, seq: live.set_chamber_light(True, sequence_id=seq)
-                            ),
-                            actor=printer_action.ACTOR_FARM,
-                            client=client,
-                        )
-                        # Wait for light to physically turn on and camera to adjust exposure
-                        await asyncio.sleep(2.5)
-
+                # The light on for the reading (restored after); the frame must postdate its settle.
                 logger.info("[PLATE CHECK] Running plate detection for printer %s", printer_id)
-                plate_result = await check_plate_empty(
-                    printer_id=printer_id,
-                    ip_address=printer.ip_address,
-                    access_code=printer.access_code,
-                    model=printer.model,
-                    include_debug_image=False,
-                    external_camera_url=printer.external_camera_url,
-                    external_camera_type=printer.external_camera_type,
-                    use_external=printer.external_camera_enabled,
-                    roi=roi,
-                    external_camera_snapshot_url=printer.external_camera_snapshot_url,
-                )
+                async with chamber_light_for_read(printer_id) as lit_at:
+                    plate_result = await check_plate_empty(printer, not_before=lit_at)
 
-                # Restore chamber light to original state
-                if light_was_off and client:
-                    logger.info("[PLATE CHECK] Restoring chamber light to off for printer %s", printer_id)
-                    await printer_action.send(
+                if plate_result.kind == "unknown":
+                    # Never block a print on a camera that could not answer (uncalibrated, capture
+                    # failed, no frame after the light came on, ...): the printer's own plate check
+                    # still runs in its start block.
+                    logger.info(
+                        "[PLATE CHECK] Plate check inconclusive for printer %s (%s: %s), proceeding with print",
                         printer_id,
-                        printer_action.Command(
-                            "ledctrl", lambda live, seq: live.set_chamber_light(False, sequence_id=seq)
-                        ),
-                        actor=printer_action.ACTOR_FARM,
-                        client=client,
+                        plate_result.reason,
+                        plate_result.message,
                     )
-
-                if not plate_result.needs_calibration and not plate_result.is_empty:
+                elif plate_result.kind == "occupied":
                     # Objects detected - pause the print!
                     logger.warning(
                         f"[PLATE CHECK] Objects detected on plate for printer {printer_id}! "
@@ -3745,6 +3701,10 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
                     source_subtask_id=_payload_subtask,
                     evidence=_evidence,
                     raise_gate=_raise_gate,
+                    # The gate's origin reads the stop verdict and whether the downtime reconcile
+                    # synthesised this terminal (a job nobody saw end).
+                    stop_verdict=_outcome.verdict,
+                    reconciled=bool(data.get("_reconciled")),
                     refusal=_outcome.plate_refusal,
                 ),
             )
@@ -6409,6 +6369,7 @@ app.include_router(spoolman_inventory.router, prefix=app_settings.api_prefix)
 app.include_router(updates.router, prefix=app_settings.api_prefix)
 app.include_router(maintenance.router, prefix=app_settings.api_prefix)
 app.include_router(camera.router, prefix=app_settings.api_prefix)
+app.include_router(camera_stills_routes.router, prefix=app_settings.api_prefix)
 app.include_router(external_links.router, prefix=app_settings.api_prefix)
 app.include_router(eject_profiles.router, prefix=app_settings.api_prefix)
 app.include_router(model_geometry.router, prefix=app_settings.api_prefix)

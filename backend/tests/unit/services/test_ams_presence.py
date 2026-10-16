@@ -377,13 +377,13 @@ class TestTerminalSweep:
 
     async def test_reads_tagged_and_changed_slots_only(self, db_session, sessions, monkeypatch):
         # (0,1) bound to an auto-minted TAGLESS spool + physically cycled → discovery.
-        auto_spool = Spool(material="PETG", data_origin="ams_auto")
+        auto_spool = Spool(label_weight=1000, material="PETG", data_origin="ams_auto")
         # (0,2) bound to a spool that carries an RFID identity, wire remain missing →
         # refreshed through the DB-bound arm (the tray shows no tag: the incomplete RFID
         # read is exactly why its remain never landed).
-        tagged_spool = Spool(material="PETG", data_origin="rfid_auto", tag_uid=_VALID_TAG)
+        tagged_spool = Spool(label_weight=1000, material="PETG", data_origin="rfid_auto", tag_uid=_VALID_TAG)
         # (0,3) the same shape with the tag ALSO visible on the wire → the live-tag arm.
-        live_spool = Spool(material="PETG", data_origin="rfid_auto", tag_uid="FEDCBA0987654321")
+        live_spool = Spool(label_weight=1000, material="PETG", data_origin="rfid_auto", tag_uid="FEDCBA0987654321")
         db_session.add_all([auto_spool, tagged_spool, live_spool])
         await db_session.flush()
         db_session.add(SpoolAssignment(spool_id=auto_spool.id, printer_id=1, ams_id=0, tray_id=1))
@@ -432,7 +432,7 @@ class TestTerminalSweep:
         # produce ZERO ams_get_rfid at print end, no matter how many prints end. Each
         # such read fails ("no tag to read") and raises a standing HMS that can never
         # self-clear on a tagless slot — the live 004/011/012 defect.
-        bound = Spool(material="PETG", data_origin="ams_auto")
+        bound = Spool(label_weight=1000, material="PETG", data_origin="ams_auto")
         db_session.add(bound)
         await db_session.flush()
         db_session.add(SpoolAssignment(spool_id=bound.id, printer_id=1, ams_id=0, tray_id=0))
@@ -528,7 +528,7 @@ class TestTerminalSweep:
         assert ams_presence._unanswered_cycle(1, 0, 0) is False  # the firmware's answer counts
 
     async def test_once_per_transition_dedup(self, db_session, sessions, monkeypatch):
-        spool = Spool(material="PETG", data_origin="rfid_auto", tag_uid=_VALID_TAG)
+        spool = Spool(label_weight=1000, material="PETG", data_origin="rfid_auto", tag_uid=_VALID_TAG)
         db_session.add(spool)
         await db_session.flush()
         db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=0, tray_id=0))
@@ -753,7 +753,7 @@ class TestIdentifyNeeded:
 
     async def test_db_bound_tagged_is_refreshed(self, db_session):
         _arm_occasion()
-        spool = Spool(material="PETG", data_origin="rfid_auto", tag_uid=_VALID_TAG)
+        spool = Spool(label_weight=1000, material="PETG", data_origin="rfid_auto", tag_uid=_VALID_TAG)
         db_session.add(spool)
         await db_session.flush()
         db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=0, tray_id=0))
@@ -765,7 +765,7 @@ class TestIdentifyNeeded:
         # tray does not show is a STANDING condition. Re-derived on every reconcile /
         # pipeline pass it owed a read every ~31 s forever, each command holding the
         # printer's identify gate so the slot pipeline deferred every decision on it.
-        spool = Spool(material="PETG", data_origin="rfid_auto", tag_uid=_VALID_TAG)
+        spool = Spool(label_weight=1000, material="PETG", data_origin="rfid_auto", tag_uid=_VALID_TAG)
         db_session.add(spool)
         await db_session.flush()
         db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=0, tray_id=0))
@@ -775,7 +775,7 @@ class TestIdentifyNeeded:
     async def test_db_bound_tagged_but_absent_is_not_read(self, db_session):
         # The bound spool was pulled: a read of an empty slot fails exactly like a
         # tagless one and raises the same never-clearing 0081. Presence is required.
-        spool = Spool(material="PETG", data_origin="rfid_auto", tray_uuid="A" * 32)
+        spool = Spool(label_weight=1000, material="PETG", data_origin="rfid_auto", tray_uuid="A" * 32)
         db_session.add(spool)
         await db_session.flush()
         db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=0, tray_id=0))
@@ -783,7 +783,7 @@ class TestIdentifyNeeded:
         assert await self._needed(db_session, _tray(0, state=9)) is None
 
     async def test_untouched_tagless_bound_slot_is_not_read(self, db_session):
-        spool = Spool(material="PETG", data_origin="ams_auto")
+        spool = Spool(label_weight=1000, material="PETG", data_origin="ams_auto")
         db_session.add(spool)
         await db_session.flush()
         db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=0, tray_id=0))
@@ -800,7 +800,7 @@ class TestIdentifyNeeded:
     async def test_changed_slot_bound_to_a_tagged_spool_is_discovery(self, db_session):
         # Something physically moved: the DB's idea of what is in the slot is now a
         # hypothesis, so the read is treated as one that may legitimately fail.
-        spool = Spool(material="PETG", data_origin="rfid_auto", tag_uid=_VALID_TAG)
+        spool = Spool(label_weight=1000, material="PETG", data_origin="rfid_auto", tag_uid=_VALID_TAG)
         db_session.add(spool)
         await db_session.flush()
         db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=0, tray_id=0))
@@ -843,7 +843,7 @@ class TestDiscoveryFailureSuppression:
         # discovery read at the next print end and ZERO notifications.
         monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", AsyncMock())
         monkeypatch.setattr("backend.app.services.spool_tagless.note_physical_cycle", AsyncMock())
-        spool = Spool(material="PETG", data_origin="ams_auto")
+        spool = Spool(label_weight=1000, material="PETG", data_origin="ams_auto")
         db_session.add(spool)
         await db_session.flush()
         db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=0, tray_id=0))
@@ -1411,7 +1411,7 @@ class TestEngagedFilamentDefer:
         return client
 
     async def _bind_tagged(self, db_session, tray_id, tag):
-        spool = Spool(material="PETG", data_origin="rfid_auto", tag_uid=tag)
+        spool = Spool(label_weight=1000, material="PETG", data_origin="rfid_auto", tag_uid=tag)
         db_session.add(spool)
         await db_session.flush()
         db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=0, tray_id=tray_id))
@@ -2015,7 +2015,11 @@ class TestReadOccasionPacing:
 
     async def _bind(self, db_session, *, tag=_VALID_TAG, spent=None, tray_id=0, **kw):
         spool = Spool(
-            material="PETG", data_origin="rfid_auto" if tag else "ams_auto", tag_uid=tag, spent_at=spent, **kw
+            material="PETG",
+            data_origin="rfid_auto" if tag else "ams_auto",
+            tag_uid=tag,
+            spent_at=spent,
+            **{"label_weight": 1000, **kw},
         )
         db_session.add(spool)
         await db_session.flush()
@@ -2164,7 +2168,7 @@ class TestProdShapeReplayThroughTheRealPredicate:
         # Same shape, now with a spent-latched binding on the slot — the newest arm.
         # It requires a SEATED (state 10) tray, so the dialect-odd state-9 slot still
         # buys nothing, occasion open or not.
-        spool = Spool(material="PETG", data_origin="ams_auto", spent_at=datetime.utcnow())
+        spool = Spool(label_weight=1000, material="PETG", data_origin="ams_auto", spent_at=datetime.utcnow())
         db_session.add(spool)
         await db_session.flush()
         db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=2, tray_id=2))
@@ -2691,6 +2695,7 @@ class TestTheAnsweredReadClosesItsEntitlement:
         if binding != "unbound":
             tag = None if "tagless" in binding else _VALID_TAG
             spool = Spool(
+                label_weight=1000,
                 material="PETG",
                 data_origin="rfid_auto" if tag else "ams_auto",
                 tag_uid=tag,
@@ -2925,7 +2930,9 @@ class TestStandingOccasionDrain:
     drain at all: the verdict re-derived forever against a read nobody would ever issue."""
 
     async def _spent_slot(self, db_session, *, tag=_VALID_TAG):
-        spool = Spool(material="PETG", data_origin="rfid_auto", tag_uid=tag, spent_at=datetime.utcnow())
+        spool = Spool(
+            label_weight=1000, material="PETG", data_origin="rfid_auto", tag_uid=tag, spent_at=datetime.utcnow()
+        )
         db_session.add(spool)
         await db_session.flush()
         db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=0, tray_id=0))
@@ -3000,7 +3007,7 @@ class TestUnboundUnreadDiscoveryArm:
     """
 
     async def _assign(self, db_session, *, tag=_VALID_TAG, tray_id=0):
-        spool = Spool(material="PETG", data_origin="rfid_auto" if tag else "ams_auto", tag_uid=tag)
+        spool = Spool(label_weight=1000, material="PETG", data_origin="rfid_auto" if tag else "ams_auto", tag_uid=tag)
         db_session.add(spool)
         await db_session.flush()
         db_session.add(SpoolAssignment(spool_id=spool.id, printer_id=1, ams_id=0, tray_id=tray_id))

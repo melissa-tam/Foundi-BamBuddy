@@ -2470,6 +2470,7 @@ def _tray_dict_from_spec(obs: TrayObservation, spec: dict) -> dict:
         "remain",
         "nozzle_temp_min",
         "nozzle_temp_max",
+        "tray_weight",
     ):
         value = spec.get(key)
         if value is not None:

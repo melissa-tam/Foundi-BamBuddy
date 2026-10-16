@@ -3,15 +3,51 @@
 Analyzes camera frames to detect if there are objects on the build plate.
 Uses calibration-based difference detection - compares current frame to
 a reference image of the empty plate.
+
+**A reading answers THREE ways** (:class:`PlateVerdict`, 2026-10-16): ``empty``, ``occupied``, or
+``unknown`` with its reason — uncalibrated, OpenCV missing, the capture failed, the frame would not
+decode, no frame taken after the reading's anchor (``not_before``), an analysis error. A failure used
+to read as "empty". Each caller decides what ``unknown`` is worth: the print-start check never blocks
+a print on it, and the auto plate-clear (``plate_autoclear``) counts it as occupied.
+
+**The frame comes from the still owner** (``services/camera_stills``) under its READING policy: the
+one capture implementation, which honours a live stream (#1348), never falls back from the external
+camera to the built-in one, and serves an anchored read only a FRESH frame taken after its anchor. A reading the farm takes itself turns the chamber light on first and restores it
+after (:func:`chamber_light_for_read`); the calibration and the auto plate-clear move the bed to the
+held-bed position first (``eject.bed_motion.lift_held_bed``), so references and readings share one
+bed height.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING, Literal
+
+from backend.app.services import camera_stills, printer_action
+from backend.app.services.printer_manager import printer_manager
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from backend.app.models.printer import Printer
 
 logger = logging.getLogger(__name__)
+
+# The compared area when a printer has none of its own, as (x, y, width, height) shares of the frame:
+# the WHOLE frame, so no part of the plate falls outside the comparison at any bed height. The
+# operator narrows it per printer in the area editor (``printers.plate_detection_roi_*``) once the
+# per-model witness shows where the plate sits at the held-bed position.
+DEFAULT_ROI: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
+
+# The chamber light's settle before a reading (seconds): the light takes ~1 s to come on and the
+# camera adjusts its exposure after it — the print-start check's figure since upstream.
+LIGHT_SETTLE_S = 2.5
 
 # Optional OpenCV import - feature disabled if not available
 try:
@@ -31,43 +67,71 @@ def _get_calibration_dir() -> Path:
     return settings.plate_calibration_dir
 
 
-class PlateDetectionResult:
-    """Result of plate detection analysis."""
+PlateVerdictKind = Literal["empty", "occupied", "unknown"]
+# Why a reading is ``unknown``.
+UnknownReason = Literal[
+    "opencv_unavailable", "uncalibrated", "capture_failed", "decode_failed", "stale_frame", "analysis_error"
+]
 
-    def __init__(
-        self,
-        is_empty: bool,
-        confidence: float,
-        difference_percent: float,
-        message: str,
-        debug_image: bytes | None = None,
-        needs_calibration: bool = False,
-    ):
-        self.is_empty = is_empty
-        self.confidence = confidence  # 0.0 to 1.0
-        self.difference_percent = difference_percent  # How different from reference
-        self.message = message
-        self.debug_image = debug_image  # Optional annotated image for debugging
-        self.needs_calibration = needs_calibration  # True if no reference image exists
+
+@dataclass(frozen=True)
+class PlateVerdict:
+    """One plate reading: ``empty`` / ``occupied`` / ``unknown`` (with ``reason``).
+
+    ``captured_at`` is the frame's own instant (None when no frame was read) — what the auto
+    plate-clear's two-reading rule compares, so one frame never counts twice.
+    """
+
+    kind: PlateVerdictKind
+    message: str
+    reason: UnknownReason | None = None
+    confidence: float = 0.0  # 0.0 to 1.0
+    difference_percent: float = 0.0  # how different from the best reference
+    captured_at: datetime | None = None
+    debug_image: bytes | None = None
+
+    @property
+    def is_empty(self) -> bool:
+        return self.kind == "empty"
+
+    @property
+    def needs_calibration(self) -> bool:
+        return self.reason == "uncalibrated"
 
     def to_dict(self) -> dict:
         return {
-            "is_empty": bool(self.is_empty),
+            "verdict": self.kind,
+            "reason": self.reason,
+            "is_empty": self.is_empty,
             "confidence": float(round(self.confidence, 2)),
             "difference_percent": float(round(self.difference_percent, 2)),
             "message": self.message,
             "has_debug_image": self.debug_image is not None,
-            "needs_calibration": bool(self.needs_calibration),
+            "needs_calibration": self.needs_calibration,
         }
+
+
+def _unknown(reason: UnknownReason, message: str) -> PlateVerdict:
+    return PlateVerdict(kind="unknown", reason=reason, message=message)
+
+
+def roi_of(printer: Printer) -> tuple[float, float, float, float] | None:
+    """The printer's own compared area, or None (then :data:`DEFAULT_ROI`). The one reader of the
+    ``plate_detection_roi_*`` columns for a reading."""
+    values = (
+        printer.plate_detection_roi_x,
+        printer.plate_detection_roi_y,
+        printer.plate_detection_roi_w,
+        printer.plate_detection_roi_h,
+    )
+    if any(value is None for value in values):
+        return None
+    x, y, w, h = values
+    return (float(x), float(y), float(w), float(h))  # type: ignore[arg-type]
 
 
 class PlateDetector:
     """Detects if the build plate is empty using calibration-based difference detection."""
-
-    # Default region of interest (ROI) as percentage of image dimensions
-    # These define where the build plate typically appears in the camera view
-    # Format: (x_start%, y_start%, width%, height%)
-    DEFAULT_ROI = (0.15, 0.35, 0.70, 0.55)  # Center-lower portion of frame
 
     # Detection thresholds for difference detection
     # Using mean pixel difference (0-100% scale)
@@ -91,7 +155,7 @@ class PlateDetector:
         if not OPENCV_AVAILABLE:
             raise RuntimeError("OpenCV is not installed. Install with: pip install opencv-python-headless")
 
-        self.roi = roi or self.DEFAULT_ROI
+        self.roi = roi or DEFAULT_ROI
         self.difference_threshold = difference_threshold
         self.blur_size = blur_size if blur_size % 2 == 1 else blur_size + 1  # Must be odd
 
@@ -401,46 +465,30 @@ class PlateDetector:
         logger.info("Deleted %s plate calibration reference(s) for printer %s", len(paths), printer_id)
         return True
 
-    def analyze_frame(
-        self, image_data: bytes, printer_id: int, plate_type: str | None = None, include_debug_image: bool = False
-    ) -> PlateDetectionResult:
+    def analyze_frame(self, image_data: bytes, printer_id: int, include_debug_image: bool = False) -> PlateVerdict:
         """Analyze a camera frame to detect if the plate is empty.
 
         Compares the current frame to all calibration reference images and uses
-        the best match (lowest difference) for the final result.
+        the best match (lowest difference) for the final result. Anything that
+        prevents a comparison is ``unknown`` with its reason — never "empty".
 
         Args:
             image_data: JPEG image data as bytes
             printer_id: Printer database ID (for reference lookup)
-            plate_type: Unused - kept for API compatibility
             include_debug_image: If True, include annotated image in result
-
-        Returns:
-            PlateDetectionResult with analysis results
         """
         try:
             # Check for calibration
             reference_paths = self._get_reference_paths(printer_id)
             if not reference_paths:
-                return PlateDetectionResult(
-                    is_empty=True,  # Default to empty when not calibrated
-                    confidence=0.0,
-                    difference_percent=0.0,
-                    message="No calibration - please calibrate with empty plate first",
-                    needs_calibration=True,
-                )
+                return _unknown("uncalibrated", "No calibration - please calibrate with empty plate first")
 
             # Decode current image
             nparr = np.frombuffer(image_data, np.uint8)
             current_frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
             if current_frame is None:
-                return PlateDetectionResult(
-                    is_empty=True,
-                    confidence=0.0,
-                    difference_percent=0.0,
-                    message="Failed to decode current image",
-                )
+                return _unknown("decode_failed", "Failed to decode current image")
 
             # Extract ROI from current frame
             current_roi, x_start, y_start, roi_width, roi_height = self._extract_roi(current_frame)
@@ -478,13 +526,7 @@ class PlateDetector:
                     best_diff = diff
 
             if best_ref_idx == -1:
-                return PlateDetectionResult(
-                    is_empty=True,
-                    confidence=0.0,
-                    difference_percent=0.0,
-                    message="Failed to load any reference images - please recalibrate",
-                    needs_calibration=True,
-                )
+                return _unknown("uncalibrated", "Failed to load any reference images - please recalibrate")
 
             difference_percent = best_difference_percent
 
@@ -562,218 +604,143 @@ class PlateDetector:
                 _, buffer = cv2.imencode(".jpg", debug_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 debug_image = buffer.tobytes()
 
-            return PlateDetectionResult(
-                is_empty=is_empty,
-                confidence=confidence,
-                difference_percent=difference_percent,
+            return PlateVerdict(
+                kind="empty" if is_empty else "occupied",
+                confidence=float(confidence),
+                difference_percent=float(difference_percent),
                 message=message,
                 debug_image=debug_image,
             )
 
         except Exception as e:
             logger.exception("Error analyzing frame for plate detection")
-            return PlateDetectionResult(
-                is_empty=True,  # Default to empty on error (don't block prints)
-                confidence=0.0,
-                difference_percent=0.0,
-                message=f"Analysis error: {e!s}",
+            return _unknown("analysis_error", f"Analysis error: {e!s}")
+
+
+@asynccontextmanager
+async def chamber_light_for_read(printer_id: int) -> AsyncIterator[datetime]:
+    """The chamber light ON for a plate reading the farm takes itself, restored to OFF after it when this
+    turned it on (the print-start check's precedent). Yields the reading's ANCHOR: the instant the light
+    has settled (:data:`LIGHT_SETTLE_S`) — a frame taken before it is not this reading's. With no client
+    (or a light already on) nothing is sent and the anchor is now. Both frames go through the command
+    record (``printer_action.chamber_light``)."""
+    client = printer_manager.get_client(printer_id)
+    turned_on = False
+    if client is not None and client.state is not None and not client.state.chamber_light:
+        sent = await printer_action.send(
+            printer_id, printer_action.chamber_light(True), actor=printer_action.ACTOR_FARM, client=client
+        )
+        if sent.published:
+            turned_on = True
+            await asyncio.sleep(LIGHT_SETTLE_S)
+    try:
+        yield datetime.now(timezone.utc)
+    finally:
+        if turned_on:
+            await printer_action.send(
+                printer_id, printer_action.chamber_light(False), actor=printer_action.ACTOR_FARM, client=client
             )
 
 
-async def capture_camera_image(
-    printer_id: int,
-    ip_address: str,
-    access_code: str,
-    model: str,
-    external_camera_url: str | None = None,
-    external_camera_type: str | None = None,
-    use_external: bool = False,
-    external_camera_snapshot_url: str | None = None,
-) -> tuple[bytes | None, str]:
-    """Capture an image from the printer camera.
-
-    If there's an active camera stream, uses the buffered frame instead of
-    creating a new connection (which would fail while stream is active).
-
-    Returns:
-        Tuple of (image_data, camera_source) or (None, error_message)
-    """
-    image_data: bytes | None = None
-    camera_source = "unknown"
-
-    # Try external camera first if requested and available
-    if use_external and external_camera_url and external_camera_type:
-        try:
-            from backend.app.services.external_camera import capture_frame
-
-            image_data = await capture_frame(
-                external_camera_url,
-                external_camera_type,
-                snapshot_url=external_camera_snapshot_url,
-            )
-            if image_data:
-                camera_source = "external"
-                logger.debug("Captured frame from external camera for printer %s", printer_id)
-        except Exception as e:
-            logger.warning("Failed to capture from external camera: %s", e)
-
-    # Fall back to built-in camera
-    if image_data is None:
-        # First, check if there's an active stream with a buffered frame
-        # This avoids blocking when camera viewer is open
-        try:
-            from backend.app.api.routes.camera import get_buffered_frame
-
-            buffered = get_buffered_frame(printer_id)
-            if buffered:
-                image_data = buffered
-                camera_source = "built-in (buffered)"
-                logger.debug("Using buffered frame from active stream for printer %s", printer_id)
-        except Exception as e:
-            logger.debug("Could not get buffered frame: %s", e)
-
-        # If no buffered frame, try to capture a new one
-        if image_data is None:
-            import tempfile
-
-            from backend.app.services.camera import capture_camera_frame
-
-            fd, tmp_name = tempfile.mkstemp(suffix=".jpg")
-            os.close(fd)
-            tmp_path = Path(tmp_name)
-            tmp_path.chmod(0o600)
-
-            try:
-                success = await capture_camera_frame(ip_address, access_code, model, tmp_path, timeout=10)
-                if success:
-                    with open(tmp_path, "rb") as f:
-                        image_data = f.read()
-                    camera_source = "built-in"
-                    logger.debug("Captured frame from built-in camera for printer %s", printer_id)
-            finally:
-                try:
-                    tmp_path.unlink()
-                except OSError:
-                    pass  # Best-effort cleanup of temporary camera capture file
-
-    return image_data, camera_source
+# Why no frame came back, as a reading's reason (``camera_stills.StillMiss`` → :data:`UnknownReason`).
+_MISS_REASON: dict[str, UnknownReason] = {
+    "capture_failed": "capture_failed",
+    "no_printer": "capture_failed",
+    "stream_stale": "stale_frame",
+}
 
 
 async def check_plate_empty(
-    printer_id: int,
-    ip_address: str,
-    access_code: str,
-    model: str,
-    plate_type: str | None = None,
+    printer: Printer,
+    *,
+    use_external: bool | None = None,
+    not_before: datetime | None = None,
     include_debug_image: bool = False,
-    external_camera_url: str | None = None,
-    external_camera_type: str | None = None,
-    use_external: bool = False,
-    roi: tuple[float, float, float, float] | None = None,
-    external_camera_snapshot_url: str | None = None,
-) -> PlateDetectionResult:
-    """Check if the build plate is empty for a printer.
+) -> PlateVerdict:
+    """One reading of ``printer``'s plate (:class:`PlateVerdict`).
 
-    Args:
-        printer_id: Printer database ID
-        ip_address: Printer IP address
-        access_code: Printer access code
-        model: Printer model string
-        plate_type: Type of build plate for calibration lookup
-        include_debug_image: If True, include annotated image in result
-        external_camera_url: URL of external camera (if configured)
-        external_camera_type: Type of external camera (mjpeg, rtsp, snapshot)
-        use_external: If True, prefer external camera over built-in
-        roi: Region of interest as (x%, y%, w%, h%) - percentages of image size
-
-    Returns:
-        PlateDetectionResult with analysis results
+    The frame is the still owner's (``camera_stills.latest_still``): with ``not_before`` (the reading's
+    anchor — the bed settled, the light on, a person's click) only a frame taken after it; without, the
+    owner's cached still. The compared area is the printer's own (:func:`roi_of`) or the whole frame.
+    ``use_external`` None takes the printer's own camera setting (#1359).
     """
     if not OPENCV_AVAILABLE:
-        return PlateDetectionResult(
-            is_empty=True,
-            confidence=0.0,
-            difference_percent=0.0,
-            message="OpenCV not available - plate detection disabled",
-        )
-
-    image_data, camera_source = await capture_camera_image(
-        printer_id,
-        ip_address,
-        access_code,
-        model,
-        external_camera_url,
-        external_camera_type,
-        use_external,
-        external_camera_snapshot_url=external_camera_snapshot_url,
+        return _unknown("opencv_unavailable", "OpenCV not available - plate detection disabled")
+    detector = PlateDetector(roi=roi_of(printer))
+    if not detector.has_calibration(printer.id):
+        return _unknown("uncalibrated", "No calibration - please calibrate with empty plate first")
+    still = await camera_stills.latest_still(
+        printer.id,
+        policy=camera_stills.READING,
+        not_before=not_before,
+        source=camera_stills.CameraSource.of(printer, use_external=use_external),
     )
-
-    if image_data is None:
-        return PlateDetectionResult(
-            is_empty=True,  # Default to empty on error
-            confidence=0.0,
-            difference_percent=0.0,
-            message="Failed to capture camera frame from any source",
+    if isinstance(still, camera_stills.NoStill):
+        reason = _MISS_REASON[still.reason]
+        message = (
+            "No camera frame taken after the reading started"
+            if reason == "stale_frame"
+            else "Failed to capture camera frame from any source"
         )
+        return _unknown(reason, message)
+    verdict = detector.analyze_frame(still.jpeg, printer.id, include_debug_image)
+    return replace(verdict, captured_at=still.captured_at, message=f"[{still.source}] {verdict.message}")
 
-    # Analyze the captured frame
-    detector = PlateDetector(roi=roi)
-    result = detector.analyze_frame(image_data, printer_id, plate_type, include_debug_image)
 
-    # Add camera source to message
-    result.message = f"[{camera_source}] {result.message}"
-
-    return result
+# What the calibration says when the bed could not be moved to the reading height first
+# (``eject.bed_motion`` refusals that are not permanent for the printer).
+_CALIBRATION_MOTION_REFUSED: dict[str, str] = {
+    "job_active": "Calibration refused: a job is running on the printer.",
+    "dispatch_in_flight": "Calibration refused: a print is being dispatched to the printer.",
+    "eject_in_flight": "Calibration refused: an eject is running on the printer.",
+    "bed_motion_in_flight": "Calibration refused: the bed is moving.",
+    "no_client": "Calibration refused: printer not connected, bed not positioned.",
+    "not_sent": "Calibration refused: the printer did not take the bed move.",
+}
 
 
 async def calibrate_plate(
-    printer_id: int,
-    ip_address: str,
-    access_code: str,
-    model: str,
+    db: AsyncSession,
+    printer: Printer,
+    *,
     label: str | None = None,
-    external_camera_url: str | None = None,
-    external_camera_type: str | None = None,
-    use_external: bool = False,
-    external_camera_snapshot_url: str | None = None,
+    use_external: bool | None = None,
 ) -> tuple[bool, str, int]:
-    """Calibrate plate detection by capturing a reference image of the empty plate.
+    """Save a reference image of ``printer``'s EMPTY plate. Returns ``(success, message, index)``.
 
-    Args:
-        printer_id: Printer database ID
-        ip_address: Printer IP address
-        access_code: Printer access code
-        model: Printer model string
-        label: Optional label for this reference (e.g., "High Temp Plate")
-        external_camera_url: URL of external camera (if configured)
-        external_camera_type: Type of external camera (mjpeg, rtsp, snapshot)
-        use_external: If True, prefer external camera over built-in
-
-    Returns:
-        Tuple of (success, message, index)
+    The bed first goes to the held-bed position (``eject.bed_motion.lift_held_bed`` — guarded onto the
+    bottom stop, then lifted off the eject aids; a CLAIMED motion), the position the auto plate-clear
+    reads from, and the reference is a frame taken after the motion settled. A printer with no bed on
+    Z (a bedslinger, a model with no Z travel) is calibrated where its bed is; a motion refused for any
+    other reason refuses the calibration rather than save a reference at another height.
     """
     if not OPENCV_AVAILABLE:
         return False, "OpenCV not available - plate detection disabled", -1
 
-    image_data, camera_source = await capture_camera_image(
-        printer_id,
-        ip_address,
-        access_code,
-        model,
-        external_camera_url,
-        external_camera_type,
-        use_external,
-        external_camera_snapshot_url=external_camera_snapshot_url,
-    )
+    from backend.app.services.eject import bed_motion
 
-    if image_data is None:
+    motion = await bed_motion.lift_held_bed(db, printer.id)
+    if isinstance(motion, bed_motion.MotionSkipped) and not motion.permanent:
+        logger.info("[plate-detection] printer %s calibration refused: bed motion %s", printer.id, motion.reason)
+        return False, _CALIBRATION_MOTION_REFUSED.get(motion.reason, "Calibration refused: bed not positioned."), -1
+    if isinstance(motion, bed_motion.MotionSent):
+        # No end-of-motion report exists on the wire: the motion has settled when its claimed window lapses.
+        await asyncio.sleep(motion.seconds)
+
+    still = await camera_stills.latest_still(
+        printer.id,
+        policy=camera_stills.READING,
+        not_before=datetime.now(timezone.utc),
+        source=camera_stills.CameraSource.of(printer, use_external=use_external),
+    )
+    if isinstance(still, camera_stills.NoStill):
         return False, "Failed to capture camera frame for calibration", -1
 
     detector = PlateDetector()
-    success, message, index = detector.calibrate(image_data, printer_id, label)
+    success, message, index = detector.calibrate(still.jpeg, printer.id, label)
 
     if success:
-        message = f"[{camera_source}] {message}"
+        message = f"[{still.source}] {message}"
 
     return success, message, index
 

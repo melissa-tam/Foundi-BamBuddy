@@ -525,6 +525,28 @@ class PrintScheduler:
             except Exception:
                 logger.exception("Periodic staged-release pass failed (non-fatal)")
 
+            # Scheduled return to service (2026-10-16): end every maintenance hold whose
+            # ``release_at`` has come, through the hold's one exit verb. Polled like
+            # ``scheduled_time`` (level-triggered, so a restart needs no re-arm) and read off the
+            # incident projection (no query unless a hold is due). BEFORE the pending-item query
+            # so the released printer dispatches this same pass. Own guard, like every sibling.
+            try:
+                from backend.app.services import service_hold
+
+                await service_hold.release_due(db)
+            except Exception:
+                logger.exception("Scheduled maintenance release failed (non-fatal)")
+
+            # Auto plate-clear (2026-10-16): a normal leftover's gate whose printer is eligible gets
+            # its next camera reading SPAWNED (one task per printer, never awaited here) when due.
+            # One settings read per pass; in memory for the printers with a gate up. Own guard.
+            try:
+                from backend.app.services import plate_autoclear
+
+                await plate_autoclear.run_pass(db)
+            except Exception:
+                logger.exception("Auto plate-clear pass failed (non-fatal)")
+
             # Check if shortest-job-first scheduling is enabled
             sjf_enabled = await self._get_bool_setting(db, "queue_shortest_first")
 

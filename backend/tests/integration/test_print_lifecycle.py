@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from backend.app.services.eject import bed_motion
 from backend.tests._fixtures.printer_action import route_verbs
 
 
@@ -1108,7 +1109,7 @@ class TestPlateCheckLadderJourney(_PlateCheckLadder):
             # The bed lifted off the release aid, its motion waited out before the requeue.
             wire.client.send_gcode.assert_called_once()
             assert "G380 S2 Z-12.0" in wire.client.send_gcode.call_args.args[0]
-            assert waits == [pytest.approx((farm_policy.VISION_HOLD_PROBE_MM + 12.0) / (1200 / 60))]
+            assert waits == [pytest.approx((bed_motion.VISION_HOLD_PROBE_MM + 12.0) / (1200 / 60))]
             # ...and it is a CLAIMED motion: the retry cannot be released onto the printer until
             # the lift's own motion time has passed.
             idle = Evidence(live_state="IDLE")
@@ -1475,7 +1476,7 @@ class TestPlateCheckFallbackHold(_PlateCheckLadder):
             # The bed is lifted off the plate-release aid.
             wire.client.send_gcode.assert_called_once()
             assert "G380 S2 Z-12.0" in wire.client.send_gcode.call_args.args[0]
-            assert waits == [pytest.approx((farm_policy.VISION_HOLD_PROBE_MM + 12.0) / (1200 / 60))]
+            assert waits == [pytest.approx((bed_motion.VISION_HOLD_PROBE_MM + 12.0) / (1200 / 60))]
 
 
 class TestPlateCheckFarmStopRetries(_PlateCheckJourney):
@@ -1582,7 +1583,7 @@ class TestPlateCheckFarmStopRetries(_PlateCheckJourney):
         # The bed was lifted off the release aid, and its motion waited out before the requeue.
         lift.send_gcode.assert_called_once()
         assert "G380 S2 Z-12.0" in lift.send_gcode.call_args.args[0]
-        assert waits == [pytest.approx((farm_policy.VISION_HOLD_PROBE_MM + 12.0) / (1200 / 60))]
+        assert waits == [pytest.approx((bed_motion.VISION_HOLD_PROBE_MM + 12.0) / (1200 / 60))]
         # The episode closed at its terminal as the farm's own recovery.
         assert (row.resolve_source, printer_incidents.outcome_of(row)) == ("terminal", "auto_recovered")
 

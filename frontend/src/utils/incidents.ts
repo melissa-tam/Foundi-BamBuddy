@@ -80,6 +80,7 @@ export const RESOLVE_SOURCE_LABEL_KEY: Record<IncidentResolveSource, string> = {
   job_ended_unseen: 'incidents.closedBy.job_ended_unseen',
   driver_ended: 'incidents.closedBy.driver_ended',
   legacy_vision_stop: 'incidents.closedBy.legacy_vision_stop',
+  scheduled: 'incidents.closedBy.scheduled',
 };
 
 /** The leaf a row with no resolve source reads. */

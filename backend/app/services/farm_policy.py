@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -46,11 +47,10 @@ from backend.app.schemas.settings import AppSettings
 from backend.app.services import farm_correlation, pause_recovery, printer_action, requeue
 from backend.app.services.cycle_episodes import record_episode
 from backend.app.services.dispatch_target import DispatchTarget
-from backend.app.services.eject import geometry as eject_geometry, remote as eject_remote
-from backend.app.services.eject.generator import Z_REFERENCE_FEED_MM_MIN
+from backend.app.services.eject import bed_motion, geometry as eject_geometry, remote as eject_remote
 from backend.app.services.hms_errors import format_hms_error_summary
 from backend.app.services.notification_service import notification_service
-from backend.app.services.plate_occupancy import Evidence, FirstArticleEject, plate_occupancy
+from backend.app.services.plate_occupancy import FirstArticleEject, TransitionRefusal, plate_occupancy
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.queue_builder import create_queue_items
 from backend.app.services.sku_catalog import plate_units
@@ -64,17 +64,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _TERMINAL_RUN_OUTCOMES = ("completed", "failed")
-
-# The vendor's own pre-home Z primitive, from the stock H2S machine-start block's
-# ``;===== avoid end stop =====`` sequence (``G380 S2 Z32 F1200`` / ``G380 S2 Z-12
-# F1200``). ``G380 S2 Z<+d>`` is a relative Z move guarded by the BOTTOM end stop, so
-# a bed already sitting on the stop truncates it to ~0 and a bed above the stop simply
-# moves AWAY from the nozzle — either way it cannot touch a part. 32 mm is the vendor's
-# figure, kept rather than re-derived: its only job is to reach the stop from wherever
-# the firmware parked the bed after the pause. The FEED of both moves is the same stock
-# block's F1200, whose one origin is ``eject.generator.Z_REFERENCE_FEED_MM_MIN`` (the
-# guarded drive's vendor feed): the lift's G-code and its motion wait read that constant.
-VISION_HOLD_PROBE_MM = 32.0
 
 
 def _hms_summary(hms_errors: list[dict] | None) -> str | None:
@@ -664,6 +653,10 @@ async def _maybe_idle_deep_park(db: AsyncSession, printer_id: int) -> None:
     eject's declared frame rather than the firmware's boot frame. That is the intended
     reading — the declared frame is the true one — and it is stated here because an
     absolute Z is only ever as good as the frame it runs in.
+
+    The G-code is ``eject.bed_motion``'s (the one builder of the farm's bed-motion G-code). The
+    park is sent UNCLAIMED, as it always was: it runs only over a plate the eject just released, on a
+    printer with nothing slated, and it holds no dispatch off.
     """
     try:
         from backend.app.api.routes.settings import get_setting
@@ -711,7 +704,7 @@ async def _maybe_idle_deep_park(db: AsyncSession, printer_id: int) -> None:
         ok = (
             await printer_action.send(
                 printer_id,
-                printer_action.gcode(f"M17\nG90\nG1 Z{park_z:.1f} F900\nM400\nM18"),
+                printer_action.gcode(bed_motion.idle_deep_park_gcode(park_z)),
                 actor=printer_action.ACTOR_FARM,
                 client=client,
             )
@@ -977,69 +970,37 @@ async def _maybe_lift_held_bed(db: AsyncSession, printer_id: int) -> None:
     on a model with no geometry row or no ``z_travel_mm`` (no proven Z axis to move).
     Cosmetic-lane discipline like the idle deep-park: every failure is a log line and
     nothing here raises into the terminal chain.
+
+    The G-code, the motion time and the claimed send are ``eject.bed_motion.lift_held_bed``'s —
+    the one verb the auto plate-clear and the plate-detection calibration take too; this lane
+    owns only its log lines and the wait before the requeue.
     """
     try:
-        printer = await db.get(Printer, printer_id)
-        if printer is None:
-            return
-        if is_bedslinger_model(printer.model):
-            return
-        geometry = await eject_geometry.get_geometry(db, printer.model)
-        if geometry is None or geometry.z_travel_mm is None:
-            logger.info(
-                "farm_policy: held-bed lift skipped on printer %s — no z_travel_mm for model %r",
-                printer_id,
-                printer.model,
-            )
-            return
-        client = printer_manager.get_client(printer_id)
-        if client is None:
-            logger.warning("farm_policy: held-bed lift skipped on printer %s — no MQTT client", printer_id)
-            return
-        lift = geometry.hold_lift_mm
-        feed = Z_REFERENCE_FEED_MM_MIN
-        motion_s = (VISION_HOLD_PROBE_MM + lift) / (feed / 60.0)
-        status = printer_manager.get_status(printer_id)
-        printing_row = await db.scalar(
-            select(PrintQueueItem.id)
-            .where(PrintQueueItem.printer_id == printer_id)
-            .where(PrintQueueItem.status == "printing")
-            .limit(1)
-        )
-        refusal = plate_occupancy.claim_bed_motion(
-            printer_id,
-            Evidence(live_state=getattr(status, "state", None), db_claim=printing_row is not None),
-            hold_s=motion_s,
-        )
-        if refusal is not None:
-            logger.info(
-                "farm_policy: held-bed lift skipped on printer %s — bed motion refused (%s): the printer is "
-                "already taken by a motion of its own (a print's start block, a sweep or another lift)",
-                printer_id,
-                refusal,
-            )
-            return
-        ok = (
-            await printer_action.send(
-                printer_id,
-                printer_action.gcode(
-                    f"M17\nG91\nG380 S2 Z{VISION_HOLD_PROBE_MM:.1f} F{feed}\nG380 S2 Z-{lift:.1f} F{feed}\nG90\nM400\nM18"
-                ),
-                actor=printer_action.ACTOR_FARM,
-                client=client,
-            )
-        ).published
-        if not ok:
-            plate_occupancy.release_bed_motion(printer_id)
-            logger.warning("farm_policy: held-bed lift command refused on printer %s", printer_id)
+        outcome = await bed_motion.lift_held_bed(db, printer_id)
+        if isinstance(outcome, bed_motion.MotionSkipped):
+            if outcome.reason == "no_z_travel":
+                logger.info(
+                    "farm_policy: held-bed lift skipped on printer %s — no z_travel_mm for its model", printer_id
+                )
+            elif outcome.reason == "no_client":
+                logger.warning("farm_policy: held-bed lift skipped on printer %s — no MQTT client", printer_id)
+            elif outcome.reason == "not_sent":
+                logger.warning("farm_policy: held-bed lift command refused on printer %s", printer_id)
+            elif not outcome.permanent:
+                logger.info(
+                    "farm_policy: held-bed lift skipped on printer %s — bed motion refused (%s): the printer is "
+                    "already taken by a motion of its own (a print's start block, a sweep or another lift)",
+                    printer_id,
+                    outcome.reason,
+                )
             return
         logger.info(
             "farm_policy: held-bed lift sent on printer %s (%.1f mm off the bottom stop) — waiting %.1fs for its motion",
             printer_id,
-            lift,
-            motion_s,
+            outcome.height_mm,
+            outcome.seconds,
         )
-        await asyncio.sleep(motion_s)
+        await asyncio.sleep(outcome.seconds)
     except Exception:  # noqa: BLE001 — cosmetic lane: never raises into the terminal chain
         logger.warning("farm_policy: held-bed lift failed on printer %s", printer_id, exc_info=True)
 
@@ -1329,6 +1290,32 @@ async def clear_quarantine(db: AsyncSession, printer_id: int) -> Printer:
     printer_manager.set_quarantined(printer_id, False)
     logger.info("farm_policy: quarantine cleared for printer %s", printer_id)
     return printer
+
+
+@dataclass(frozen=True)
+class OperatorClear:
+    """What a person's "Mark plate cleared" did: the authority's refusal (nothing changed), or the
+    holds it closed (``(kind, …)``, empty when it ended none)."""
+
+    refusal: TransitionRefusal | None
+    incidents_closed: tuple[str, ...] = ()
+
+
+async def operator_clear_plate(printer_id: int) -> OperatorClear:
+    """A PERSON clearing the plate: the plate transition, then the holds whose resolution IS that act.
+
+    ONE verb for the human clear, so the clear-plate route cannot drift from it: the authority's
+    ``clear_plate`` (persisted, broadcast, the scheduler kicked on the release edge) and, only when it
+    cleared, ``pause_recovery.on_plate_cleared`` — the human-EVIDENCE closer (a lost Z frame ends on a
+    person taking the part off the plate). The automatic clear (``plate_autoclear``) is the
+    authority's transition ALONE: a camera reading is not a person, and its eligibility already
+    requires that no hold of any kind stands.
+    """
+    refusal = plate_occupancy.clear_plate(printer_id)
+    if refusal is not None:
+        return OperatorClear(refusal=refusal)
+    closed = await pause_recovery.on_plate_cleared(printer_id)
+    return OperatorClear(refusal=None, incidents_closed=tuple(kind for _id, kind in closed))
 
 
 async def recover_printer(db: AsyncSession, printer_id: int) -> dict:

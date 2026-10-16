@@ -70,6 +70,7 @@ from backend.app.models.spool_k_profile import SpoolKProfile
 from backend.app.models.spool_usage_history import SpoolUsageHistory
 from backend.app.services import spool_binding
 from backend.app.services.hms_errors import RUNOUT_HMS_CODES, hms_short_code
+from backend.app.services.spool_defaults import resolve_label_weight
 from backend.app.services.spool_tag_matcher import (
     ZERO_TAG_UID,
     ZERO_TRAY_UUID,
@@ -2033,11 +2034,8 @@ async def _build_respool_prompt_payload(
     state = printer_manager.get_status(printer_id)
     tray_count = _count_trays_in_ams(state, ams_id) if ams_id != 255 else 0
 
-    tray_weight = tray.get("tray_weight")
-    try:
-        label_weight_prefill = int(tray_weight) if tray_weight else int(donor.label_weight or 1000)
-    except (TypeError, ValueError):
-        label_weight_prefill = int(donor.label_weight or 1000)
+    # The tag's figure, else the donor's label, else the default-weight setting.
+    label_weight_prefill = await resolve_label_weight(db, tray.get("tray_weight"), donor.label_weight)
 
     brand_prefill = (await _respool_last_brand(db)) or None
     donor_remaining = float((donor.label_weight or 0) - (donor.weight_used or 0))
@@ -2864,7 +2862,8 @@ async def respool_tag(
             "label_weight": parsed.label_weight,
         }
 
-    final_label_weight = int(label_weight) if label_weight else int(source["label_weight"] or 1000)
+    # The operator's figure, else the donor's (or the tray parse's) label, else the setting.
+    final_label_weight = await resolve_label_weight(db, label_weight, source["label_weight"])
 
     new_spool = Spool(
         material=source["material"],

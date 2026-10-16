@@ -20,7 +20,8 @@ import { ColorSection } from '../../components/spool-form/ColorSection';
 import { AdditionalSection } from '../../components/spool-form/AdditionalSection';
 import { PAProfileSection } from '../../components/spool-form/PAProfileSection';
 import type { ColorPreset, PrinterWithCalibrations, SpoolFormData } from '../../components/spool-form/types';
-import { defaultFormData, validateForm } from '../../components/spool-form/types';
+import { newSpoolFormData, validateForm } from '../../components/spool-form/types';
+import { useDefaultSpoolWeight } from '../../hooks/useDefaultSpoolWeight';
 import {
   buildFilamentOptions,
   extractBrandsFromPresets,
@@ -436,7 +437,13 @@ function NewSpoolTouchForm({ currencySymbol, onCreated, selectedSpool, spoolmanM
 
   const [viewMode, setViewMode] = useState<NewSpoolViewMode>('simple');
   const [activeSubTab, setActiveSubTab] = useState<NewSpoolSubTab>('filament');
-  const [formData, setFormData] = useState<SpoolFormData>(defaultFormData);
+  const defaultSpoolWeight = useDefaultSpoolWeight();
+  // 0 = "no figure yet"; the effect below fills the default-weight setting once it resolves.
+  const [formData, setFormData] = useState<SpoolFormData>(() => newSpoolFormData(0));
+  useEffect(() => {
+    if (defaultSpoolWeight === undefined) return;
+    setFormData((prev) => (prev.label_weight > 0 ? prev : { ...prev, label_weight: defaultSpoolWeight }));
+  }, [defaultSpoolWeight]);
   const [errors, setErrors] = useState<Partial<Record<keyof SpoolFormData, string>>>({});
   const [quickAdd, setQuickAdd] = useState(false);
   const [quantity, setQuantity] = useState(1);

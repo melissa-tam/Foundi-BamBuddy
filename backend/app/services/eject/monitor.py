@@ -750,7 +750,9 @@ async def watch_gate_escalation_only(
     held by an unknown job and only a human clearing it (which NULLs the gate) may
     resume dispatch. Same poll cadence as the cooldown watch. A plate the printer REFUSED
     is paged ONCE, on the first tick a page is permitted — the refusal is the event (operator
-    ruling 2026-09-29: page "right away"). A DEPOSIT is paged by the attention owner
+    ruling 2026-09-29: page "right away") — unless the refusal was rebuilt at startup
+    (``PlateRefusal.hydrated``): its page went out when the gate was raised, and the hourly reminder
+    (``farm_stall``) keeps paging it, so a restart pages nothing. A DEPOSIT is paged by the attention owner
     (``farm_stall``) past its bound and then hourly, never by this watch (owner 5, 2026-10-11).
     Exits ``"cleared"`` when the gate is cleared externally (operator).
 
@@ -765,8 +767,9 @@ async def watch_gate_escalation_only(
     ``refusal`` (2026-09-24) outranks both: the printer's plate check paused a job and
     the job was then stopped, so the page names the printer's OWN words for what is wrong
     with the plate (:func:`escalation_sentence`) — the stop wiped them off the printer,
-    and the cause is the only place they survive. Memory-only: after a restart the gate
-    stands and this reads the generic sentence.
+    and the cause is the only place they survive. The words are memory-only; the refusal
+    itself survives a restart through the gate's stored origin (``plate_refused``), rebuilt as a
+    hydrated refusal with no words (armed silently).
 
     A disconnected/stale tick does NOT end the watch — its lifetime is the gated
     PHASE, not connectivity (mirroring ``watch_bed_and_clear``'s unreadable-bed
@@ -791,8 +794,9 @@ async def watch_gate_escalation_only(
             notify_plate_not_empty,
             source_detail=escalation_sentence(farm_source=farm_source, refusal=refusal),
         )
-    # Only the refusal pages here (its event); a deposit's page is the attention owner's.
-    escalated = refusal is None
+    # Only the refusal pages here (its event); a deposit's page is the attention owner's. A refusal
+    # rebuilt at startup (``PlateRefusal.hydrated``) was paged when its gate was raised: armed silently.
+    escalated = refusal is None or refusal.hydrated
     while True:
         if not plate_occupancy.is_plate_occupied(printer_id):
             logger.info(

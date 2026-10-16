@@ -79,6 +79,7 @@ def _terminal() -> TerminalDisposition:
         evidence=_deposit(),
         policy=EscalationOnly(),
         raise_gate=True,
+        origin="foreign",
     )
 
 

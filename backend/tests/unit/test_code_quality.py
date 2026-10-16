@@ -2533,6 +2533,65 @@ class TestIncidentResolutionOwnership:
         assert closers_with_a_close == callers
 
 
+# --- A maintenance hold's scheduled return to service (2026-10-16) ----------------
+
+_SERVICE_HOLD = ("services", "service_hold.py")
+_INCIDENT_STORE = ("services", "printer_incidents.py")
+
+
+def _scan_release_at_writes(tree: ast.Module) -> list[tuple[tuple[str, ...], int, str]]:
+    """Every WRITE of ``release_at``: an assignment (or ``del``) of ``x.release_at``, a
+    ``setattr`` naming it, or a ``release_at=`` keyword on a row construction or an SQL
+    ``.values(...)`` — ``(scope, line, what)``. The verb's own ``release_at=`` parameter
+    (``service_hold.enter(..., release_at=)``) is a call keyword on a VERB, not a write."""
+    hits: list[tuple[tuple[str, ...], int, str]] = []
+    for node, scope in _scoped_nodes(tree):
+        if isinstance(node, ast.Attribute) and node.attr == "release_at" and isinstance(node.ctx, (ast.Store, ast.Del)):
+            hits.append((scope, node.lineno, "assigns .release_at"))
+        elif isinstance(node, ast.Call):
+            name = _call_name(node)
+            if (
+                name == "setattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == "release_at"
+            ):
+                hits.append((scope, node.lineno, "setattr('release_at')"))
+            elif name in {"PrinterIncident", "values"} and any(kw.arg == "release_at" for kw in node.keywords):
+                hits.append((scope, node.lineno, f"{name}(release_at=...)"))
+    return hits
+
+
+class TestServiceHoldReleaseOwnership:
+    """``printer_incident.release_at`` — the operator's scheduled return to service — has ONE
+    writer, the store's ``set_release_at``, and ONE caller of it, the maintenance verb
+    (``service_hold``: enter / reschedule). SOURCE pins: a second writer (a route setting the
+    column, a lane clearing it on its own) passes every behaviour test while leaving the per-pass
+    projection (``due_releases``) reading a time the row no longer carries."""
+
+    def test_release_at_is_written_only_by_the_store_setter(self):
+        strays = [
+            f"  - {'/'.join(parts)}:{line} {what} (in {'.'.join(scope) or '<module>'})"
+            for parts, tree in _app_trees()
+            for scope, line, what in _scan_release_at_writes(tree)
+            if not (parts == _INCIDENT_STORE and scope == ("set_release_at",))
+        ]
+        assert not strays, (
+            "printer_incident.release_at is written outside printer_incidents.set_release_at:\n" + "\n".join(strays)
+        )
+
+    def test_the_setter_is_called_only_by_the_maintenance_verb(self):
+        callers = {parts for parts, _scope, _node in _calls_named("set_release_at")}
+        assert callers == {_SERVICE_HOLD}, f"set_release_at is called outside services/service_hold: {callers}"
+
+    def test_the_scan_sees_the_one_writer(self):
+        """The liveness half: a scan that stopped seeing the setter's own write would pass on nothing."""
+        trees = dict(_app_trees())
+        assert ((("set_release_at",), "assigns .release_at")) in {
+            (scope, what) for scope, _line, what in _scan_release_at_writes(trees[_INCIDENT_STORE])
+        }
+
+
 # --- The derived-3MF cache mechanism, and which module owns it (2026-09-19) --------
 
 # The content-addressed cache MECHANISM — the sha256 key, the system-temp caller copies,
@@ -4949,3 +5008,335 @@ class TestQuarantineOwnership:
             if line.strip().startswith(("import ", "from "))
         ]
         assert [line for line in imports if "eject.monitor" in line or "eject import monitor" in line] == []
+
+
+# --- A new spool's label weight: ONE owner (Part 2, fold F14, 2026-10-16) ---------------------------
+#
+# Every way a roll enters the internal inventory mints its label as "a positive stated figure (a tag's
+# ``tray_weight``, an operator's or a CSV's), else the ``default_spool_weight_g`` setting", and the rule
+# and the key's one reader live in the leaf ``services/spool_defaults``. Before it, five lanes each
+# carried their own literal (the ORM column default, ``parse_tray_fields``' ``tray_weight`` fallback, the
+# respool's ``or 1000``, ``SpoolCreate``'s default, the CSV's copy of that default), and the main AMS lane
+# dropped the tag's figure, so every RFID roll minted at the literal too. The pins: every ``Spool(``
+# construction names its label (the column has no Python default, so a missed path fails NOT NULL);
+# no literal label-weight fallback survives outside the setting's own schema default; the key is read
+# by the owner alone; the owner imports no spool service (``spool_tagless`` imports
+# ``spool_tag_matcher``, which reads the owner — an owner above either closes a cycle).
+_SPOOL_DEFAULTS = ("services", "spool_defaults.py")
+_DEFAULT_WEIGHT_KEY = "default_spool_weight_g"
+# Where the key may be NAMED: the owner (its one reader), the settings schema (the field, whose default
+# is the one origin of the figure) and the settings route's type whitelist (a coercion table, no read).
+_DEFAULT_WEIGHT_KEY_SITES = frozenset({_SPOOL_DEFAULTS, ("schemas", "settings.py"), ("api", "routes", "settings.py")})
+# The Spoolman store's lanes keep their own figures: a separate store the setting does not govern
+# (plan Part 2 "Out of scope"; open-items "Spoolman-lane default weight"). Named by module, and by
+# function where a module serves both stores.
+_SPOOLMAN_LANE_MODULES = frozenset(
+    {
+        ("api", "routes", "spoolman_inventory.py"),
+        ("api", "routes", "_spoolman_helpers.py"),
+        ("api", "routes", "spoolman.py"),
+        ("services", "spoolman.py"),
+    }
+)
+_SPOOLMAN_LANE_FUNCTIONS = frozenset({(("api", "routes", "spoolbuddy.py"), "update_spool_weight")})
+_LABEL_NAMES = frozenset({"label_weight", "tray_weight"})
+
+
+def _names_a_label(node: ast.AST) -> bool:
+    """Does an expression read a label figure — ``x.label_weight``, ``label_weight``,
+    ``d["tray_weight"]``, ``d.get("label_weight")``?"""
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name) and sub.id in _LABEL_NAMES:
+            return True
+        if isinstance(sub, ast.Attribute) and sub.attr in _LABEL_NAMES:
+            return True
+        if isinstance(sub, ast.Constant) and sub.value in _LABEL_NAMES:
+            return True
+    return False
+
+
+def _weight_literal(node: ast.AST | None) -> bool:
+    """A positive numeric literal — a gram figure, never a 0 "no label" guard."""
+    return (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, int | float)
+        and not isinstance(node.value, bool)
+        and node.value > 0
+    )
+
+
+def _is_label_fallback(node: ast.AST) -> bool:
+    """One node that falls back to a literal label figure."""
+    if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+        # ``s.label_weight or 1000``
+        return _weight_literal(node.values[-1]) and any(_names_a_label(v) for v in node.values[:-1])
+    if isinstance(node, ast.IfExp):
+        # ``int(w) if w else 1000`` where the test reads a label figure
+        return _names_a_label(node.test) and (_weight_literal(node.body) or _weight_literal(node.orelse))
+    if isinstance(node, ast.Call):
+        # ``t.get("tray_weight", 1000)`` / ``Spool(label_weight=1000)``
+        get_default = (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and len(node.args) == 2
+            and _names_a_label(node.args[0])
+            and _weight_literal(node.args[1])
+        )
+        return get_default or any(kw.arg in _LABEL_NAMES and _weight_literal(kw.value) for kw in node.keywords)
+    if isinstance(node, ast.Assign | ast.AnnAssign):
+        # ``label_weight: int = 1000`` / ``= Field(1000)`` / ``= mapped_column(Integer, default=1000)`` /
+        # ``label_weight = _safe_float(x, 1000.0)``
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if not any(isinstance(t, ast.Name) and t.id in _LABEL_NAMES for t in targets):
+            return False
+        value = node.value
+        if _weight_literal(value):
+            return True
+        return isinstance(value, ast.Call) and (
+            any(_weight_literal(a) for a in value.args) or any(kw.arg == "default" for kw in value.keywords)
+        )
+    return False
+
+
+def _scan_label_fallbacks(tree: ast.Module) -> list[tuple[str, int]]:
+    """``(function, line)`` of every literal label-weight fallback in one module."""
+    return [
+        (scope, node.lineno) for scope, nodes in _function_scopes(tree) for node in nodes if _is_label_fallback(node)
+    ]
+
+
+class TestSpoolLabelWeightOwnership:
+    def test_every_spool_construction_names_its_label(self):
+        """The column carries no Python default; a construction that forgets the label must be a
+        source-visible defect here, not a NOT NULL at the farm. ``**payload`` alone cannot be checked
+        statically, so the keyword is required at every site."""
+        offenders = []
+        for parts, tree in _app_trees():
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
+                if name == "Spool" and "label_weight" not in {kw.arg for kw in node.keywords}:
+                    offenders.append(f"{'/'.join(parts)}:{node.lineno}")
+        assert offenders == []
+
+    def test_the_spool_model_has_no_label_default(self):
+        from backend.app.models.spool import Spool
+
+        column = Spool.__table__.c.label_weight
+        assert column.default is None
+        assert column.server_default is None
+        assert column.nullable is False
+
+    def test_no_literal_label_weight_fallback_outside_the_setting_default(self):
+        offenders = []
+        for parts, tree in _app_trees():
+            if parts in _SPOOLMAN_LANE_MODULES or parts == ("schemas", "settings.py"):
+                continue
+            offenders.extend(
+                f"{'/'.join(parts)}:{line} ({scope})"
+                for scope, line in _scan_label_fallbacks(tree)
+                if (parts, scope) not in _SPOOLMAN_LANE_FUNCTIONS
+            )
+        assert offenders == []
+
+    def test_the_scan_sees_each_retired_shape(self):
+        """Mutation witness: the five shapes this change deleted are each still caught."""
+        retired = (
+            "def a(t):\n    return int(t.get('tray_weight', 1000))\n",
+            "def b(s):\n    return s.label_weight or 1000\n",
+            "class C:\n    label_weight: int = 1000\n",
+            "class D:\n    label_weight = mapped_column(Integer, default=1000)\n",
+            "def e(w, src):\n    return int(w) if w else int(src['label_weight'] or 1000)\n",
+        )
+        for source in retired:
+            assert _scan_label_fallbacks(ast.parse(source)), source
+
+    def test_the_setting_is_read_by_its_owner_alone(self):
+        offenders = []
+        for py_file in get_python_files(BACKEND_DIR):
+            parts = _relative_parts(py_file)
+            if parts not in _DEFAULT_WEIGHT_KEY_SITES and _DEFAULT_WEIGHT_KEY in py_file.read_text(encoding="utf-8"):
+                offenders.append("/".join(parts))
+        assert offenders == []
+
+    def test_the_owner_is_a_leaf_below_the_spool_services(self):
+        source = (BACKEND_DIR / Path(*_SPOOL_DEFAULTS)).read_text(encoding="utf-8")
+        imports = [line.strip() for line in source.splitlines() if line.strip().startswith(("import ", "from "))]
+        assert [line for line in imports if "backend.app.services" in line] == []
+
+
+# --- Auto plate-clear (2026-10-16): the gate's origin, the human clear, the bed-motion builder, the still owner ---
+
+_PLATE_OCCUPANCY_STORE = ("services", "plate_occupancy_store.py")
+_FARM_POLICY_MODULE = ("services", "farm_policy.py")
+_CAMERA_STILLS = ("services", "camera_stills.py")
+_PLATE_DETECTION = ("services", "plate_detection.py")
+_CAMERA_ROUTES = ("api", "routes", "camera.py")
+# The modules that may spell a guarded bed drive (``G380``): the one bed-motion builder, and the eject
+# block's own Z re-reference prologue and its validator.
+_G380_OWNERS = frozenset(
+    {
+        ("services", "eject", "bed_motion.py"),
+        ("services", "eject", "generator.py"),
+        ("services", "eject", "validator.py"),
+    }
+)
+# The camera's own capture primitives: a frame is taken by the still owner alone.
+_CAPTURE_PRIMITIVES = frozenset(
+    {
+        "capture_camera_frame",
+        "capture_camera_frame_bytes",
+        "get_buffered_frame",
+        "try_get_active_buffered_frame",
+        "live_buffered_frame",
+        "capture_frame",
+    }
+)
+
+
+def _docstring_ids(tree: ast.Module) -> set[int]:
+    """The ids of every docstring constant (module, class, function) — prose, never a G-code builder."""
+    ids: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.body:
+            first = node.body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                ids.add(id(first.value))
+    return ids
+
+
+_ORIGIN_COLUMNS = ("plate_gate_origin", "plate_gate_origin_subtask_id")
+
+
+def _scan_plate_gate_origin_writes(tree: ast.Module) -> list[tuple[tuple[str, ...], int, str]]:
+    """Every WRITE of the two origin columns: an attribute assignment, or a keyword in any call (a model
+    constructor, an ``update().values(...)``)."""
+    hits = []
+    for node, scope in _scoped_nodes(tree):
+        if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Attribute) and target.attr in _ORIGIN_COLUMNS:
+                    hits.append((scope, node.lineno, f"assigns .{target.attr}"))
+        elif isinstance(node, ast.Call):
+            for kw in node.keywords:
+                if kw.arg in _ORIGIN_COLUMNS:
+                    hits.append((scope, node.lineno, f"passes {kw.arg}="))
+    return hits
+
+
+class TestPlateGateOriginOwnership:
+    """WHY a gate stands (``plate_occupancy.PlateOrigin``) is stated by every construction of the plate
+    record and persisted by ONE writer. SOURCE pins: a construction that defaults the origin, or a
+    second writer of the column (a route stamping it, a lane clearing it on its own), passes every
+    behaviour test while the auto plate-clear reads an origin nobody decided."""
+
+    def test_every_plate_record_construction_states_its_origin(self):
+        constructions: list[tuple[tuple[str, ...], int]] = []
+        strays: list[str] = []
+        for parts, tree in _app_trees():
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and _called(node.func)[1] == "PlateOccupied":
+                    constructions.append((parts, node.lineno))
+                    if not any(kw.arg == "origin" for kw in node.keywords):
+                        strays.append(f"  - {'/'.join(parts)}:{node.lineno} builds PlateOccupied without origin=")
+        assert not strays, "A plate record is built without stating its origin:\n" + "\n".join(strays)
+        # Liveness: the authority's four raisers (hydrate, terminal, declaration, the eject escalation).
+        assert {parts for parts, _line in constructions} == {_PLATE_OCCUPANCY}
+        assert len(constructions) >= 4
+
+    def test_the_origin_field_has_no_default(self):
+        import dataclasses
+
+        from backend.app.services.plate_occupancy import PlateOccupied, TerminalDisposition
+
+        for cls in (PlateOccupied, TerminalDisposition):
+            (field,) = [f for f in dataclasses.fields(cls) if f.name == "origin"]
+            assert field.default is dataclasses.MISSING and field.default_factory is dataclasses.MISSING, cls
+
+    def test_the_origin_columns_are_written_by_the_store_persist_alone(self):
+        strays = [
+            f"  - {'/'.join(parts)}:{line} {what} (in {'.'.join(scope) or '<module>'})"
+            for parts, tree in _app_trees()
+            for scope, line, what in _scan_plate_gate_origin_writes(tree)
+            if not (parts == _PLATE_OCCUPANCY_STORE and scope[-2:] == ("_write_occupancy", "_do"))
+        ]
+        assert not strays, "The gate's origin columns are written outside the store's persist:\n" + "\n".join(strays)
+
+    def test_the_scan_sees_the_one_writer_of_both_columns(self):
+        trees = dict(_app_trees())
+        seen = {
+            (scope[-2:], what) for scope, _line, what in _scan_plate_gate_origin_writes(trees[_PLATE_OCCUPANCY_STORE])
+        }
+        for column in _ORIGIN_COLUMNS:
+            assert (("_write_occupancy", "_do"), f"assigns .{column}") in seen, column
+
+
+class TestHumanClearOwnership:
+    """``pause_recovery.on_plate_cleared`` is the HUMAN-evidence closer (a lost Z frame ends on a person
+    taking the part off). Its callers are the person's clear (``farm_policy.operator_clear_plate``, the
+    route's one verb) and Recover — never the automatic clear, which is the plate transition alone."""
+
+    def test_the_human_closer_has_two_callers(self):
+        callers = {
+            (parts, scope[-1] if scope else "<module>") for parts, scope, _node in _calls_named("on_plate_cleared")
+        }
+        assert callers == {
+            (_FARM_POLICY_MODULE, "operator_clear_plate"),
+            (_FARM_POLICY_MODULE, "recover_printer"),
+        }
+
+    def test_the_automatic_clear_is_the_plate_transition(self):
+        """Liveness: the auto plate-clear clears through the authority's ``clear_plate``."""
+        callers = {(parts, scope[-1]) for parts, scope, _node in _calls_named("clear_plate")}
+        assert (("services", "plate_autoclear.py"), "_note_reading") in callers
+
+
+class TestBedMotionGcodeOwnership:
+    """``services/eject/bed_motion`` is the ONE builder of the farm's server-side bed motions (the held-bed
+    lift and the idle deep-park). A guarded bed drive (``G380``) spelled anywhere else is a second builder
+    — the shape that let two inline copies drift before this extraction."""
+
+    def test_the_guarded_drive_is_spelled_by_its_owners_alone(self):
+        strays: list[str] = []
+        for parts, tree in _app_trees():
+            if parts in _G380_OWNERS:
+                continue
+            prose = _docstring_ids(tree)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in prose:
+                    if "G380" in node.value:
+                        strays.append(f"  - {'/'.join(parts)}:{node.lineno} spells G380")
+        assert not strays, "A bed drive is built outside eject/bed_motion:\n" + "\n".join(strays)
+
+    def test_the_farm_policy_takes_its_motions_from_the_builder(self):
+        """Liveness: the refused plate's lift and the idle park both reach the builder."""
+        trees = dict(_app_trees())
+        called = {_called(node.func) for node in ast.walk(trees[_FARM_POLICY_MODULE]) if isinstance(node, ast.Call)}
+        assert {("bed_motion", "lift_held_bed"), ("bed_motion", "idle_deep_park_gcode")} <= called
+
+
+class TestCameraStillOwnership:
+    """``services/camera_stills`` is the ONE capture implementation every plate reading and the snapshot
+    route take their frame from: it honours a live stream (#1348) and serves an anchored read only a frame
+    taken after its anchor. A capture primitive called from the plate detection or the snapshot route is
+    a second capture — the buffered-frame-with-no-age-check shape this owner replaced."""
+
+    def test_plate_detection_and_the_snapshot_take_frames_from_the_owner(self):
+        strays: list[str] = []
+        for parts, tree in _app_trees():
+            if parts not in (_PLATE_DETECTION, _CAMERA_ROUTES):
+                continue
+            for node, scope in _scoped_nodes(tree):
+                if not isinstance(node, ast.Call) or _called(node.func)[1] not in _CAPTURE_PRIMITIVES:
+                    continue
+                if parts == _CAMERA_ROUTES and scope[:1] != ("camera_snapshot",):
+                    continue
+                strays.append(f"  - {'/'.join(parts)}:{node.lineno} calls {_called(node.func)[1]}()")
+        assert not strays, "A frame is captured outside services/camera_stills:\n" + "\n".join(strays)
+
+    def test_the_stream_frame_with_its_time_has_one_reader(self):
+        callers = {parts for parts, _scope, _node in _calls_named("live_buffered_frame")}
+        assert callers == {_CAMERA_STILLS}

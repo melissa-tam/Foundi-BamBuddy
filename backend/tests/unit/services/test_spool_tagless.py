@@ -115,6 +115,7 @@ async def _seed_assignment(
     material/colour so a same-filament tray re-binds on fingerprint match.
     """
     spool = Spool(
+        label_weight=1000,
         material=material,
         rgba=rgba,
         data_origin="rfid_auto" if tag_uid else "ams_auto",
@@ -229,15 +230,15 @@ class TestBroadcastOrigin:
 
 class TestPredicates:
     def test_fingerprint_matches(self):
-        spool = Spool(material="PETG", rgba="112233FF")
+        spool = Spool(label_weight=1000, material="PETG", rgba="112233FF")
         assert spool_tagless.fingerprint_matches(spool, _tray("PETG", color="112230FF")) is True  # near color
         assert spool_tagless.fingerprint_matches(spool, _tray("PLA", color="112233FF")) is False  # material
         assert spool_tagless.fingerprint_matches(spool, _tray("PETG", color="FF0000FF")) is False  # far color
 
     def test_is_tagless_spool(self):
-        assert spool_tagless.is_tagless_spool(Spool(material="PETG")) is True
-        assert spool_tagless.is_tagless_spool(Spool(material="PETG", tag_uid=_VALID_TAG)) is False
-        assert spool_tagless.is_tagless_spool(Spool(material="PETG", tray_uuid="A" * 32)) is False
+        assert spool_tagless.is_tagless_spool(Spool(label_weight=1000, material="PETG")) is True
+        assert spool_tagless.is_tagless_spool(Spool(label_weight=1000, material="PETG", tag_uid=_VALID_TAG)) is False
+        assert spool_tagless.is_tagless_spool(Spool(label_weight=1000, material="PETG", tray_uuid="A" * 32)) is False
         assert spool_tagless.is_tagless_spool(None) is False
 
 
@@ -309,7 +310,7 @@ class TestBareTray:
 
     async def test_never_overwrites_operator_bound_bare_slot(self, db_session, printer_factory, env):
         printer = await printer_factory()
-        operator_spool = Spool(material="PLA", data_origin="manual")  # operator setup, no tag
+        operator_spool = Spool(label_weight=1000, material="PLA", data_origin="manual")  # operator setup, no tag
         operator_spool.k_profiles = []
         operator_spool.assignments = []
         db_session.add(operator_spool)
@@ -357,7 +358,7 @@ class TestAssignFromSettingMoves:
 
 class TestProvisionalDisposal:
     async def test_hard_delete_pristine(self, db_session):
-        spool = Spool(material="PETG", data_origin="ams_auto")
+        spool = Spool(label_weight=1000, material="PETG", data_origin="ams_auto")
         spool.k_profiles = []
         spool.assignments = []
         db_session.add(spool)
@@ -369,7 +370,7 @@ class TestProvisionalDisposal:
         assert await db_session.get(Spool, spool_id) is None
 
     async def test_archive_when_ledger_present(self, db_session):
-        spool = Spool(material="PETG", data_origin="ams_auto")
+        spool = Spool(label_weight=1000, material="PETG", data_origin="ams_auto")
         spool.k_profiles = []
         spool.assignments = []
         db_session.add(spool)
@@ -383,7 +384,7 @@ class TestProvisionalDisposal:
         assert spool.archived_at is not None
 
     async def test_kept_when_not_ams_auto(self, db_session):
-        spool = Spool(material="PETG", data_origin="rfid_auto")
+        spool = Spool(label_weight=1000, material="PETG", data_origin="rfid_auto")
         spool.k_profiles = []
         spool.assignments = []
         db_session.add(spool)
@@ -438,7 +439,7 @@ class TestForceBareTray:
             is False
         )
         # Operator-bound slot → force does NOT override.
-        operator_spool = Spool(material="PLA", data_origin="manual")
+        operator_spool = Spool(label_weight=1000, material="PLA", data_origin="manual")
         operator_spool.k_profiles = []
         operator_spool.assignments = []
         db_session.add(operator_spool)
@@ -465,7 +466,7 @@ class TestApplySpoolLazyLoadRegression:
         from backend.app.services.slot_identity import apply_spool_to_slot_via_mqtt
 
         printer = await printer_factory()
-        spool = Spool(material="PETG", rgba="00FF00FF", data_origin="ams_auto")
+        spool = Spool(label_weight=1000, material="PETG", rgba="00FF00FF", data_origin="ams_auto")
         spool.k_profiles = []
         spool.assignments = []
         db_session.add(spool)
@@ -519,7 +520,7 @@ class TestApplySpoolLazyLoadRegression:
         from backend.app.services.printer_manager import printer_manager
 
         printer = await printer_factory()
-        spool = Spool(material="PETG", rgba="00FF00FF", data_origin="ams_auto")
+        spool = Spool(label_weight=1000, material="PETG", rgba="00FF00FF", data_origin="ams_auto")
         spool.k_profiles = []
         spool.assignments = []
         db_session.add(spool)
@@ -913,7 +914,9 @@ class TestDefaultRowIdentity:
 
 class TestBareTraySpentGuard:
     async def _seed_spent_ams_auto(self, db_session, printer_id):
-        spent = Spool(material="PETG", rgba="000000FF", data_origin="ams_auto", spent_at=datetime.utcnow())
+        spent = Spool(
+            label_weight=1000, material="PETG", rgba="000000FF", data_origin="ams_auto", spent_at=datetime.utcnow()
+        )
         spent.k_profiles = []
         spent.assignments = []
         db_session.add(spent)
@@ -1754,6 +1757,7 @@ class TestBareTraySpentGuardOutranksTheOriginVeto:
 
     async def _seed(self, db_session, printer_id, *, origin, spent):
         spool = Spool(
+            label_weight=1000,
             material="PETG",
             rgba="000000FF",
             data_origin=origin,

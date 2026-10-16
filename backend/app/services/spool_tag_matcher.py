@@ -11,6 +11,7 @@ from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_k_profile import SpoolKProfile
 from backend.app.services.spool_binding import bind_spool_to_slot
+from backend.app.services.spool_defaults import resolve_label_weight
 from backend.app.services.tray_fields import ZERO_TAG_UID, ZERO_TRAY_UUID
 from backend.app.utils.printer_models import extruder_for_ams, nozzle_for_ams_unit
 from backend.app.utils.retry_window import RetryWindow
@@ -116,7 +117,9 @@ async def parse_tray_fields(db: AsyncSession, tray_data: dict) -> ParsedTrayFiel
     tray_info_idx = tray_data.get("tray_info_idx", "")
     nozzle_min = tray_data.get("nozzle_temp_min", 0)
     nozzle_max = tray_data.get("nozzle_temp_max", 0)
-    label_weight = int(tray_data.get("tray_weight", 1000))
+    # The tag's own figure when it states a positive one, else the default-weight setting
+    # (an untagged tray reports ``tray_weight="0"``) — the ONE tray parse applies the rule.
+    label_weight = await resolve_label_weight(db, tray_data.get("tray_weight"))
 
     # Parse material and subtype from tray_sub_brands ("PLA Basic" → material="PLA", subtype="Basic")
     material = tray_type or "PLA"

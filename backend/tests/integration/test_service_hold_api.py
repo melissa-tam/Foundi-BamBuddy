@@ -12,6 +12,7 @@ MQTT session down
 override.") stays with the route that raises it, in ``test_printers_api.py``.
 """
 
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -66,6 +67,8 @@ class TestEnterAndExit:
             # so a bool for it could only ever be False.
             "eject_stopped": False,
             "lease_revoked": False,
+            # No body: no scheduled return to service.
+            "release_at": None,
         }
         row = await printer_incidents.get_open(db_session, printer.id, kinds={KIND_SERVICE_HOLD})
         assert row is not None and row.status == STATUS_ESCALATED
@@ -148,6 +151,114 @@ class TestEnterAndExit:
         )
 
         assert response.status_code == 200
+
+
+def _future(**delta) -> str:
+    return (datetime.now(timezone.utc) + timedelta(**delta)).isoformat()
+
+
+class TestScheduledReturn:
+    """The return to service over HTTP: optional on POST, set / changed / cleared by PATCH, a
+    time that is not in the future refused with a 422 (the service decides; the route maps)."""
+
+    async def test_enter_with_a_time_stores_it_as_naive_utc(
+        self, async_client: AsyncClient, printer_factory, db_session
+    ):
+        printer = await printer_factory()
+        at = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(hours=2)
+
+        response = await async_client.post(
+            f"/api/v1/printers/{printer.id}/service-hold", json={"release_at": at.isoformat()}
+        )
+
+        assert response.status_code == 200
+        naive = at.replace(tzinfo=None)
+        assert response.json()["release_at"] == naive.isoformat()
+        row = await printer_incidents.get_open(db_session, printer.id, kinds={KIND_SERVICE_HOLD})
+        assert row is not None and row.release_at == naive
+
+    async def test_enter_with_a_past_time_is_422_and_opens_nothing(self, async_client: AsyncClient, printer_factory):
+        printer = await printer_factory()
+
+        response = await async_client.post(
+            f"/api/v1/printers/{printer.id}/service-hold", json={"release_at": _future(minutes=-5)}
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == "Return time is not in the future. Pick a later time."
+        assert printer_incidents.automation_held(printer.id) is False
+
+    async def test_patch_sets_and_clears_the_time(self, async_client: AsyncClient, printer_factory, db_session):
+        printer = await printer_factory()
+        await async_client.post(f"/api/v1/printers/{printer.id}/service-hold")
+
+        set_ = await async_client.patch(
+            f"/api/v1/printers/{printer.id}/service-hold", json={"release_at": _future(hours=3)}
+        )
+        assert set_.status_code == 200
+        assert set_.json()["release_at"] is not None
+        status = await async_client.get(f"/api/v1/printers/{printer.id}/status")
+        assert status.json()["service_hold"]["release_at"] == set_.json()["release_at"]
+
+        cleared = await async_client.patch(f"/api/v1/printers/{printer.id}/service-hold", json={"release_at": None})
+        assert cleared.status_code == 200
+        assert cleared.json() == {"release_at": None}
+        status = await async_client.get(f"/api/v1/printers/{printer.id}/status")
+        assert status.json()["service_hold"]["release_at"] is None
+
+    async def test_patch_with_a_past_time_is_422_and_keeps_the_time(self, async_client: AsyncClient, printer_factory):
+        printer = await printer_factory()
+        entered = await async_client.post(
+            f"/api/v1/printers/{printer.id}/service-hold", json={"release_at": _future(hours=1)}
+        )
+
+        response = await async_client.patch(
+            f"/api/v1/printers/{printer.id}/service-hold", json={"release_at": _future(hours=-1)}
+        )
+
+        assert response.status_code == 422
+        status = await async_client.get(f"/api/v1/printers/{printer.id}/status")
+        assert status.json()["service_hold"]["release_at"] == entered.json()["release_at"]
+
+    async def test_patch_on_an_unheld_printer_is_409(self, async_client: AsyncClient, printer_factory):
+        printer = await printer_factory()
+
+        response = await async_client.patch(
+            f"/api/v1/printers/{printer.id}/service-hold", json={"release_at": _future(hours=1)}
+        )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == "Printer is not in maintenance mode."
+
+    async def test_patch_needs_the_field(self, async_client: AsyncClient, printer_factory):
+        """``release_at`` is required and nullable: an empty body is not a silent clear."""
+        printer = await printer_factory()
+        await async_client.post(f"/api/v1/printers/{printer.id}/service-hold")
+
+        response = await async_client.patch(f"/api/v1/printers/{printer.id}/service-hold", json={})
+
+        assert response.status_code == 422
+
+    async def test_patch_unknown_printer_is_404(self, async_client: AsyncClient):
+        response = await async_client.patch("/api/v1/printers/424242/service-hold", json={"release_at": None})
+
+        assert response.status_code == 404
+
+    async def test_patch_is_forbidden_without_printers_control(
+        self, async_client: AsyncClient, db_session, printer_factory
+    ):
+        printer = await printer_factory()
+        await service_hold.enter(db_session, printer.id, actor="raymond")
+        await _enable_auth(db_session)
+        key = await _api_key(db_session, can_read_status=True, can_control_printer=False)
+
+        response = await async_client.patch(
+            f"/api/v1/printers/{printer.id}/service-hold",
+            json={"release_at": _future(hours=1)},
+            headers={"X-API-Key": key},
+        )
+
+        assert response.status_code == 403
 
 
 class TestServiceHoldProjection:

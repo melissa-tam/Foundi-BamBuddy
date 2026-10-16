@@ -273,6 +273,20 @@ export interface CameraDiagnoseStage {
   code: string | null;
 }
 
+/**
+ * `GET /printers/{id}/camera/still` (`services/camera_stills`): the printer's CACHED camera
+ * still. The server owns the capture cadence (1 -> 5 -> 15 min while nothing about the printer
+ * changes, back to 1 min on a change), so polling it never adds captures.
+ *   - `still`     a frame, with when it was taken (`X-Captured-At`) and its `ETag`
+ *   - `unchanged` 304: the frame named by the `etag` sent is still the latest
+ *   - `none`      503: no still could be had (camera off, capture failed, a live stream with
+ *                 no fresh frame)
+ */
+export type CameraStillAnswer =
+  | { kind: 'still'; blob: Blob; capturedAt: string | null; etag: string | null }
+  | { kind: 'unchanged' }
+  | { kind: 'none' };
+
 export interface CameraDiagnoseResult {
   printer_id: number;
   protocol: 'rtsp' | 'chamber_image';
@@ -386,6 +400,12 @@ export type PrinterIncidentKind =
 export interface ServiceHoldState {
   /** ISO timestamp the operator took the hold. */
   since: string;
+  /**
+   * Scheduled return to service (ISO, naive UTC — parse with `parseUTCDate`):
+   * the farm's scheduler ends the hold at this time through the same exit as
+   * the button. `null` / absent = the hold ends only on Exit.
+   */
+  release_at?: string | null;
 }
 
 /**
@@ -489,6 +509,17 @@ export interface ServiceHoldEnterResult {
   already_held: boolean;
   eject_stopped: boolean;
   lease_revoked: boolean;
+  /** The hold's scheduled return to service after the call, or null. */
+  release_at: string | null;
+}
+
+/**
+ * `PATCH /printers/{id}/service-hold` — the hold's return to service after the
+ * call (null = cleared). 409 when the printer is not held; 422 on a time that
+ * is not in the future.
+ */
+export interface ServiceHoldRescheduleResult {
+  release_at: string | null;
 }
 
 /** `DELETE /printers/{id}/service-hold`. */
@@ -1041,7 +1072,19 @@ export interface PlateDetectionROI {
   h: number;  // Height % (0.0-1.0)
 }
 
+// A plate reading answers three ways; `unknown` carries why (uncalibrated, capture failed, ...).
+export type PlateVerdictKind = 'empty' | 'occupied' | 'unknown';
+export type PlateUnknownReason =
+  | 'opencv_unavailable'
+  | 'uncalibrated'
+  | 'capture_failed'
+  | 'decode_failed'
+  | 'stale_frame'
+  | 'analysis_error';
+
 export interface PlateDetectionResult {
+  verdict: PlateVerdictKind;
+  reason: PlateUnknownReason | null;
   is_empty: boolean;
   confidence: number;
   difference_percent: number;
@@ -1052,7 +1095,8 @@ export interface PlateDetectionResult {
   light_warning?: boolean;
   reference_count?: number;
   max_references?: number;
-  roi?: PlateDetectionROI;
+  // The compared area in use: the printer's own, else the server's whole-frame default.
+  roi: PlateDetectionROI;
 }
 
 export interface PlateDetectionStatus {
@@ -1634,6 +1678,9 @@ export interface AppSettings {
   // JSON string default filament pushed to BARE tagless trays (mirrors
   // gcode_snippets serialization). Empty string / null = feature off.
   tagless_default_filament: string | null;
+  // Label weight (g) a new roll starts from when no tag or operator figure states
+  // one (50-5000). Read through `hooks/useDefaultSpoolWeight`.
+  default_spool_weight_g: number;
   spoolman_enabled: boolean;  // True when the user has switched filament tracking to Spoolman; backend includes this in the /settings/ response even though earlier consumers read it from the dedicated /settings/spoolman endpoint as a string
   auto_add_unknown_rfid: boolean;  // When false, the backend skips auto-creating inventory spools for unknown RFID tags and instead broadcasts an unknown_tag event for the confirmation modal
   spoolman_url: string;
@@ -1782,6 +1829,10 @@ export interface AppSettings {
   // travel never park.
   farm_idle_park_enabled: boolean;
   farm_idle_park_percent: number;
+  // Auto plate-clear: a normal leftover's gate (a foreign or screen print, an operator stop, an
+  // unattributed finish, a plate marked occupied) clears after two empty camera readings on an
+  // idle, calibrated printer with no hold. Default off.
+  farm_plate_autoclear_enabled: boolean;
   // Chute prime: at dispatch the sliced file's start-block prime line is
   // rewritten so the prime is extruded into the purge chute instead of onto the
   // plate's front lip. A file whose start block is not recognised dispatches
@@ -4672,9 +4723,18 @@ export const api = {
   // fans off, an in-flight eject sweep stopped, a running print stopped as an
   // operator stop, the dispatch lease revoked) — the response says which of
   // those actually happened. Permission: `printers:control`.
-  enterServiceHold: (printerId: number) =>
+  // `releaseAt`: optional scheduled return to service (UTC ISO); omitted or
+  // null = the hold ends only on Exit. A time that is not in the future is a 422.
+  enterServiceHold: (printerId: number, releaseAt: string | null = null) =>
     request<ServiceHoldEnterResult>(`/printers/${printerId}/service-hold`, {
       method: 'POST',
+      body: JSON.stringify({ release_at: releaseAt }),
+    }),
+  // Set, change or clear (null) a held printer's return to service.
+  rescheduleServiceHold: (printerId: number, releaseAt: string | null) =>
+    request<ServiceHoldRescheduleResult>(`/printers/${printerId}/service-hold`, {
+      method: 'PATCH',
+      body: JSON.stringify({ release_at: releaseAt }),
     }),
   exitServiceHold: (printerId: number) =>
     request<ServiceHoldExitResult>(`/printers/${printerId}/service-hold`, {
@@ -6772,6 +6832,30 @@ export const api = {
     withStreamToken(`${API_BASE}/printers/${printerId}/camera/stream?fps=${fps}`),
   getCameraSnapshotUrl: (printerId: number) =>
     withStreamToken(`${API_BASE}/printers/${printerId}/camera/snapshot`),
+  /** The cached still (`CameraStillAnswer`); `etag` is the frame already held, for a 304. */
+  getCameraStill: async (printerId: number, etag: string | null = null): Promise<CameraStillAnswer> => {
+    const headers: Record<string, string> = {};
+    if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+    if (etag) headers['If-None-Match'] = etag;
+    const response = await fetch(`${API_BASE}/printers/${printerId}/camera/still`, {
+      headers,
+      cache: 'no-store',
+      credentials: 'include',
+    });
+    if (response.status === 304) return { kind: 'unchanged' };
+    if (response.status === 503) return { kind: 'none' };
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      const detail = (error as { detail?: unknown }).detail;
+      throw new ApiError(typeof detail === 'string' ? detail : `HTTP ${response.status}`, response.status);
+    }
+    return {
+      kind: 'still',
+      blob: await response.blob(),
+      capturedAt: response.headers.get('X-Captured-At'),
+      etag: response.headers.get('ETag'),
+    };
+  },
   testCameraConnection: (printerId: number) =>
     request<{ success: boolean; message?: string; error?: string }>(`/printers/${printerId}/camera/test`),
   getCameraStatus: (printerId: number) =>

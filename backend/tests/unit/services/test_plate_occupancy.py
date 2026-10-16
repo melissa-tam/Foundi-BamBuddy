@@ -112,6 +112,7 @@ def _disposition(
     deposited: bool = True,
     policy: po.OccupancyPolicy | None = None,
     raise_gate: bool = True,
+    origin: po.PlateOrigin = "farm_deposit",
 ) -> po.TerminalDisposition:
     return po.TerminalDisposition(
         queue_item_id=queue_item_id,
@@ -119,6 +120,7 @@ def _disposition(
         evidence=_deposit_evidence(deposited=deposited),
         policy=policy if policy is not None else po.CooldownEject(unit_id=1, run_id=1),
         raise_gate=raise_gate,
+        origin=origin,
     )
 
 

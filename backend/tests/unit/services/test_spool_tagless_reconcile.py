@@ -200,6 +200,7 @@ async def _seed_spool(
     nozzle_temp_max=None,
 ):
     spool = Spool(
+        label_weight=1000,
         material="PETG",
         rgba=rgba,
         slicer_filament=slicer_filament,

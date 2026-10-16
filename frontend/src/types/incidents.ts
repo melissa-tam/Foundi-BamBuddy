@@ -50,7 +50,9 @@ export type IncidentResolveSource =
   | 'handed_over'
   | 'job_ended_unseen'
   | 'driver_ended'
-  | 'legacy_vision_stop';
+  | 'legacy_vision_stop'
+  // A maintenance hold ended by its own scheduled return to service.
+  | 'scheduled';
 
 /** `printer_incidents.summary` as a model — the equipment-fault ledger's tally. */
 export interface IncidentSummary {

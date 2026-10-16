@@ -86,6 +86,7 @@ from backend.app.services.spool_binding import (
     last_released_from_slot_stmt,
     release_spool_from_slot,
 )
+from backend.app.services.spool_defaults import default_label_weight_g
 from backend.app.services.spool_tag_matcher import (
     auto_assign_spool,
     is_bambu_tag,
@@ -757,10 +758,10 @@ async def mint_tagless_spool(
 
     Exactly one source must be given. Common shape: no tag fields,
     ``data_origin="ams_auto"``, ``tag_type=None``, ``weight_used=0``.
-    ``label_weight`` uses the tray's reported net weight when the AMS gives a
-    positive one, otherwise it is left to the ``Spool`` model's default (see
-    ``models/spool.py`` — ``label_weight`` default = 1000 g); tagless trays
-    commonly report ``tray_weight="0"``.
+    ``label_weight`` is the tray's reported net weight when the AMS gives a positive
+    one (the tray parse applies that rule), else the default-weight setting through
+    its one owner, ``spool_defaults`` — tagless trays commonly report
+    ``tray_weight="0"``, and the default arm has no tray at all.
 
     **Both arms emit ONE identity for the default filament.** The tray arm used to
     hardcode ``brand=None`` while the default arm read the setting's brand, so the
@@ -774,7 +775,7 @@ async def mint_tagless_spool(
     if (tray is None) == (default_filament is None):
         raise ValueError("mint_tagless_spool requires exactly one of tray / default_filament")
 
-    label_weight: int | None
+    label_weight: int
     if tray is not None:
         parsed = await parse_tray_fields(db, tray)
         material = parsed.material
@@ -834,8 +835,7 @@ async def mint_tagless_spool(
         )
         if _row_identity is not None:
             brand, subtype = _row_identity.brand, _row_identity.subtype
-        # Only a POSITIVE reported net weight overrides the model default.
-        label_weight = parsed.label_weight if parsed.label_weight > 0 else None
+        label_weight = parsed.label_weight
         source = "tray"
     else:
         material = default_filament.get("material") or "PLA"
@@ -853,7 +853,7 @@ async def mint_tagless_spool(
         # the resolver emits it verbatim (a byte-identical backup-group peer).
         nozzle_temp_min = default_filament.get("nozzle_temp_min")
         nozzle_temp_max = default_filament.get("nozzle_temp_max")
-        label_weight = None  # use the Spool model default (1000 g)
+        label_weight = await default_label_weight_g(db)
         source = "default"
 
     kwargs: dict = {
@@ -871,10 +871,7 @@ async def mint_tagless_spool(
         "data_origin": DATA_ORIGIN,
         "tag_type": None,
     }
-    if label_weight is not None:
-        kwargs["label_weight"] = label_weight
-
-    spool = Spool(**kwargs)
+    spool = Spool(**kwargs, label_weight=label_weight)
     # Initialize relationships BEFORE add() to avoid an async lazy load — the
     # SpoolAssignment back_populates resolution runs synchronously (see #612 and
     # ``create_spool_from_tray``).
@@ -1341,7 +1338,8 @@ _LEDGER_OVERCHARGE_SCOPE = "ledger_overcharge"
 # — the grams ledger (the successor gets exactly the re-pointed charges), the tag columns
 # (a tagless mint has none), the spent/prompt/fault stamps (they described the old roll)
 # and the FIFO stamps (``spool_binding`` owns those, and the successor's service entry
-# genuinely IS this boundary).
+# genuinely IS this boundary). The label weight is inherited too, but named at the
+# construction itself (every ``Spool(`` names its label — ``TestSpoolLabelWeightOwnership``).
 _SUCCESSOR_INHERITED_FIELDS = (
     "material",
     "subtype",
@@ -1354,7 +1352,6 @@ _SUCCESSOR_INHERITED_FIELDS = (
     "slicer_filament_name",
     "nozzle_temp_min",
     "nozzle_temp_max",
-    "label_weight",
     "core_weight",
     "core_weight_catalog_id",
     "cost_per_kg",
@@ -1378,7 +1375,13 @@ async def _mint_successor_row(db: AsyncSession, departed: Spool, *, weight_used:
     lazy load (#612).
     """
     kwargs = {name: getattr(departed, name) for name in _SUCCESSOR_INHERITED_FIELDS}
-    successor = Spool(**kwargs, weight_used=weight_used, data_origin=DATA_ORIGIN, tag_type=None)
+    successor = Spool(
+        **kwargs,
+        label_weight=departed.label_weight,
+        weight_used=weight_used,
+        data_origin=DATA_ORIGIN,
+        tag_type=None,
+    )
     # The charges moving across are prints this physical roll actually fed, so the
     # feed-evidence field moves with them (rule 8 names ``last_used`` as the field that
     # survives repairs and proves a roll fed).

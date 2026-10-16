@@ -22,6 +22,8 @@ interface HMSErrorModalProps {
   onClose: () => void;
   printerId: number;
   hasPermission: (permission: Permission) => boolean;
+  /** Touch sizing (the touch view): a wider sheet and 56 px buttons. */
+  touch?: boolean;
 }
 
 type SeverityKey = 'fatal' | 'serious' | 'warning' | 'info';
@@ -46,8 +48,9 @@ function getSeverityInfo(severity: number): {
   }
 }
 
-export function HMSErrorModal({ printerName, errors, onClose, printerId, hasPermission }: HMSErrorModalProps) {
+export function HMSErrorModal({ printerName, errors, onClose, printerId, hasPermission, touch = false }: HMSErrorModalProps) {
   const { t } = useTranslation();
+  const buttonSize = touch ? 'min-h-[56px] px-4 text-base' : 'px-3 py-1.5 text-sm';
   const { showToast } = useToast();
   const queryClient = useQueryClient();
 
@@ -103,7 +106,7 @@ export function HMSErrorModal({ printerName, errors, onClose, printerId, hasPerm
   });
 
   return (
-    <Modal onClose={onClose} closeOnOverlay={false} labelledBy="hms-error-modal-title">
+    <Modal onClose={onClose} closeOnOverlay={false} labelledBy="hms-error-modal-title" size={touch ? 'lg' : 'md'}>
       <CardContent className="p-0">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
@@ -113,7 +116,8 @@ export function HMSErrorModal({ printerName, errors, onClose, printerId, hasPerm
           </div>
           <button
             onClick={onClose}
-            className="p-1 hover:bg-bambu-dark-tertiary rounded-lg transition-colors"
+            aria-label={t('common.close')}
+            className={`${touch ? 'min-h-[56px] min-w-[56px] flex items-center justify-center' : 'p-1'} hover:bg-bambu-dark-tertiary rounded-lg transition-colors`}
           >
             <X className="w-5 h-5 text-bambu-gray" />
           </button>
@@ -169,7 +173,7 @@ export function HMSErrorModal({ printerName, errors, onClose, printerId, hasPerm
                                     job_id: error.job_id ?? null,
                                   });
                                 }}
-                                className={`flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-lg ${bgColor} ${color} hover:${buttonHoverColor} transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0`}
+                                className={`flex items-center gap-1.5 ${buttonSize} font-medium rounded-lg ${bgColor} ${color} hover:${buttonHoverColor} transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0`}
                               >
                                 {t(`hmsErrors.actions.${action}`, action)}
                               </button>
@@ -205,7 +209,7 @@ export function HMSErrorModal({ printerName, errors, onClose, printerId, hasPerm
             <button
               onClick={() => clearMutation.mutate()}
               disabled={!hasPermission('printers:control') || clearMutation.isPending}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-lg bg-red-500/20 text-red-400 hover:bg-red-500/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0"
+              className={`flex items-center gap-1.5 ${buttonSize} font-medium rounded-lg bg-red-500/20 text-red-400 hover:bg-red-500/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0`}
             >
               {clearMutation.isPending ? (
                 <Loader2 className="w-4 h-4 animate-spin" />

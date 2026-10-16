@@ -46,6 +46,7 @@ const RESOLVE_SOURCES: Record<IncidentResolveSource, true> = {
   job_ended_unseen: true,
   driver_ended: true,
   legacy_vision_stop: true,
+  scheduled: true,
 };
 
 /** Resolve a dotted key against the English bundle. */

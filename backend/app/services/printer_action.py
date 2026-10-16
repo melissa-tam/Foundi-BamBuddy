@@ -209,6 +209,11 @@ def gcode(text: str) -> Command:
     return Command("gcode_line", lambda client, seq: client.send_gcode(text, sequence_id=seq))
 
 
+def chamber_light(on: bool) -> Command:
+    """The ``system.ledctrl`` frame switching the chamber light on or off."""
+    return Command("ledctrl", lambda client, seq: client.set_chamber_light(on, sequence_id=seq))
+
+
 def cali_sel(ams_id: int, tray_id: int, *, cali_idx: int, filament_id: str, nozzle_diameter: str = "0.4") -> Command:
     """An ``extrusion_cali_sel`` K-profile selection on a slot (the client's guarded write)."""
     return Command(

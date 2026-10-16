@@ -12,14 +12,14 @@ import { render, screen, fireEvent } from '@testing-library/react';
 import { I18nextProvider } from 'react-i18next';
 import i18n from '../../../i18n';
 import { ColorSection } from '../../../components/spool-form/ColorSection';
-import { defaultFormData } from '../../../components/spool-form/types';
+import { newSpoolFormData } from '../../../components/spool-form/types';
 
 function renderColorSection(opts: {
   catalogColors: Parameters<typeof ColorSection>[0]['catalogColors'];
-  formData?: Partial<typeof defaultFormData>;
+  formData?: Partial<ReturnType<typeof newSpoolFormData>>;
 }) {
   const formData = {
-    ...defaultFormData,
+    ...newSpoolFormData(1000),
     brand: 'Bambu Lab',
     material: 'PLA',
     ...opts.formData,

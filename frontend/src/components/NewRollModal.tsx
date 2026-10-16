@@ -7,6 +7,7 @@ import { InlineAlert } from './ui/InlineAlert';
 import { api } from '../api/client';
 import type { InventorySpool, Printer } from '../api/client';
 import { useToast } from '../contexts/ToastContext';
+import { useDefaultSpoolWeight } from '../hooks/useDefaultSpoolWeight';
 import { getAmsLabel } from '../utils/amsHelpers';
 import { getSwatchStyle } from '../utils/colors';
 import type { NewRollContext } from '../utils/newRollContext';
@@ -93,6 +94,7 @@ export function NewRollModal({ context, onClose }: NewRollModalProps) {
 
   const [brand, setBrand] = useState('');
   const [labelWeight, setLabelWeight] = useState('');
+  const defaultSpoolWeight = useDefaultSpoolWeight(context !== null);
   const [costPerKg, setCostPerKg] = useState('');
   const [costTouched, setCostTouched] = useState(false);
   const [note, setNote] = useState('');
@@ -204,6 +206,16 @@ export function NewRollModal({ context, onClose }: NewRollModalProps) {
     setNote('');
     resetNewRollMutation();
   }, [context, queryClient, resetNewRollMutation]);
+
+  // A tagless replacement mints at the default-weight setting unless a figure is
+  // typed, so the field opens on it. Runs after the reset above and fills only an
+  // empty field: a late-resolving settings query never overwrites operator input.
+  // The tagged lane keeps the server's own prefill (the tag's or the donor's label).
+  useEffect(() => {
+    if (!context || context.tagged || context.label_weight_prefill != null) return;
+    if (defaultSpoolWeight === undefined) return;
+    setLabelWeight((prev) => (prev === '' ? String(defaultSpoolWeight) : prev));
+  }, [context, defaultSpoolWeight]);
 
   // Seed / recompute cost from the chosen brand until the operator edits it
   // manually. Covers the initial open, a brand change (typed or picked), and the

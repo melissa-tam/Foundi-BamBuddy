@@ -106,6 +106,11 @@ class TrayObservation:
     nozzle_temp_min: int | None
     nozzle_temp_max: int | None
 
+    # The tag's net weight (g) as the wire states it (``tray_weight``; ``0`` on an
+    # untagged tray). Carried to the mint so a tagged roll is minted at its tag's figure;
+    # ``spool_tag_matcher.parse_tray_fields`` applies "positive figure, else the setting".
+    tray_weight: int | None = None
+
     # ``tray_exist_bits`` bit for this slot, when the push carried a TRUSTED mask, the
     # slot is bitmask-addressable (AMS-HT units are not) and ``ams_exist_bits`` lists
     # the unit. ``None`` = no evidence. Evidence in BOTH polarities — a set bit is
@@ -221,6 +226,7 @@ def observe_tray(
         remain=parse_int_field(tray.get("remain")),
         nozzle_temp_min=parse_int_field(tray.get("nozzle_temp_min")),
         nozzle_temp_max=parse_int_field(tray.get("nozzle_temp_max")),
+        tray_weight=parse_int_field(tray.get("tray_weight")),
         exist_bit=bit,
     )
 
@@ -316,6 +322,7 @@ def observation_tray_dict(obs: TrayObservation) -> dict:
         ("remain", obs.remain),
         ("nozzle_temp_min", obs.nozzle_temp_min),
         ("nozzle_temp_max", obs.nozzle_temp_max),
+        ("tray_weight", obs.tray_weight),
     ):
         if value is not None:
             tray[key] = value

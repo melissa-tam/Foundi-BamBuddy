@@ -5,6 +5,9 @@ graceful stand-down in between. Four things live here and nowhere else:
 
 * :func:`enter` — open the durable hold, then quiesce;
 * :func:`exit` — close the hold this module owns and wake the scheduler;
+* :func:`reschedule` / :func:`release_due` — the hold's scheduled RETURN TO SERVICE
+  (``printer_incident.release_at``): set, change or clear it, and end every due hold
+  through :func:`exit` from the scheduler's pass;
 * :func:`quiesce` — stop one printer's automatic ACTIONS while its MQTT session, and its
   observation of the printer, stay up. Shared by :func:`enter` and the teardown verb;
 * :func:`quiesce_for_teardown` — the same, plus retiring the plate watch, for the one
@@ -61,11 +64,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Literal
 
 from backend.app.models.printer_incident import (
     KIND_SERVICE_HOLD,
     RESOLVE_OPERATOR,
+    RESOLVE_SCHEDULED,
     STATUS_RESOLVED,
 )
 from backend.app.services import printer_incidents
@@ -87,6 +92,13 @@ CAUSE_ENTER = "service hold"
 #: Why the scheduler is woken when a hold lifts. Same vocabulary as the other kick
 #: producers (``enqueue`` / ``manual_start`` / ``dry_run_enqueue``).
 _KICK_REASON = "service_hold_released"
+
+#: Who is on the record when the hold's own scheduled time ends it (:func:`release_due`).
+ACTOR_SCHEDULE = "schedule"
+
+#: Why a return time is refused: it is not in the future. The route maps it to a 422.
+ReleaseRefusalReason = Literal["release_in_past"]
+RELEASE_IN_PAST: ReleaseRefusalReason = "release_in_past"
 
 #: How long :func:`quiesce_for_teardown` waits for a cancelled plate watch to run its
 #: ``finally`` — the plate hold's release and both fans-off publishes (production; restored
@@ -132,6 +144,50 @@ class HoldVerdict:
     already_held: bool
     eject_stopped: bool = False
     lease_revoked: bool = False
+    #: The hold's scheduled return to service after this call (naive UTC), or ``None``.
+    release_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class ReleaseRefused:
+    """:func:`enter` / :func:`reschedule` refused the return time and changed NOTHING.
+
+    The decision is the verb's (a time at or before now can never be honoured as a schedule:
+    the next pass would release the hold at once, which is an Exit the operator did not press);
+    the route only maps ``reason`` to its 422.
+    """
+
+    reason: ReleaseRefusalReason
+
+
+@dataclass(frozen=True)
+class RescheduleVerdict:
+    """:func:`reschedule`'s answer: is the printer held, and its return time after the call."""
+
+    held: bool
+    release_at: datetime | None = None
+
+
+def _naive_utc(at: datetime) -> datetime:
+    """``at`` as naive UTC — the column's convention (``print_queue.scheduled_time``'s). An aware
+    time is converted; a naive one is already UTC by that convention."""
+    if at.tzinfo is None:
+        return at
+    return at.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def release_refusal(release_at: datetime | None, *, now: datetime | None = None) -> ReleaseRefused | None:
+    """Why ``release_at`` cannot be a hold's return time, or ``None`` when it can.
+
+    ``None`` (no scheduled return) is always accepted. A time at or before ``now`` is refused: it
+    is not a schedule but an immediate exit, and the exit has its own button.
+    """
+    if release_at is None:
+        return None
+    now = now or datetime.utcnow()
+    if _naive_utc(release_at) <= now:
+        return ReleaseRefused(reason=RELEASE_IN_PAST)
+    return None
 
 
 async def quiesce(printer_id: int, *, cause: str) -> QuiesceReport:
@@ -253,8 +309,22 @@ async def quiesce_for_teardown(printer_id: int, *, cause: str) -> QuiesceReport:
     return await quiesce(printer_id, cause=cause)
 
 
-async def enter(db: AsyncSession, printer_id: int, *, actor: str) -> HoldVerdict:
+async def enter(
+    db: AsyncSession,
+    printer_id: int,
+    *,
+    actor: str,
+    release_at: datetime | None = None,
+    now: datetime | None = None,
+) -> HoldVerdict | ReleaseRefused:
     """Put ``printer_id`` in maintenance mode. Idempotent.
+
+    ``release_at`` is the optional scheduled return to service: the scheduler's pass ends the
+    hold at that time through :func:`exit` (:func:`release_due`). A time that is not in the
+    future is refused BEFORE anything is opened or quiesced (:class:`ReleaseRefused`). On a
+    printer already held, a given time RESCHEDULES the standing row (the second click with a
+    time means "until then"); with no time the standing schedule is left as it is — the second
+    click is a quiesce, not a statement about the return.
 
     Durable FIRST: the row is what every lane's gate reads, so it is opened before a
     single actuator is touched — a quiesce that dies half-way still leaves a printer
@@ -276,15 +346,28 @@ async def enter(db: AsyncSession, printer_id: int, *, actor: str) -> HoldVerdict
     quiesce with no session, and the hold is still worth recording — it is what stops
     the kick-driven scheduler dispatching within ~1 s of re-activation.
     """
+    refused = release_refusal(release_at, now=now)
+    if refused is not None:
+        logger.info(
+            "[service-hold] printer %s: enter by %s refused (%s: %s)", printer_id, actor, refused.reason, release_at
+        )
+        return refused
     row = await printer_incidents.open_declared(db, printer_id, kind=KIND_SERVICE_HOLD)
     already_held = row is None
+    if release_at is not None:
+        if row is None:
+            row = await printer_incidents.get_open(db, printer_id, kinds={KIND_SERVICE_HOLD})
+        if row is not None:
+            await printer_incidents.set_release_at(db, row.id, _naive_utc(release_at))
     report = await quiesce(printer_id, cause=CAUSE_ENTER)
     await _broadcast(printer_id)
+    scheduled = _scheduled_return(printer_id)
     logger.info(
-        "[service-hold] printer %s ENTERED maintenance mode by %s (already_held=%s, %s)",
+        "[service-hold] printer %s ENTERED maintenance mode by %s (already_held=%s, release_at=%s, %s)",
         printer_id,
         actor,
         already_held,
+        scheduled.isoformat() if scheduled else "-",
         report,
     )
     return HoldVerdict(
@@ -292,11 +375,100 @@ async def enter(db: AsyncSession, printer_id: int, *, actor: str) -> HoldVerdict
         already_held=already_held,
         eject_stopped=report.eject_stopped,
         lease_revoked=report.lease_revoked,
+        release_at=scheduled,
     )
 
 
-async def exit(db: AsyncSession, printer_id: int, *, actor: str) -> bool:
+async def reschedule(
+    db: AsyncSession,
+    printer_id: int,
+    release_at: datetime | None,
+    *,
+    actor: str,
+    now: datetime | None = None,
+) -> RescheduleVerdict | ReleaseRefused:
+    """Set, change or clear (``None``) the held printer's scheduled return to service.
+
+    A time that is not in the future is refused and changes nothing (:class:`ReleaseRefused`).
+    A printer that is not held answers ``held=False`` and nothing is written: a return time
+    belongs to a hold, and there is none to carry it. The new time is projected at once, so the
+    next scheduler pass reads it (:func:`release_due`) and every open card shows it.
+    """
+    refused = release_refusal(release_at, now=now)
+    if refused is not None:
+        logger.info(
+            "[service-hold] printer %s: reschedule by %s refused (%s: %s)",
+            printer_id,
+            actor,
+            refused.reason,
+            release_at,
+        )
+        return refused
+    row = await printer_incidents.get_open(db, printer_id, kinds={KIND_SERVICE_HOLD})
+    if row is None:
+        logger.info(
+            "[service-hold] printer %s is not in maintenance mode — no return time to set (%s)", printer_id, actor
+        )
+        return RescheduleVerdict(held=False)
+    stored = _naive_utc(release_at) if release_at is not None else None
+    if await printer_incidents.set_release_at(db, row.id, stored) is None:
+        # Closed between the read and the write: there is no hold left to schedule.
+        logger.info("[service-hold] printer %s hold %s closed underneath this reschedule", printer_id, row.id)
+        return RescheduleVerdict(held=False)
+    await _broadcast(printer_id)
+    logger.info(
+        "[service-hold] printer %s return to service %s by %s",
+        printer_id,
+        f"set to {stored.isoformat()}" if stored else "cleared",
+        actor,
+    )
+    return RescheduleVerdict(held=True, release_at=stored)
+
+
+async def release_due(db: AsyncSession, *, now: datetime | None = None) -> int:
+    """End every maintenance hold whose scheduled return to service has come. Returns how many.
+
+    Run from a guarded pass in ``print_scheduler.check_queue``, BEFORE the pending-item query, so
+    a released printer is dispatchable in the same pass. The due set is read off the open-row
+    projection (``printer_incidents.due_releases``): zero queries on a pass with nothing due, and
+    a due row costs its exit (one select, one update, a broadcast and a dispatch kick).
+
+    Polled like ``print_queue.scheduled_time`` and LEVEL-triggered, so nothing has to be re-armed
+    after a restart: the projection is rebuilt from the rows, and a time that passed while the
+    process was down releases on the first pass. Each due hold ends through :func:`exit` — the
+    hold's ONE closer — with ``source=RESOLVE_SCHEDULED``; an operator who pressed Exit first
+    leaves nothing open for it to close, so a hold is released exactly once. One failing release
+    never skips the rest.
+    """
+    now = now or datetime.utcnow()
+    released = 0
+    for due in printer_incidents.due_releases(now):
+        try:
+            if await exit(db, due.printer_id, actor=ACTOR_SCHEDULE, source=RESOLVE_SCHEDULED, due_by=now):
+                released += 1
+        except Exception:  # noqa: BLE001 — one printer's release must not starve the others
+            logger.exception(
+                "[service-hold] printer %s: the scheduled release of hold %s failed", due.printer_id, due.incident_id
+            )
+    return released
+
+
+async def exit(
+    db: AsyncSession,
+    printer_id: int,
+    *,
+    actor: str,
+    source: str = RESOLVE_OPERATOR,
+    due_by: datetime | None = None,
+) -> bool:
     """Take ``printer_id`` out of maintenance mode. True iff THIS call released a hold.
+
+    The hold's ONE closer, for both of its ends: the operator's Exit (``source`` ``operator``)
+    and the hold's own scheduled return to service (:func:`release_due`: ``source``
+    ``scheduled``, ``due_by`` = the pass's now). A scheduled release re-checks, in the
+    synchronous stretch before the close, that the row still carries a return time at or before
+    ``due_by`` (``printer_incidents.release_is_due``), so a time the operator changed or cleared
+    after the pass listed the row is honoured.
 
     Closes the row this module owns by ID — never ``close_open_for_printer``, which
     would also close a jam or a lost-Z frame standing beside the hold, i.e. the faults
@@ -314,7 +486,12 @@ async def exit(db: AsyncSession, printer_id: int, *, actor: str) -> bool:
     if row is None:
         logger.info("[service-hold] printer %s is not in maintenance mode — nothing to release (%s)", printer_id, actor)
         return False
-    closed = await printer_incidents.close(db, row.id, status=STATUS_RESOLVED, source=RESOLVE_OPERATOR)
+    if due_by is not None and not printer_incidents.release_is_due(printer_id, row.id, due_by):
+        logger.info(
+            "[service-hold] printer %s hold %s: return time changed before its release — left held", printer_id, row.id
+        )
+        return False
+    closed = await printer_incidents.close(db, row.id, status=STATUS_RESOLVED, source=source)
     if closed is None:
         # Somebody else closed it between the read and the close. They own the
         # re-arm; re-running it here would be a second decision on one release.
@@ -323,8 +500,17 @@ async def exit(db: AsyncSession, printer_id: int, *, actor: str) -> bool:
 
     _kick_dispatch(printer_id)
     await _broadcast(printer_id)
-    logger.info("[service-hold] printer %s LEFT maintenance mode (released by %s)", printer_id, actor)
+    logger.info(
+        "[service-hold] printer %s LEFT maintenance mode (released by %s, source=%s)", printer_id, actor, source
+    )
     return True
+
+
+def _scheduled_return(printer_id: int) -> datetime | None:
+    """The held printer's scheduled return to service, off the open-row projection, or ``None``."""
+    row = printer_incidents.snapshot(printer_id, kind=KIND_SERVICE_HOLD)
+    raw = row.get("release_at") if row is not None else None
+    return datetime.fromisoformat(raw) if raw else None
 
 
 def _kick_dispatch(printer_id: int) -> None:

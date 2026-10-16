@@ -152,6 +152,8 @@ class TestTheFarmsRestartStop:
                 source_subtask_id=_JOB,
                 evidence=evidence,
                 raise_gate=True,
+                stop_verdict=outcome.verdict,
+                reconciled=False,
                 refusal=outcome.plate_refusal,
             ),
         )

@@ -696,6 +696,51 @@ describe('PrintersPage', () => {
       await waitFor(() => expect(entered).toEqual(['1']));
     });
 
+    /** The scheduled return to service: the card's banner names it and Clear
+     *  sends `release_at: null` through PATCH. */
+    it('names the return time and clears it through PATCH', async () => {
+      const patched: unknown[] = [];
+      serveOne({ ...heldPrinter, service_hold: { since: '2026-09-12T03:02:28Z', release_at: '2099-12-31T10:00:00' } });
+      server.use(
+        http.patch('/api/v1/printers/:id/service-hold', async ({ request }) => {
+          patched.push(await request.json());
+          return HttpResponse.json({ release_at: null });
+        }),
+      );
+      render(<PrintersPage />);
+
+      expect(await screen.findByText(/in maintenance until/i)).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: /clear return time/i }));
+
+      await waitFor(() => expect(patched).toEqual([{ release_at: null }]));
+    });
+
+    /** A one-click entry (nothing live to stop) sends no return time. */
+    it('a one-click entry sends no return time', async () => {
+      const bodies: unknown[] = [];
+      serveOne(mockPrinters[0]);
+      server.use(
+        http.post('/api/v1/printers/:id/service-hold', async ({ request }) => {
+          bodies.push(await request.json());
+          return HttpResponse.json({
+            held: true,
+            already_held: false,
+            eject_stopped: false,
+            lease_revoked: false,
+            release_at: null,
+          });
+        }),
+      );
+      render(<PrintersPage />);
+      await screen.findByText('X1 Carbon');
+
+      const user = userEvent.setup();
+      await user.click(screen.getByRole('button', { name: 'More' }));
+      await user.click(await screen.findByRole('button', { name: /enter maintenance mode/i }));
+
+      await waitFor(() => expect(bodies).toEqual([{ release_at: null }]));
+    });
+
     it('does not render the generic incident chip for the hold kind', async () => {
       serveOne(heldPrinter, {
         open_incident: { id: 41, kind: 'service_hold', status: 'escalated', slot_desc: null, created_at: null, operator_exits: false, printer_messages: [] },

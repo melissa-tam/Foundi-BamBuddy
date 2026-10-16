@@ -97,7 +97,7 @@ registerSettingsSearch({ labelKey: 'settings.queueDrying', tab: 'queue', keyword
 registerSettingsSearch({ labelKey: 'settings.farmProduction', labelFallback: 'Farm Production', tab: 'farm', keywords: 'farm retry quarantine consecutive failures offline stalled usb cleanup pause paused stalled watchdog idle park deep bed lower position chute prime purge start block plate lip blow off blowoff stray filament aux fan print start bed leveling', anchor: 'card-farm-production' });
 registerSettingsSearch({ labelKey: 'settings.farmEjectCooldown', labelFallback: 'Eject Cooldown', tab: 'farm', keywords: 'eject cooldown shop air ambient room temperature eject line margin stall window epsilon plateau min cooling per check give up timer close enough release threshold bed temperature quarantine aux fan auxiliary speed percent hold plate position fan part top chamber exhaust air duct airduct boost sustain toggle enable', anchor: 'card-farm-cooldown' });
 registerSettingsSearch({ labelKey: 'settings.dispatchResponsiveness', labelFallback: 'Dispatch responsiveness', tab: 'farm', keywords: 'dispatch responsiveness latency poll interval queue check kick debounce coalesce usb preflight fresh window max wait parallel concurrency upload skip identical slim 3mf mesh thumbnail eject file speed', anchor: 'card-dispatch-responsiveness' });
-registerSettingsSearch({ labelKey: 'settings.filamentChecks', tab: 'filament', keywords: 'filament check warning runout remaining spool selection policy fifo first loaded lowest slot order minimum start weight floor untagged tagless auto add default bare tray respool observation prompt threshold reused tag grams rfid', anchor: 'card-filamentchecks' });
+registerSettingsSearch({ labelKey: 'settings.filamentChecks', tab: 'filament', keywords: 'filament check warning runout remaining spool selection policy fifo first loaded lowest slot order minimum start weight floor untagged tagless auto add default bare tray respool observation prompt threshold reused tag grams rfid default spool label weight new roll', anchor: 'card-filamentchecks' });
 registerSettingsSearch({ labelKey: 'settings.printModal', tab: 'filament', keywords: 'print modal custom mapping', anchor: 'card-printmodal' });
 registerSettingsSearch({ labelKey: 'settings.amsDisplayThresholds', tab: 'filament', keywords: 'ams humidity temperature threshold history retention', anchor: 'card-amsthresholds' });
 registerSettingsSearch({ labelKey: 'settings.externalUrl', tab: 'network', keywords: 'external url reverse proxy public notification link', anchor: 'card-externalurl' });
@@ -1028,6 +1028,7 @@ export function SettingsPage() {
       (settings.spool_recovery_protect_layers ?? 7) !== (localSettings.spool_recovery_protect_layers ?? 7) ||
       (settings.runout_auto_resume_enabled ?? true) !== (localSettings.runout_auto_resume_enabled ?? true) ||
       (settings.tagless_default_filament ?? '') !== (localSettings.tagless_default_filament ?? '') ||
+      settings.default_spool_weight_g !== localSettings.default_spool_weight_g ||
       (settings.queue_drying_enabled ?? false) !== (localSettings.queue_drying_enabled ?? false) ||
       (settings.queue_drying_block ?? false) !== (localSettings.queue_drying_block ?? false) ||
       (settings.ambient_drying_enabled ?? false) !== (localSettings.ambient_drying_enabled ?? false) ||
@@ -1097,6 +1098,7 @@ export function SettingsPage() {
       (settings.farm_usb_auto_cleanup ?? true) !== (localSettings.farm_usb_auto_cleanup ?? true) ||
       (settings.farm_idle_park_enabled ?? true) !== (localSettings.farm_idle_park_enabled ?? true) ||
       (settings.farm_idle_park_percent ?? 75) !== (localSettings.farm_idle_park_percent ?? 75) ||
+      (settings.farm_plate_autoclear_enabled ?? false) !== (localSettings.farm_plate_autoclear_enabled ?? false) ||
       (settings.farm_chute_prime_enabled ?? true) !== (localSettings.farm_chute_prime_enabled ?? true) ||
       (settings.farm_plate_blowoff_enabled ?? true) !== (localSettings.farm_plate_blowoff_enabled ?? true) ||
       (settings.farm_plate_blowoff_seconds ?? 10) !== (localSettings.farm_plate_blowoff_seconds ?? 10) ||
@@ -1161,6 +1163,7 @@ export function SettingsPage() {
         spool_recovery_step_timeout_s: localSettings.spool_recovery_step_timeout_s,
         spool_recovery_protect_layers: localSettings.spool_recovery_protect_layers,
         tagless_default_filament: localSettings.tagless_default_filament,
+        default_spool_weight_g: localSettings.default_spool_weight_g,
         queue_drying_enabled: localSettings.queue_drying_enabled,
         queue_drying_block: localSettings.queue_drying_block,
         ambient_drying_enabled: localSettings.ambient_drying_enabled,
@@ -1230,6 +1233,7 @@ export function SettingsPage() {
         farm_usb_auto_cleanup: localSettings.farm_usb_auto_cleanup,
         farm_idle_park_enabled: localSettings.farm_idle_park_enabled,
         farm_idle_park_percent: localSettings.farm_idle_park_percent,
+        farm_plate_autoclear_enabled: localSettings.farm_plate_autoclear_enabled,
         farm_chute_prime_enabled: localSettings.farm_chute_prime_enabled,
         farm_plate_blowoff_enabled: localSettings.farm_plate_blowoff_enabled,
         farm_plate_blowoff_seconds: localSettings.farm_plate_blowoff_seconds,
@@ -5285,6 +5289,12 @@ export function SettingsPage() {
                 enabled={localSettings.farm_idle_park_enabled ?? true}
               />
               <SettingSwitch
+                label={t('settings.farmPlateAutoclear')}
+                hint={t('settings.farmPlateAutoclearHelp')}
+                checked={localSettings.farm_plate_autoclear_enabled ?? false}
+                onChange={(checked) => updateSetting('farm_plate_autoclear_enabled', checked)}
+              />
+              <SettingSwitch
                 label={t('settings.farmChutePrimeEnabled', 'Prime into chute')}
                 hint={t('settings.farmChutePrimeEnabledHelp', 'The start-block prime line is extruded into the purge chute instead of onto the plate lip. Files with an unrecognised start block dispatch unmodified.')}
                 checked={localSettings.farm_chute_prime_enabled ?? true}
@@ -5907,6 +5917,17 @@ export function SettingsPage() {
                     </div>
                   );
                 })()}
+                {/* Label weight a new roll starts from when nothing states one (an
+                    untagged AMS roll, New roll, Add spool, CSV import). */}
+                <SettingNumber
+                  id="default-spool-weight"
+                  label={t('settings.defaultSpoolWeight')}
+                  hint={t('settings.defaultSpoolWeightHint')}
+                  value={localSettings.default_spool_weight_g}
+                  onChange={(value) => updateSetting('default_spool_weight_g', value)}
+                  min={50}
+                  max={5000}
+                />
                 {/* Reused-tag re-spool OBSERVATION threshold. Named for what it governs:
                     tier 3 was demoted to a log line 2026-08-10 and the tier-2 toggle that
                     once made "prompt" true of this card was removed 2026-08-19, so a

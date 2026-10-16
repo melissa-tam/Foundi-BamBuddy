@@ -356,6 +356,12 @@ RESOLVE_HANDED_OVER = "handed_over"
 # an unseen end from an answered one. 16 characters — inside ``resolve_source``'s
 # VARCHAR(24).
 RESOLVE_JOB_ENDED_UNSEEN = "job_ended_unseen"
+# A maintenance hold (``service_hold``) released by its own scheduled return time
+# (``release_at``): the scheduler's pass ran the hold's one exit verb at the time the operator
+# set (``service_hold.release_due``). Its own token beside ``operator`` because no hand pressed
+# Exit at that moment — the ledger reads WHO ended the hold. 9 characters, inside
+# ``resolve_source``'s VARCHAR(24).
+RESOLVE_SCHEDULED = "scheduled"
 
 
 class PrinterIncident(Base):
@@ -425,6 +431,14 @@ class PrinterIncident(Base):
     # stands (and on every row not closed ABORTED). Durable since 2026-10-11, so a restart no longer
     # lifts every bar at once.
     rearmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # A maintenance hold's scheduled RETURN TO SERVICE (2026-10-16): when the scheduler's pass ends
+    # the hold through its one exit verb (``service_hold.release_due``), naive UTC like
+    # ``print_queue.scheduled_time``. Meaningful only on a ``service_hold`` row; NULL = the hold ends
+    # only on "Exit maintenance mode". Written ONLY by ``printer_incidents.set_release_at``, called
+    # ONLY from ``services/service_hold`` (``test_code_quality.TestServiceHoldReleaseOwnership``) — the
+    # operator's time is a human's input the wire cannot restate, so it is a column, and the projection
+    # (``printer_incidents._open_cache``) is what the per-pass check reads.
+    release_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     __table_args__ = (
         # ONE open incident per printer PER KIND — the durable successor of the

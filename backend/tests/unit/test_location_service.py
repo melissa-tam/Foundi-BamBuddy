@@ -71,7 +71,7 @@ async def test_resolve_spool_location_fields_prefers_location_id(db_session: Asy
 async def test_rename_location_updates_spool_storage(db_session: AsyncSession):
     loc = Location()
     assign_location_name(loc, "Old Shelf")
-    spool = Spool(material="PLA", location_id=None, storage_location="Old Shelf")
+    spool = Spool(label_weight=1000, material="PLA", location_id=None, storage_location="Old Shelf")
     db_session.add(loc)
     db_session.add(spool)
     await db_session.commit()
@@ -162,7 +162,7 @@ async def test_rename_location_picks_up_legacy_row_with_trailing_whitespace(db_s
     # Simulate a legacy row whose name was stored with the same value but
     # the column entry has whitespace padding (this happens in old free-text
     # data + manual DB edits).
-    legacy_spool = Spool(material="PLA", location_id=None, storage_location="  Old Shelf  ")
+    legacy_spool = Spool(label_weight=1000, material="PLA", location_id=None, storage_location="  Old Shelf  ")
     db_session.add(loc)
     db_session.add(legacy_spool)
     await db_session.commit()

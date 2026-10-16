@@ -30,6 +30,7 @@ from backend.app.models.printer_model_geometry import PrinterModelGeometry
 from backend.app.models.sku import Sku, SkuFile
 from backend.app.services import farm_correlation, farm_policy, printer_incidents, requeue
 from backend.app.services.dispatch_target import decode_printer_ids, encode_printer_ids
+from backend.app.services.eject import bed_motion
 from backend.app.services.notification_service import notification_service
 from backend.app.services.plate_occupancy import (
     CooldownEject,
@@ -809,6 +810,8 @@ class TestAFinishThatPrintedWithoutFilament:
                 source_subtask_id="J-011",
                 evidence=evidence,
                 raise_gate=True,
+                stop_verdict=None,
+                reconciled=False,
                 refusal=self._outcome().plate_refusal,
             ),
         )
@@ -2536,6 +2539,18 @@ class TestIdleDeepPark:
         assert view.plate_occupied is True  # plate KEPT
         assert client.sent == []
 
+    async def test_the_park_takes_no_claim(self, db_session):
+        """The park is sent UNCLAIMED, as it always was (it is outside the bed-motion claim the
+        held-bed lift, the auto plate-clear and the calibration take): no dispatch waits behind it."""
+        printer = await self._mk_printer(db_session, "PARKnoclaim")
+        await self._seed_geometry(db_session)
+        client = _ParkClient()
+        await self._terminal(db_session, printer, client)
+
+        assert client.sent == ["M17\nG90\nG1 Z255.0 F900\nM400\nM18"]
+        assert plate_occupancy.snapshot(printer.id).bed_motion_active is False
+        assert plate_occupancy.dispatchable(printer.id, Evidence(live_state="IDLE")) is None
+
     async def test_never_parks_on_a_failed_eject(self, db_session):
         printer = await self._mk_printer(db_session, "PARKfailed")
         await self._seed_geometry(db_session)
@@ -3445,7 +3460,7 @@ class TestRefusedPlateTerminal:
                 ),
             )
 
-        motion_s = (farm_policy.VISION_HOLD_PROBE_MM + 15.0) / (1200 / 60)
+        motion_s = (bed_motion.VISION_HOLD_PROBE_MM + 15.0) / (1200 / 60)
         assert lift_waits == [("wait", pytest.approx(motion_s)), ("requeue",)]
         assert motion_s == pytest.approx(2.35)
 
@@ -3480,7 +3495,7 @@ class TestRefusedPlateTerminal:
 
         idle = Evidence(live_state="IDLE")
         assert plate_occupancy.dispatchable(printer.id, idle) == "bed_motion_in_flight"
-        now[0] += (farm_policy.VISION_HOLD_PROBE_MM + 12.0) / (1200 / 60) + 0.01
+        now[0] += (bed_motion.VISION_HOLD_PROBE_MM + 12.0) / (1200 / 60) + 0.01
         assert plate_occupancy.dispatchable(printer.id, idle) is None
 
     @pytest.mark.parametrize(

@@ -15,26 +15,24 @@ import { AlertTriangle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { InfoHint } from './ui/InfoHint';
 import type { HoldChipState } from '../api/client';
-
-const TONE_CLASS: Record<HoldChipState['tone'], string> = {
-  acting: 'bg-yellow-500/20 text-yellow-400',
-  held: 'bg-status-error/20 text-status-error',
-};
+import { TONE_CLASS } from './holdChipTone';
 
 interface HoldChipProps {
   chip: HoldChipState;
+  /** Touch sizing (the touch view): larger copy and a 56 px tooltip target. */
+  touch?: boolean;
 }
 
-export function HoldChip({ chip }: HoldChipProps) {
+export function HoldChip({ chip, touch = false }: HoldChipProps) {
   const { t } = useTranslation();
   const sentences = chip.tooltip.map((copy) => t(copy.key, copy.values)).join(' ');
   const tooltip = chip.qualifier ? `${sentences} — ${chip.qualifier}` : sentences;
 
   return (
-    <span className={`flex items-center gap-1 px-2 py-1 rounded-full text-xs ${TONE_CLASS[chip.tone]}`}>
+    <span className={`flex items-center gap-1 px-2 py-1 rounded-full ${touch ? 'text-sm' : 'text-xs'} ${TONE_CLASS[chip.tone]}`}>
       <AlertTriangle className="w-3 h-3" aria-hidden="true" />
       {t(chip.label.key, chip.label.values)}
-      <InfoHint text={tooltip} />
+      <InfoHint text={tooltip} touch={touch} />
     </span>
   );
 }

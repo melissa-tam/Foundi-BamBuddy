@@ -455,6 +455,143 @@ class TestPersistCallable:
 
 
 # ---------------------------------------------------------------------------
+# The gate's origin: persisted with the gate, bound to it, hydrated across a restart
+# ---------------------------------------------------------------------------
+
+
+def _foreign_terminal(source: str | None = "FOREIGN-1") -> po.TerminalDisposition:
+    from backend.app.services import farm_correlation
+
+    return farm_correlation.terminal_disposition(
+        verdict="foreign",
+        item_id=None,
+        eject_profile_id=None,
+        first_article=False,
+        batch_id=None,
+        source_subtask_id=source,
+        evidence=po.DepositEvidence.unknown("completed"),
+        raise_gate=True,
+        stop_verdict=None,
+        reconciled=False,
+    )
+
+
+async def _restart(scheduled) -> None:
+    """Let the persists land, then rebuild the authority from the DB as a new process would."""
+    await _drain(scheduled)
+    po.plate_occupancy.reset_for_tests()
+    await store.hydrate()
+
+
+class TestTheGateOrigin:
+    async def test_a_gates_origin_survives_a_restart(self, db_session, monkeypatch, scheduled):
+        printer = await _mk_printer(db_session, "ORG1")
+        await db_session.commit()
+        _patch_session(monkeypatch, db_session)
+        store.wire_core()
+
+        po.plate_occupancy.note_terminal(printer.id, _foreign_terminal())
+        await _drain(scheduled)
+        await db_session.refresh(printer)
+        assert (printer.plate_gate_origin, printer.plate_gate_origin_subtask_id) == ("foreign", "FOREIGN-1")
+
+        await _restart(scheduled)
+        view = po.plate_occupancy.snapshot(printer.id)
+        assert (view.plate_occupied, view.plate_origin) == (True, "foreign")
+
+    async def test_an_operator_declaration_survives_a_restart(self, db_session, monkeypatch, scheduled):
+        printer = await _mk_printer(db_session, "ORG2")
+        await db_session.commit()
+        _patch_session(monkeypatch, db_session)
+        store.wire_core()
+
+        assert po.plate_occupancy.declare_occupied(printer.id, po.Evidence()) is None
+        await _drain(scheduled)
+        await db_session.refresh(printer)
+        # A source-less gate: its origin was written for no source id, and matches the NULL gate source.
+        assert (printer.plate_gate_origin, printer.plate_gate_origin_subtask_id) == ("operator_declared", None)
+        await _restart(scheduled)
+        assert po.plate_occupancy.snapshot(printer.id).plate_origin == "operator_declared"
+
+    async def test_the_origin_is_nulled_with_the_gate(self, db_session, monkeypatch, scheduled):
+        printer = await _mk_printer(db_session, "ORG3")
+        await db_session.commit()
+        _patch_session(monkeypatch, db_session)
+        store.wire_core()
+
+        po.plate_occupancy.note_terminal(printer.id, _foreign_terminal())
+        await _drain(scheduled)
+        assert po.plate_occupancy.clear_plate(printer.id) is None
+        await _drain(scheduled)
+        await db_session.refresh(printer)
+        assert (
+            printer.awaiting_plate_clear,
+            printer.plate_gate_subtask_id,
+            printer.plate_gate_origin,
+            printer.plate_gate_origin_subtask_id,
+        ) == (False, None, None, None)
+
+    @pytest.mark.parametrize(("gate", "written_for"), [("SUB-NEW", "SUB-OLD"), ("SUB-NEW", None), (None, "SUB-OLD")])
+    async def test_an_origin_written_for_another_gate_hydrates_unknown(
+        self, db_session, monkeypatch, scheduled, gate, written_for
+    ):
+        """A previous build (a rollback window) released this printer's gate and raised a new one without
+        ever writing the columns: the origin left behind was written for the OLD gate's source and must not
+        be read as the standing gate's origin."""
+        printer = await _mk_printer(db_session, f"ORG4{gate}{written_for}", awaiting=True, gate=gate)
+        printer.plate_gate_origin = "foreign"
+        printer.plate_gate_origin_subtask_id = written_for
+        await db_session.commit()
+        _patch_session(monkeypatch, db_session)
+
+        await store.hydrate()
+        assert po.plate_occupancy.snapshot(printer.id).plate_origin == "unknown"
+
+    @pytest.mark.parametrize("stored", [None, "", "garbage", "foreign|SUB-1"])
+    async def test_a_missing_or_unreadable_origin_hydrates_unknown(self, db_session, monkeypatch, stored):
+        printer = await _mk_printer(db_session, f"ORG5{stored}", awaiting=True, gate="SUB-1")
+        printer.plate_gate_origin = stored
+        printer.plate_gate_origin_subtask_id = "SUB-1"
+        await db_session.commit()
+        _patch_session(monkeypatch, db_session)
+
+        await store.hydrate()
+        assert po.plate_occupancy.snapshot(printer.id).plate_origin == "unknown"
+
+    async def test_a_refused_plate_is_rebuilt_as_a_refusal(self, db_session, monkeypatch, scheduled):
+        """The refusal survives a restart (it used to degrade to a generic deposit): the startup ladder
+        rebuilds a HYDRATED refusal (``EscalationOnly(refusal=PlateRefusal(hydrated=True))``) — with no
+        words, which never survive; its watch arms silently (``test_farm_stall``)."""
+        from backend.app.services import farm_correlation
+
+        printer = await _mk_printer(db_session, "ORG6")
+        await db_session.commit()
+        _patch_session(monkeypatch, db_session)
+        store.wire_core()
+
+        po.plate_occupancy.note_terminal(
+            printer.id,
+            farm_correlation.terminal_disposition(
+                verdict="matched",
+                item_id=None,
+                eject_profile_id=None,
+                first_article=False,
+                batch_id=None,
+                source_subtask_id="SUB-R",
+                evidence=po.DepositEvidence.unknown("cancelled"),
+                raise_gate=True,
+                stop_verdict="plate_refused",
+                reconciled=False,
+                refusal=po.PlateRefusal(messages=()),
+            ),
+        )
+        await _restart(scheduled)
+        view = po.plate_occupancy.snapshot(printer.id)
+        assert view.plate_origin == "plate_refused"
+        assert view.plate_policy == po.EscalationOnly(refusal=po.PlateRefusal(hydrated=True))
+
+
+# ---------------------------------------------------------------------------
 # The remaining callables
 # ---------------------------------------------------------------------------
 

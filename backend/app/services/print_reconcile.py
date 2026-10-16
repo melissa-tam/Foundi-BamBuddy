@@ -217,6 +217,8 @@ async def _unattributed_hold(db: AsyncSession, printer_id: int, state: PrinterSt
         source_subtask_id=None,
         evidence=DepositEvidence.unknown(_OUTCOME_STATES.get((state.state or "").upper(), "aborted")),
         raise_gate=raise_gate,
+        stop_verdict=None,
+        reconciled=True,
     )
 
 

@@ -167,6 +167,16 @@ class AppSettings(BaseModel):
             "{brand, material, subtype, rgba, slicer_filament}. Empty = off."
         ),
     )
+    # Label weight (g) a NEW roll is minted with when nothing states one: an untagged
+    # AMS roll, the New roll dialog, Add spool and CSV import. A tag's own positive
+    # tray_weight wins. Read ONLY through ``services/spool_defaults`` (the one owner);
+    # this field's default is the one origin of the figure. Existing rows never change.
+    default_spool_weight_g: int = Field(
+        default=1000,
+        ge=50,
+        le=5000,
+        description="Label weight (g) for a new roll when no tag or operator figure states one",
+    )
 
     # Updates
     check_updates: bool = Field(default=True, description="Automatically check for updates on startup")
@@ -756,6 +766,15 @@ class AppSettings(BaseModel):
         le=95,
         description="Idle park depth as a percentage of the model's commandable Z travel (10-95)",
     )
+    # Auto plate-clear (2026-10-16, services/plate_autoclear): a plate left by a normal leftover —
+    # a foreign/screen print, an operator stop with a deposit, an unattributed finish, a "Mark plate
+    # occupied" — is cleared after two empty camera readings on an idle, calibrated printer with no
+    # hold. Off by default: each printer's camera is calibrated and checked per model first.
+    farm_plate_autoclear_enabled: bool = Field(
+        default=False,
+        description="Clear the plate automatically when the camera shows it empty (normal leftovers only: "
+        "a foreign or screen print, an operator stop, an unattributed finish, a plate marked occupied)",
+    )
     farm_chute_prime_enabled: bool = Field(
         default=True,
         description="Rewrite the sliced file's start-block prime line at dispatch so the prime is extruded into "
@@ -818,6 +837,7 @@ class AppSettingsUpdate(BaseModel):
     spool_recovery_protect_layers: int | None = Field(default=None, ge=0, le=1000)
     runout_auto_resume_enabled: bool | None = None
     tagless_default_filament: str | None = None
+    default_spool_weight_g: int | None = Field(default=None, ge=50, le=5000)
     check_updates: bool | None = None
     check_printer_firmware: bool | None = None
     include_beta_updates: bool | None = None
@@ -957,6 +977,7 @@ class AppSettingsUpdate(BaseModel):
     farm_cooldown_hold_part_top_mm: int | None = Field(default=None, ge=-50, le=200)
     farm_idle_park_enabled: bool | None = None
     farm_idle_park_percent: int | None = Field(default=None, ge=10, le=95)
+    farm_plate_autoclear_enabled: bool | None = None
     farm_chute_prime_enabled: bool | None = None
     farm_plate_blowoff_enabled: bool | None = None
     farm_plate_blowoff_seconds: int | None = Field(default=None, ge=3, le=60)
