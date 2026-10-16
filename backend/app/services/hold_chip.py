@@ -61,7 +61,7 @@ from backend.app.models.printer_incident import (
 )
 from backend.app.services import incident_resolution, printer_incidents, refill_verdict
 from backend.app.services.command_outcome import Answer
-from backend.app.services.feed_state import FeedPhase, FeedReading
+from backend.app.services.feed_state import FeedReading
 from backend.app.services.tray_fields import TRAY_NOW_EXTERNAL_SPOOL, toolhead_feed
 from backend.app.utils import site_time
 
@@ -132,7 +132,6 @@ _STOP_ON_PRINTER = "printers.toolhead.stopOnPrinter"
 # the farm's hand, or a person's command took the printer. Any other last stop on an escalated air-stop
 # row is the one the printer did not take.
 _STOP_TAKEN: frozenset[str] = frozenset({Answer.REACHED.value, Answer.TAKEN_OVER.value})
-_FED_PHASES: frozenset[FeedPhase] = frozenset({FeedPhase.FED, FeedPhase.TAIL})
 
 
 @dataclass(frozen=True)
@@ -190,7 +189,7 @@ def _hold_chip(printer_id: int | None, state: PrinterState | None, feed: FeedRea
     if not printer_id:
         return None
     active = toolhead_feed(state).active
-    fed = active.kind in ("fed", "external") or (feed is not None and feed.phase in _FED_PHASES)
+    fed = active.kind in ("fed", "external") or (feed is not None and feed.toolhead_fed)
     if not fed and active.kind in ("empty", "unknown"):
         refill = printer_incidents.refill_state(printer_id)
         if refill is not None:

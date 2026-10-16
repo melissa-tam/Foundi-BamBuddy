@@ -818,6 +818,9 @@ def _payload(
         "code": incident.code or "",
         "status": incident.status,
         "job_id": incident.job_id or "",
+        # The job layer the fault stood at (the column, recorded at open and re-stamped by an
+        # upgrade) — read DB-free by :func:`faulted_at_last_layer`; the card ignores it.
+        "fault_layer": incident.fault_layer,
         "slot_desc": slot_desc(incident),
         "created_at": incident.created_at.isoformat() if incident.created_at else None,
         "escalated_at": incident.escalated_at.isoformat() if incident.escalated_at else None,
@@ -1380,6 +1383,28 @@ def air_stop_on(printer_id: int | None, incident_id: int) -> bool:
     if not printer_id:
         return False
     return bool(((_open_cache.get(printer_id) or {}).get(incident_id) or {}).get(PAYLOAD_AIR_STOP))
+
+
+def faulted_at_last_layer(printer_id: int | None, total_layers: int, *, incident_id: int | None = None) -> bool:
+    """Did an OPEN AMS row on this printer (``incident_id``'s, when named) fault at its job's LAST layer —
+    the row's durable ``fault_layer`` at or past ``total_layers`` (the job's total, known: > 0)? Then the
+    fault stood in the printer's END-OF-PRINT sequence and nothing is left to print (004-H2S incident 621,
+    2026-10-15: an overload during the end-of-print retract at layer 167/167). Pure, DB-free, sync — the
+    :func:`air_stop_on` idiom, for its two readers: the recovery driver's round verdict
+    (``spool_recovery._round_owed``: the printer's dialog answered, never a swap) and the refill verdict
+    (``refill_verdict.refill_owed``: no refill load at the end of print). The live ``END_RETRACT`` phase is no
+    witness once the printer paused; the row's recorded layer is."""
+    if not printer_id or total_layers <= 0:
+        return False
+    for payload_id, payload in (_open_cache.get(printer_id) or {}).items():
+        if incident_id is not None and payload_id != incident_id:
+            continue
+        if payload.get("kind") not in AMS_FAULT_KINDS:
+            continue
+        fault_layer = payload.get("fault_layer")
+        if isinstance(fault_layer, int) and fault_layer >= total_layers:
+            return True
+    return False
 
 
 def cached_kind(printer_id: int, incident_id: int) -> str | None:

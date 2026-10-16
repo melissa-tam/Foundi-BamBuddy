@@ -346,7 +346,7 @@ async def test_a_hold_whose_only_resume_was_backfilled_never_sent_is_still_owed(
 
     from backend.app.services import incident_resolution
     from backend.app.services.bambu_mqtt import PrinterState
-    from backend.app.services.feed_state import FeedPhase
+    from backend.app.services.feed_state import FED_PHASES, FeedPhase
 
     await _boot(engine)
     await _insert(
@@ -400,7 +400,8 @@ async def test_a_hold_whose_only_resume_was_backfilled_never_sent_is_still_owed(
         ctx = incident_resolution.Context(
             state=state,
             driver_live=False,
-            feed=SimpleNamespace(phase=FeedPhase.FED),
+            # The reading's ``toolhead_fed`` is the leaf's own set (``feed_state.FED_PHASES``), never re-spelled.
+            feed=SimpleNamespace(phase=FeedPhase.FED, toolhead_fed=FeedPhase.FED in FED_PHASES),
         )
         assert incident_resolution.resume_owed(row, ctx).owed is True
     finally:

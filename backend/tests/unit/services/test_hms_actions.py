@@ -474,3 +474,156 @@ class TestAmsControlBranchesDelegateToTheOnePublisher:
         with patch.object(BambuMQTTClient, "ams_control", return_value=True) as pub:
             client.execute_hms_action("07008029", action, "", sequence_id="1")
         pub.assert_called_once_with(param, request_pushall=True, sequence_id="1")
+
+
+# --- the farm's answer to a fault pause (2026-10-16, F1 / F2) ----------------------------------------------
+
+# The two catalog spellings of "Problem solved, resume" — the only buttons the farm presses for a fault.
+_PROBLEM_SOLVED = {HMSAction.PROBLEM_SOLVED_RESUME, HMSAction.RESUME_PRINTING_PROBELM_SOLVED}
+_IGNORE_FAMILY = {HMSAction.IGNORE_RESUME, HMSAction.IGNORE_NO_REMINDER_NEXT_TIME, HMSAction.DONT_REMIND_NEXT_TIME}
+
+
+def _catalog() -> dict[str, dict[str, list[str]]]:
+    """The vendored catalog itself (``backend/app/data/hms_actions.json``), every device × code."""
+    from backend.app.services import hms_actions
+
+    return json.loads(hms_actions._DATA_FILE.read_text(encoding="utf-8"))
+
+
+def _dialog_state(code: str, actions: list[str]):
+    """A PAUSEd printer whose ``print_error`` is the dialog ``code`` names (8 hex chars, or the short code of a
+    16-char ``hms[]`` key) with that code's parsed ``HMSError`` carrying ``actions`` — the shape the parse
+    leaves (``BambuMQTTClient._update_state``)."""
+    from backend.app.services.bambu_mqtt import HMSError, PrinterState
+
+    if len(code) == 16:
+        attr, word = int(code[:8], 16), int(code[8:], 16)
+        print_error = ((attr >> 16) & 0xFFFF) << 16 | (word & 0xFFFF)
+        error = HMSError(code=f"0x{word:x}", attr=attr, module=(attr >> 24) & 0xFF, severity=2, actions=list(actions))
+    else:
+        print_error = int(code, 16)
+        error = HMSError(
+            code=f"0x{print_error & 0xFFFF:x}", attr=print_error, module=3, severity=3, actions=list(actions)
+        )
+    state = PrinterState()
+    state.state = "PAUSE"
+    state.print_error = print_error
+    state.hms_errors = [error]
+    return state
+
+
+class TestTheFaultDialogAnswer:
+    """``bambu_mqtt.dialog_resume_button`` — the farm's answer to a fault pause: "Problem solved, resume"
+    where the vendored catalog lists it for the standing code, else a plain resume. Never an Ignore (it
+    skips the printer's own re-check), never CONTINUE (``ams_control resume`` — the release ladder's third
+    rung, its order unchanged). Operator-approved 2026-10-16."""
+
+    def test_every_device_and_code_of_the_catalog_answers_problem_solved_or_nothing(self):
+        from backend.app.services.bambu_mqtt import dialog_resume_button
+
+        catalog = _catalog()
+        seen = 0
+        for device, codes in catalog.items():
+            for code, actions in codes.items():
+                answer = dialog_resume_button(_dialog_state(code, actions))
+                seen += 1
+                assert answer not in _IGNORE_FAMILY, (device, code, answer)
+                assert answer != HMSAction.CONTINUE, (device, code, answer)
+                if _PROBLEM_SOLVED & set(actions):
+                    assert answer in _PROBLEM_SOLVED, (device, code, actions, answer)
+                    assert answer == next(a for a in actions if a in _PROBLEM_SOLVED), (device, code)
+                else:
+                    assert answer is None, (device, code, actions, answer)
+        assert seen > 2000  # the whole vendored catalog was walked
+
+    def test_the_extruder_overload_answers_problem_solved_on_every_model_that_lists_it(self):
+        from backend.app.services.bambu_mqtt import dialog_resume_button
+
+        listed = {device: codes["0300801E"] for device, codes in _catalog().items() if "0300801E" in codes}
+        assert "093" in listed  # the H2S fleet (serial prefix 093)
+        for device, actions in listed.items():
+            assert (
+                dialog_resume_button(_dialog_state("0300801E", actions)) == HMSAction.RESUME_PRINTING_PROBELM_SOLVED
+            ), device
+
+    def test_the_parse_attaches_the_buttons_the_chooser_reads(self):
+        """The real wire path: an H2S push with ``print_error`` 0300801E — the parse attaches the catalog's
+        buttons to the dialog's HMSError, and the chooser reads them (no second catalog read)."""
+        from backend.app.services.bambu_mqtt import dialog_resume_button
+
+        client = BambuMQTTClient(ip_address="192.168.1.100", serial_number="0938AJ611600372", access_code="12345678")
+        client._process_message({"print": {"gcode_state": "PAUSE", "print_error": 0x0300801E}})
+        assert dialog_resume_button(client.state) == HMSAction.RESUME_PRINTING_PROBELM_SOLVED
+
+    @pytest.mark.parametrize(
+        ("print_error", "actions", "expected"),
+        [
+            pytest.param(0, [HMSAction.RESUME_PRINTING_PROBELM_SOLVED], None, id="no_dialog"),
+            pytest.param(0x03000002, [HMSAction.RESUME_PRINTING_PROBELM_SOLVED], None, id="a_status_word"),
+            pytest.param(0x07008010, [HMSAction.CONTINUE, HMSAction.CHECK_ASSISTANT], None, id="continue_only"),
+            pytest.param(0x0500808C, [HMSAction.IGNORE_RESUME], None, id="ignore_only"),
+        ],
+    )
+    def test_no_problem_solved_button_is_a_plain_resume(self, print_error, actions, expected):
+        from backend.app.services.bambu_mqtt import HMSError, PrinterState, dialog_resume_button
+
+        state = PrinterState()
+        state.print_error = print_error
+        state.hms_errors = [
+            HMSError(code=f"0x{print_error & 0xFFFF:x}", attr=print_error, module=3, severity=3, actions=actions)
+        ]
+        assert dialog_resume_button(state) is expected
+
+    def test_a_dialog_with_no_parsed_entry_or_a_malformed_state_answers_none(self):
+        from backend.app.services.bambu_mqtt import PrinterState, dialog_resume_button
+
+        state = PrinterState()
+        state.print_error = 0x0300801E
+        state.hms_errors = []
+        assert dialog_resume_button(state) is None
+        assert dialog_resume_button(object()) is None
+        assert dialog_resume_button(None) is None
+
+    def test_the_answer_is_the_plate_check_press_s_frame(self):
+        """The record's ``resume(answer_dialog=True)`` publishes the SAME frame the plate-check ladder's press
+        sends (measured accepted on H2S, 014-H2S 2026-10-05): ``resume`` + the DECIMAL ``err`` + ``param:
+        "reserve"`` + the paused job's ``subtask_id`` + the action's id — and a plain resume when the dialog
+        lists no problem-solved button. The record's command stays ``resume`` either way."""
+        from backend.app.services import printer_action
+
+        client = BambuMQTTClient(ip_address="192.168.1.100", serial_number="0938AJ611600372", access_code="12345678")
+        client._client = MagicMock()
+        client.state.connected = True
+        client._process_message(
+            {"print": {"gcode_state": "PAUSE", "print_error": 0x0300801E, "subtask_id": "1038503660"}}
+        )
+        client._client.publish.reset_mock()
+
+        command = printer_action.resume(answer_dialog=True)
+        assert command.name == "resume"
+        assert command.publish(client, "2697") is True
+        frames = [json.loads(c.args[1]) for c in client._client.publish.call_args_list]
+        assert frames[0] == {
+            "print": {
+                "command": "resume",
+                "err": str(0x0300801E),
+                "param": "reserve",
+                "job_id": "1038503660",
+                "sequence_id": "2697",
+            }
+        }
+
+        client._process_message({"print": {"print_error": 0}})
+        client.state.hms_errors = []
+        client._client.publish.reset_mock()
+        assert printer_action.resume(answer_dialog=True).publish(client, "2698") is True
+        assert json.loads(client._client.publish.call_args_list[0].args[1]) == {
+            "print": {"command": "resume", "sequence_id": "2698"}
+        }
+        # The card's Resume and the K9 verb stay plain whatever the dialog says.
+        client._process_message({"print": {"print_error": 0x0300801E}})
+        client._client.publish.reset_mock()
+        assert printer_action.resume().publish(client, "2699") is True
+        assert json.loads(client._client.publish.call_args_list[0].args[1]) == {
+            "print": {"command": "resume", "sequence_id": "2699"}
+        }

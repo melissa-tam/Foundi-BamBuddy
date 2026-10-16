@@ -489,6 +489,35 @@ class TestBoundsOnANonActionAnchor:
         assert await waiter == printer_action.Unanswered("_TEST_SELF_HEAL", Reading.SENT)
         assert printer_action.outstanding(sent.action_id)
 
+    async def test_a_lanes_note_on_an_answered_action_says_so_and_writes_no_late_answer(
+        self, client: _FakeClient, clock: FakeClock, own_session_factory, caplog
+    ) -> None:
+        """F13 (2026-10-16): a lane's bound passing on an action the printer ALREADY answered is no
+        unanswered command. 014-H2S 2026-10-15: the swap round's resume (action 2699) was answered ``reached``
+        at 02:16:43, and at 02:18:13 the reader's held-success fallback logged it "unanswered after 90s".
+        The line now says ``bound passed (answered: reached)``, and ``bound_passed_at`` — "answered LATE" to its
+        readers (``dispatch_claim``) — is never written for it."""
+        await printer_action.reread_session(_PID, 1)
+        sent = await printer_action.send(_PID, printer_action.resume(), actor=printer_action.ACTOR_FARM)
+        client.state.state = "RUNNING"
+        _report(client)  # the RESUME family is answered by RUNNING
+        await _drain()
+        assert not printer_action.outstanding(sent.action_id)
+        clock.advance(90)
+
+        caplog.set_level(logging.WARNING, logger=_LOG)
+        printer_action.note_bound_passed(
+            _PID, _BOUND, lane="spool_recovery.lever=resume swapped", action_id=sent.action_id
+        )
+        await _drain()
+
+        assert _self_heal_lines(caplog) == [
+            f"[self-heal] action {sent.action_id} printer={_PID} lane=spool_recovery.lever=resume swapped "
+            "bound=_TEST_SELF_HEAL passed (answered: reached) after 30s online"
+        ]
+        row = await _row(own_session_factory, sent.action_id)
+        assert (row.answer, row.bound_passed_at) == ("reached", None)
+
     async def test_a_note_with_no_action_only_logs(self, client: _FakeClient, clock: FakeClock, caplog) -> None:
         caplog.set_level(logging.WARNING, logger=_LOG)
         printer_action.note_bound_passed(_PID, _BOUND, lane="eject-start")
