@@ -27,6 +27,16 @@ import type { PrinterStatus } from '../api/client';
 import type { EjectProfile } from '../types/ejectProfiles';
 import { useToast } from '../contexts/ToastContext';
 
+// Printer states in which a job owns the plate, so no eject may be offered. Wider than
+// RUNNING/PAUSE: PREPARE and SLICING precede the first layer but the printer is already
+// committed to the job.
+const JOB_OWNS_PLATE_STATES: readonly string[] = ['RUNNING', 'PAUSE', 'PREPARE', 'SLICING'];
+
+/** Whether a job owns the plate in this printer state — every eject door is withheld then. */
+export function jobOwnsPlate(state: string | null | undefined): boolean {
+  return JOB_OWNS_PLATE_STATES.includes(state ?? '');
+}
+
 /** Who put the part on the plate, per the backend's `foreign_plate` detail.
  *  Decides the dialog title only — the flow is identical for all three. */
 export type EjectDialogOrigin = 'foreign' | 'farm_unit' | 'declared';

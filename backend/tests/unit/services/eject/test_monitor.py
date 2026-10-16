@@ -286,6 +286,7 @@ def _occupy(printer_id: int, policy, *, source: str | None = "SUB-1") -> None:
             evidence=_deposit_evidence(),
             policy=policy,
             raise_gate=True,
+            origin="farm_deposit",
         ),
     )
 

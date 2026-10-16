@@ -809,6 +809,11 @@ def _payload(
     the farm stops the print (ISO, naive UTC), written only by the hold's deadline timer
     (:func:`note_deadline`); ``None`` while no timer has computed it.
 
+    ``release_at`` — a maintenance hold's scheduled return to service (ISO, naive UTC), the
+    row's own column, kept current by its one setter (:func:`set_release_at`); ``None`` on every
+    other kind and on a hold with no scheduled return. It is what :func:`due_releases` reads on
+    every scheduler pass, so that check costs no query.
+
     Only JSON PRIMITIVES: the WS lane serializes this dict with a bare ``json.dumps``.
     """
     ledger = ledger if ledger is not None else _LedgerProjection()
@@ -833,6 +838,7 @@ def _payload(
         "failed_command": ledger.failed_command.as_payload() if ledger.failed_command is not None else None,
         "farm_actions": [action.as_payload() for action in ledger.farm_actions],
         "deadline_at": deadline_at,
+        "release_at": incident.release_at.isoformat() if incident.release_at else None,
     }
 
 
@@ -1099,6 +1105,83 @@ def note_deadline(printer_id: int, incident_id: int, at: datetime | None) -> Non
     if not rows or incident_id not in rows:
         return
     rows[incident_id] = {**rows[incident_id], "deadline_at": at.isoformat() if at is not None else None}
+
+
+async def set_release_at(db: AsyncSession, incident_id: int, release_at: datetime | None) -> PrinterIncident | None:
+    """Set (or clear, ``None``) an OPEN maintenance hold's scheduled return to service.
+
+    THE one writer of ``printer_incident.release_at``, called ONLY from ``services/service_hold``
+    (its enter and reschedule verbs; ``test_code_quality.TestServiceHoldReleaseOwnership``): the
+    verb owns the decision (a time in the past is refused there), this store owns the record and
+    its projection. ``release_at`` is naive UTC, like ``print_queue.scheduled_time``.
+
+    Commits, then patches the row's cached projection in the same synchronous stretch, so
+    :func:`due_releases` — the per-pass reader — never reads a time the row no longer carries.
+    Returns the row, or ``None`` when it is missing, already closed, or not a ``service_hold``
+    (the column means nothing on any other kind, so nothing else may carry it).
+    """
+    incident = await db.get(PrinterIncident, incident_id)
+    if incident is None or incident.resolved_at is not None or incident.kind != KIND_SERVICE_HOLD:
+        return None
+    incident.release_at = release_at
+    await db.commit()
+    rows = _open_cache.get(incident.printer_id)
+    if rows is not None and incident.id in rows:
+        rows[incident.id] = {**rows[incident.id], "release_at": release_at.isoformat() if release_at else None}
+    logger.info(
+        "printer_incidents: printer %s incident %s release_at=%s",
+        incident.printer_id,
+        incident.id,
+        release_at.isoformat() if release_at else "-",
+    )
+    return incident
+
+
+@dataclass(frozen=True)
+class DueRelease:
+    """One open maintenance hold whose scheduled return to service has come (:func:`due_releases`)."""
+
+    printer_id: int
+    incident_id: int
+    release_at: datetime
+
+
+def _release_at_of(payload: dict) -> datetime | None:
+    """A cached ``service_hold`` projection's ``release_at`` as a datetime, or ``None``."""
+    if payload.get("kind") != KIND_SERVICE_HOLD:
+        return None
+    raw = payload.get("release_at")
+    return datetime.fromisoformat(raw) if raw else None
+
+
+def due_releases(now: datetime) -> tuple[DueRelease, ...]:
+    """Every OPEN maintenance hold whose ``release_at`` is at or before ``now`` (naive UTC).
+
+    Read off the open-row projection (:data:`_open_cache`) — no query, O(open rows) in memory —
+    because the scheduler asks it on every pass (``service_hold.release_due``). The projection is
+    rebuilt from the rows at startup (:func:`rehydrate`), so a hold whose time passed while the
+    process was down is due on the first pass after the restart. Level-triggered: a row stays due
+    until its exit closes it, and a closed row has left the projection.
+    """
+    due: list[DueRelease] = []
+    for printer_id, rows in _open_cache.items():
+        for incident_id, payload in rows.items():
+            at = _release_at_of(payload)
+            if at is not None and at <= now:
+                due.append(DueRelease(printer_id=printer_id, incident_id=incident_id, release_at=at))
+    return tuple(due)
+
+
+def release_is_due(printer_id: int, incident_id: int, now: datetime) -> bool:
+    """Does open hold ``incident_id`` still carry a ``release_at`` at or before ``now``?
+
+    The exit's re-check of a scheduled release (``service_hold.exit(due_by=)``), read off the same
+    projection as :func:`due_releases` in the synchronous stretch before the close, so a reschedule
+    or a clear that landed after the pass listed the row is honoured. DB-free.
+    """
+    payload = (_open_cache.get(printer_id) or {}).get(incident_id)
+    at = _release_at_of(payload) if payload is not None else None
+    return at is not None and at <= now
 
 
 def printer_messages_of(incident: PrinterIncident) -> tuple[PrinterMessage, ...]:

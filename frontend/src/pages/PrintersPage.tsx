@@ -6,9 +6,6 @@ import { computePopoverPosition } from '../utils/popoverPosition';
 import { mapModelCode } from '../utils/printerModels';
 import {
   inFlightEject,
-  recoverApplies,
-  recoverEffects,
-  type RecoverEffect,
 } from '../utils/printerRecovery';
 import {
   BED_TEMP_DEFAULTS,
@@ -26,24 +23,6 @@ import {
 // original bug at #1447).
 const DRYING_POPOVER_WIDTH = 240;
 const DRYING_POPOVER_ESTIMATED_HEIGHT = 320;
-
-// One line per Recover effect in the confirm dialog: the operator confirms an
-// explicit override, so the dialog states exactly what THIS printer loses — no
-// fixed list that promises effects the printer does not have. The verb's own
-// unconditional consequence (resuming the paused runs) is appended after these
-// by the dialog; it belongs to no printer state, so it is not an effect here.
-const RECOVER_EFFECT_COPY: Record<RecoverEffect, string> = {
-  plate: 'printers.quarantine.recoverEffectPlate',
-  lease: 'printers.quarantine.recoverEffectLease',
-  eject: 'printers.quarantine.recoverEffectEject',
-  quarantine: 'printers.quarantine.recoverEffectQuarantine',
-  equipment_fault: 'printers.quarantine.recoverEffectFault',
-};
-
-// Printer states in which a job owns the plate, so no eject may be offered.
-// Wider than RUNNING/PAUSE: PREPARE and SLICING precede the first layer but the
-// printer is already committed to the job.
-const ACTIVE_PRINT_STATES: readonly string[] = ['RUNNING', 'PAUSE', 'PREPARE', 'SLICING'];
 
 /**
  * An in-flight eject claim's age as mm:ss. A sweep is a ~2-minute job, so the
@@ -128,8 +107,8 @@ import {
 
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { api, discoveryApi, firmwareApi, withStreamToken, ApiError } from '../api/client';
-import { formatDateOnly, formatETA, formatDuration, formatTimeOnly, parseUTCDate } from '../utils/date';
-import type { Printer, PrinterCreate, PrinterStatus, AMSUnit, DiscoveredPrinter, FirmwareUpdateInfo, FirmwareUploadStatus, LinkedSpoolInfo, SpoolAssignment, HMSError, InventorySpool, SmartPlug, PrinterDiagnosticResult, FarmPrinterContext, SlotRecheckResult, PlateCheckAction, PlateCheckExit } from '../api/client';
+import { asDateFormat, formatDateOnly, formatETA, formatDuration, parseUTCDate, type DateFormat } from '../utils/date';
+import type { Printer, PrinterCreate, PrinterStatus, AMSUnit, DiscoveredPrinter, FirmwareUpdateInfo, FirmwareUploadStatus, LinkedSpoolInfo, SpoolAssignment, HMSError, InventorySpool, SmartPlug, PrinterDiagnosticResult, FarmPrinterContext, SlotRecheckResult } from '../api/client';
 import { findGeometry } from '../types/modelGeometries';
 import { Card, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
@@ -148,12 +127,15 @@ import { FarmUnitChip } from '../components/FarmUnitChip';
 import { hmsTone } from '../utils/hmsTone';
 import { showNoUsbChip } from '../utils/noUsbChip';
 import { HoldChip } from '../components/HoldChip';
-import { bulkResumeToast, refillingToast, refusalToast, resumeRefusalOf, tallyResumes } from '../utils/printResume';
+import { MaintenanceBanner } from '../components/maintenance/MaintenanceBanner';
+import { bulkResumeToast, tallyResumes } from '../utils/printResume';
 import { PrinterQueueWidget } from '../components/PrinterQueueWidget';
 import { AMSHistoryModal } from '../components/AMSHistoryModal';
 import { AmsBackupModal } from '../components/AmsBackupModal';
 import { HeaterHistoryModal } from '../components/HeaterHistoryModal';
 import type { HeaterSensorKind } from '../api/client';
+import type { PlateDetectionResult } from '../api/client';
+import { InfoHint } from '../components/ui/InfoHint';
 import { FilamentHoverCard, EmptySlotHoverCard, HOVER_CARD_CONTROL_FOCUS } from '../components/FilamentHoverCard';
 import type { EmptySlotBinding } from '../components/FilamentHoverCard';
 import { LinkSpoolModal } from '../components/LinkSpoolModal';
@@ -161,8 +143,11 @@ import { AssignSpoolModal } from '../components/AssignSpoolModal';
 import { NewRollModal } from '../components/NewRollModal';
 import { manualNewRollContext, type NewRollContext } from '../utils/newRollContext';
 import { ConfigureAmsSlotModal } from '../components/ConfigureAmsSlotModal';
-import { EjectPlateDialog } from '../components/EjectPlateDialog';
-import { useEjectPlate } from '../hooks/useEjectPlate';
+import { jobOwnsPlate } from '../hooks/useEjectPlate';
+import { printingQueueQuery, usePrinterActions } from '../hooks/usePrinterActions';
+import { PrinterActionPrompts } from '../components/PrinterActionPrompts';
+import { plateStatusOf } from '../utils/plateStatus';
+import { classifyPrinterStatus, STATUS_GROUP_META, STATUS_GROUP_ORDER } from '../utils/printerStatusBucket';
 import { useToast } from '../contexts/ToastContext';
 import { ChamberLight } from '../components/icons/ChamberLight';
 import { PlateClearedIcon } from '../components/icons/PlateClearedIcon';
@@ -174,7 +159,6 @@ import { getAmsLabel, getGlobalTrayId, getFillBarColor, getSpoolmanFillLevel, ge
 import { slotPresence } from '../utils/spoolBindingStatus';
 import { remainingGrams, remainingFraction } from '../utils/spoolGrams';
 import { getPrinterImage, getWifiStrength, filterCompatibleQueueItems } from '../utils/printer';
-import { coolingLabel, deriveFarmPhase } from '../utils/farmPhase';
 import { FilamentSlotCircle } from '../components/FilamentSlotCircle';
 import { slotRanOut } from '../utils/slotStatus';
 import { amsCommandToast, type AmsCommand } from '../utils/amsCommand';
@@ -1453,38 +1437,6 @@ function NozzleTemperatureControlBox({
   );
 }
 
-const STATUS_GROUP_ORDER: string[] = ['error', 'printing', 'paused', 'finished', 'idle', 'offline'];
-
-const STATUS_GROUP_META: Record<string, { labelKey: string; dot: string }> = {
-  error:    { labelKey: 'printers.status.problem',   dot: 'bg-status-error' },
-  printing: { labelKey: 'printers.status.printing',  dot: 'bg-bambu-green animate-pulse' },
-  paused:   { labelKey: 'printers.status.paused',    dot: 'bg-status-warning' },
-  finished: { labelKey: 'printers.status.finished',  dot: 'bg-blue-400' },
-  idle:     { labelKey: 'printers.status.idle',       dot: 'bg-bambu-green' },
-  offline:  { labelKey: 'printers.status.offline',   dot: 'bg-gray-400' },
-};
-
-/** Classify a printer into one of the UI status buckets. */
-function classifyPrinterStatus(
-  status: { connected: boolean; state: string | null; hms_errors?: HMSError[] } | undefined,
-): PrinterState {
-  if (!status?.connected) return 'offline';
-  // Error bucket = error-level HMS tone (fatal/serious code, or a FAILED print
-  // carrying any error). Unknown codes are no longer filtered out (H1).
-  if (hmsTone(status.hms_errors, status.state) === 'error') return 'error';
-  switch (status.state) {
-    case 'RUNNING': return 'printing';
-    case 'PAUSE':   return 'paused';
-    case 'FINISH':  return 'finished';
-    // FAILED without an error-level fault is the printer's terminal state after
-    // any unsuccessful end — including user-cancellations. Treat the same as
-    // FINISH for grouping/badging purposes; the error escalation is the
-    // early-return above.
-    case 'FAILED':  return 'finished';
-    default:        return 'idle';
-  }
-}
-
 /**
  * Get human-readable status display text for a printer.
  * Uses stg_cur_name for detailed calibration/preparation stages,
@@ -1784,6 +1736,7 @@ function PrinterCard({
   spoolmanLoading = false,
   onUnassignSpoolmanSpool,
   timeFormat = 'system',
+  dateFormat = 'system',
   cameraViewMode = 'window',
   onOpenEmbeddedCamera,
   checkPrinterFirmware = true,
@@ -1824,6 +1777,8 @@ function PrinterCard({
   spoolmanLoading?: boolean;
   onUnassignSpoolmanSpool?: (spoolmanSpoolId: number) => void;
   timeFormat?: 'system' | '12h' | '24h';
+  /** Date-entry format for the maintenance return-to-service field. */
+  dateFormat?: DateFormat;
   cameraViewMode?: 'window' | 'embedded';
   onOpenEmbeddedCamera?: (printerId: number, printerName: string) => void;
   checkPrinterFirmware?: boolean;
@@ -1850,11 +1805,6 @@ function PrinterCard({
   const { hasPermission } = useAuth();
   const [showMenu, setShowMenu] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
-  const [showRecoverConfirm, setShowRecoverConfirm] = useState(false);
-  // The one eject flow behind all three doors on this card (overflow item,
-  // plate banner, compact icon): the mutation, the hot-bed confirm, the eject
-  // dialog and the per-code refusal routing all live in the hook.
-  const ejectPlate = useEjectPlate(printer.id);
   const [deleteArchives, setDeleteArchives] = useState(true);
   const [showEditModal, setShowEditModal] = useState(false);
   const [showFileManager, setShowFileManager] = useState(false);
@@ -1865,8 +1815,6 @@ function PrinterCard({
   const [showHMSModal, setShowHMSModal] = useState(false);
   // #1762: AMS Filament Backup status / control modal — opens from the badge.
   const [amsBackupModalOpen, setAmsBackupModalOpen] = useState(false);
-  const [showStopConfirm, setShowStopConfirm] = useState(false);
-  const [showPauseConfirm, setShowPauseConfirm] = useState(false);
   const [pendingAmsCommand, setPendingAmsCommand] = useState<PendingAmsCommand | null>(null);
   const [showSpeedMenu, setShowSpeedMenu] = useState<number | null>(null);
   const [showAirductMenu, setShowAirductMenu] = useState<number | null>(null);
@@ -1874,11 +1822,6 @@ function PrinterCard({
   const [statusControlMenu, setStatusControlMenu] = useState<string | null>(null);
   const [bedJogStep, setBedJogStep] = useState<number>(10);
   const [showNotHomedModal, setShowNotHomedModal] = useState<null | { distance: number }>(null);
-  const [showResumeConfirm, setShowResumeConfirm] = useState(false);
-  // The plate-check dialog the operator is confirming "Ignore and resume" for,
-  // captured at the click: the confirm sends THAT dialog's print_error/job_id,
-  // and the backend judges whether it is still the human's turn.
-  const [pendingIgnoreResume, setPendingIgnoreResume] = useState<PlateCheckExit | null>(null);
   const [showSkipObjectsModal, setShowSkipObjectsModal] = useState(false);
   const [showUploadForPrint, setShowUploadForPrint] = useState(false);
   const [showPrinterInfo, setShowPrinterInfo] = useState(false);
@@ -1935,18 +1878,7 @@ function PrinterCard({
     savedPresetId?: string;
   } | null>(null);
   const [showFirmwareModal, setShowFirmwareModal] = useState(false);
-  const [plateCheckResult, setPlateCheckResult] = useState<{
-    is_empty: boolean;
-    confidence: number;
-    difference_percent: number;
-    message: string;
-    debug_image_url?: string;
-    needs_calibration: boolean;
-    light_warning?: boolean;
-    reference_count?: number;
-    max_references?: number;
-    roi?: { x: number; y: number; w: number; h: number };
-  } | null>(null);
+  const [plateCheckResult, setPlateCheckResult] = useState<PlateDetectionResult | null>(null);
   const [isCheckingPlate, setIsCheckingPlate] = useState(false);
   const [isCalibrating, setIsCalibrating] = useState(false);
   const [editingRoi, setEditingRoi] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
@@ -1958,6 +1890,10 @@ function PrinterCard({
     queryFn: () => api.getPrinterStatus(printer.id),
     refetchInterval: 30000, // Fallback polling, WebSocket handles real-time
   });
+
+  // The verbs this card shares with the touch view, their prompts and the one eject
+  // flow behind all three eject doors on this card (`hooks/usePrinterActions`).
+  const actions = usePrinterActions(printer, status, timeFormat);
 
   // Check for firmware updates (cached for 5 minutes, can be disabled in settings)
   const { data: firmwareInfo } = useQuery({
@@ -2169,11 +2105,7 @@ function PrinterCard({
   }, [queueItems, loadedFilamentTypes, loadedFilaments]);
 
   // Fetch currently printing queue item to show who started it (Issue #206)
-  const { data: printingQueueItems } = useQuery({
-    queryKey: ['queue', printer.id, 'printing'],
-    queryFn: () => api.getQueue(printer.id, 'printing'),
-    enabled: status?.state === 'RUNNING',
-  });
+  const { data: printingQueueItems } = useQuery(printingQueueQuery(printer.id, status?.state === 'RUNNING'));
 
   // Fetch reprint user info (for prints started via Reprint, not queue - Issue #206)
   const { data: reprintUser } = useQuery({
@@ -2197,7 +2129,7 @@ function PrinterCard({
   // is wider than RUNNING/PAUSE: PREPARE and SLICING also own the plate. Used by
   // the eject affordances ONLY — every other consumer keeps isPrintingOrPaused,
   // whose narrower meaning ("a print is showing progress") they depend on.
-  const isActivePrintState = ACTIVE_PRINT_STATES.includes(status?.state ?? '');
+  const isActivePrintState = jobOwnsPlate(status?.state);
   // The plate gate now blocks dispatch unconditionally, so the
   // clear-plate affordance must appear whenever the gate is raised — not only when
   // the global require_plate_clear convenience toggle is on. A raised gate always
@@ -2225,17 +2157,10 @@ function PrinterCard({
   // `is_active`: that flag means "this instance holds an MQTT session", and the
   // hold deliberately keeps the session up.
   const serviceHold = printer.service_hold ?? status?.service_hold ?? null;
-  const serviceHoldSince = serviceHold?.since ? parseUTCDate(serviceHold.since) : null;
   // The plate authority's in-flight eject claim, and whether its watchdog has
   // already given its verdict (no runtime owner is coming — Recover is the exit).
   const ejectClaim = inFlightEject(status);
-  // Everything Recover would clear here — the plate gate, a dispatch lease, an
-  // eject claim, the quarantine, an equipment fault whose exit IS this verb.
-  // `utils/printerRecovery` is the one origin: the menu, both banners and the
-  // confirm dialog below read this list, so the affordance and the dialog's
-  // effect lines are the same fact.
-  const recoverEffectList = recoverEffects(printer, status);
-  const canRecover = recoverApplies(recoverEffectList);
+  const canRecover = actions.canRecover;
 
   const activePrintName = status?.current_print && isPrintingOrPaused
     ? formatPrintName(status.subtask_name || status.current_print || null, status.gcode_file, t, activePlateLabel)
@@ -2248,75 +2173,15 @@ function PrinterCard({
       setRetainedPrintJob(null);
     }
   }, [activePrintName, needsPlateClear, status?.cover_url]);
-  /** The plate pill: its one-line label, its tone, and any supplementary detail. */
-  interface PlateStatusPill {
-    label: string;
-    className: string;
-    /** Supplementary constraint (never inline in the pill) — omitted when none. */
-    title?: string;
-  }
-  const plateStatus: PlateStatusPill | null = (() => {
-    if (!status?.connected) return null;
-    // A raised gate always surfaces its "not cleared" state (it blocks dispatch
-    // regardless of the toggle); the informational In-Use / Cleared pills stay
-    // gated on the toggle so pure-upstream cards aren't cluttered.
-    if (!requirePlateClear && !status.awaiting_plate_clear) return null;
-    if (isPrintingOrPaused) {
-      return {
-        label: t('printers.plateStatus.inUse'),
-        className: 'bg-blue-500/20 text-blue-400',
-      };
-    }
-    if (status.awaiting_plate_clear) {
-      // Cooldown/eject phase: while the farm's cooldown watch is
-      // armed the hold is EXPECTED — show the target vs live bed temperature
-      // instead of the alarming "not cleared" copy. The sweep runs inside the
-      // print file, so it's folded into this phase rather than shown apart.
-      const phase = deriveFarmPhase({
-        state: status.state,
-        awaiting_plate_clear: status.awaiting_plate_clear,
-        eject_watch: status.eject_watch,
-      });
-      if (phase?.kind === 'ejectDeferred') {
-        // Cooldown over, fans retired, sweep withheld by maintenance mode. The
-        // pill states where the plate is; what the operator can do about it
-        // (clear it by hand, or wait for the hold to end) rides the tooltip —
-        // and a plate still held at the nozzle plane carries the same do-not-jog
-        // constraint as the cooling pill, so it gets its own variant.
-        return phase.held
-          ? {
-              label: t('printers.phase.ejectDeferredHeld'),
-              className: 'bg-blue-500/20 text-blue-400',
-              title: t('printers.phase.ejectDeferredHeldHint'),
-            }
-          : {
-              label: t('printers.phase.ejectDeferred'),
-              className: 'bg-blue-500/20 text-blue-400',
-              title: t('printers.phase.ejectDeferredHint'),
-            };
+  // The plate pill (`utils/plateStatus`, shared with the touch tile).
+  const plateStatusView = plateStatusOf(status, requirePlateClear);
+  const plateStatus = plateStatusView
+    ? {
+        label: t(plateStatusView.label.key, plateStatusView.label.values),
+        className: plateStatusView.className,
+        title: plateStatusView.hintKey ? t(plateStatusView.hintKey) : undefined,
       }
-      if (phase?.kind === 'cooling') {
-        // A HELD plate (hold_z) keeps the toolhead parked at the chute for the
-        // whole wait — that constraint is the operator's, so it rides a tooltip
-        // on the pill rather than the pill's own one-line label. The label
-        // itself (eject line or plateau) is `coolingLabel`'s choice.
-        const cooling = coolingLabel(phase);
-        return {
-          label: t(cooling.key, { threshold: cooling.threshold }),
-          className: 'bg-blue-500/20 text-blue-400',
-          ...(phase.held ? { title: t('printers.phase.coolingHeldHint') } : {}),
-        };
-      }
-      return {
-        label: t('printers.plateStatus.notCleared'),
-        className: 'bg-yellow-500/20 text-yellow-400',
-      };
-    }
-    return {
-      label: t('printers.plateStatus.cleared'),
-      className: 'bg-status-ok/20 text-status-ok',
-    };
-  })();
+    : null;
   const plateStatusPill = plateStatus ? (
     <span
       className={`inline-flex flex-shrink-0 items-center rounded-full px-2 py-0.5 text-[10px] font-medium ${plateStatus.className}`}
@@ -2431,93 +2296,6 @@ function PrinterCard({
     onError: (error: Error) => showToast(error.message || t('printers.toast.failedToRunScript'), 'error'),
   });
 
-  // Print control mutations
-  const stopPrintMutation = useMutation({
-    mutationFn: () => api.stopPrint(printer.id),
-    onSuccess: () => {
-      showToast(t('printers.toast.printStopped'));
-      queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
-    },
-    onError: (error: Error) => showToast(error.message || t('printers.toast.failedToStopPrint'), 'error'),
-  });
-
-  const pausePrintMutation = useMutation({
-    mutationFn: () => api.pausePrint(printer.id),
-    onSuccess: () => {
-      showToast(t('printers.toast.printPaused'));
-      queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
-    },
-    onError: (error: Error) => showToast(error.message || t('printers.toast.failedToPausePrint'), 'error'),
-  });
-
-  // The resume of a paused print: over an empty toolhead the backend refills it
-  // first and answers `refilling` at once; a refusal is a typed 409
-  // (`utils/printResume` owns all three sentences).
-  const resumePrintMutation = useMutation({
-    mutationFn: () => api.resumePrint(printer.id),
-    onSuccess: (answer) => {
-      if (answer.status === 'refilling') {
-        const toast = refillingToast(answer.slot, t);
-        showToast(toast.message, toast.type);
-      } else {
-        showToast(t('printers.toast.printResumed'));
-      }
-      queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
-    },
-    onError: (error: Error) => {
-      const refusal = resumeRefusalOf(error);
-      if (refusal !== null) {
-        const toast = refusalToast(refusal, t);
-        showToast(toast.message, toast.type);
-      } else {
-        showToast(error.message || t('printers.toast.failedToResumePrint'), 'error');
-      }
-    },
-  });
-
-  // The printer's own plate-check "Ignore and resume" button. A refusal (409:
-  // the farm is still acting, or no paused plate check) arrives as the
-  // backend's `detail` in `error.message` via the client's `request` helper.
-  const ignoreResumeMutation = useMutation({
-    mutationFn: (exit: PlateCheckExit) =>
-      api.executeHMSAction(printer.id, {
-        action: 'IGNORE_RESUME' satisfies PlateCheckAction,
-        print_error: exit.print_error,
-        job_id: exit.job_id,
-      }),
-    onSuccess: () => {
-      showToast(t('printers.plateCheck.sent'));
-      queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
-    },
-    onError: (error: Error) => showToast(t('printers.plateCheck.refused', { message: error.message }), 'error'),
-  });
-
-  const clearPlateMutation = useMutation({
-    mutationFn: () => api.clearPlate(printer.id),
-    onSuccess: (result) => {
-      // One message per event: the gate release, plus the fault it closed when
-      // the verb met an equipment fault whose rule this clear satisfies.
-      const closedFault = result.incidents_closed.length > 0
-        ? ` ${t('printers.plateStatus.clearedClosedFault')}`
-        : '';
-      showToast(t('queue.clearPlateSuccess') + closedFault);
-      queryClient.setQueryData(['printerStatus', printer.id], (old: PrinterStatus | undefined) =>
-        old ? { ...old, awaiting_plate_clear: false } : old
-      );
-      queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
-      queryClient.invalidateQueries({ queryKey: ['queue', printer.id] });
-    },
-    // clear-plate is refused while an eject owns the printer (the sweep's own
-    // terminal clears the gate) — that refusal gets real copy, not backend English.
-    onError: (error: Error) =>
-      showToast(
-        error instanceof ApiError && error.code === 'eject_in_flight'
-          ? t('printers.plateStatus.ejectInFlight')
-          : error.message || t('printers.toast.failedToSendCommand'),
-        'error'
-      ),
-  });
-
   // Operator declaration that this printer's plate is occupied — raises the
   // plate-clear gate so dispatch is held. Serves the disconnected/maintenance
   // lane, where no websocket frame will follow: the optimistic flip covers the
@@ -2536,32 +2314,6 @@ function PrinterCard({
       queryClient.invalidateQueries({ queryKey: ['printers'] });
     },
     onError: (error: Error) => showToast(error.message || t('printers.toast.failedToSendCommand'), 'error'),
-  });
-
-  // Farm one-click recovery: clears the plate hold, lifts quarantine, and resumes
-  // any paused production run on this printer in a single action. Replaces the
-  // separate clear-quarantine affordance on the card.
-  const recoverMutation = useMutation({
-    mutationFn: () => api.recoverPrinter(printer.id),
-    onSuccess: (result) => {
-      // One message per event — the runs it resumed and the fault it closed are
-      // both what the operator just did.
-      const closedFault = result.incidents_closed.length > 0
-        ? ` ${t('printers.quarantine.recoverClosedFault')}`
-        : '';
-      showToast(
-        t('printers.quarantine.recoverSuccess', { count: result.runs_resumed.length }) + closedFault
-      );
-      setShowRecoverConfirm(false);
-      queryClient.setQueryData(['printerStatus', printer.id], (old: PrinterStatus | undefined) =>
-        old ? { ...old, awaiting_plate_clear: false } : old
-      );
-      queryClient.invalidateQueries({ queryKey: ['printers'] });
-      queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
-      queryClient.invalidateQueries({ queryKey: ['queue', printer.id] });
-      queryClient.invalidateQueries({ queryKey: ['production-runs'] });
-    },
-    onError: (error: Error) => showToast(error.message || t('printers.quarantine.recoverError'), 'error'),
   });
 
   const nozzleTemperatureMutation = useMutation({
@@ -2595,35 +2347,6 @@ function PrinterCard({
     onError: (error: Error) => showToast(error.message || t('printers.toast.failedToSendCommand'), 'error'),
   });
 
-  const fanSpeedMutation = useMutation({
-    mutationFn: ({ fan, speed }: { fan: 'part' | 'aux' | 'chamber'; speed: number }) =>
-      api.setFanSpeed(printer.id, fan, speed),
-    onMutate: async ({ fan, speed }) => {
-      await queryClient.cancelQueries({ queryKey: ['printerStatus', printer.id] });
-      const previousStatus = queryClient.getQueryData(['printerStatus', printer.id]);
-      const fanField = {
-        part: 'cooling_fan_speed',
-        aux: 'big_fan1_speed',
-        chamber: 'big_fan2_speed',
-      }[fan];
-      queryClient.setQueryData(['printerStatus', printer.id], (old: PrinterStatus | undefined) =>
-        old ? { ...old, [fanField]: speed } : old
-      );
-      return { previousStatus };
-    },
-    onSuccess: (result) => {
-      setStatusControlMenu(null);
-      showToast(result.message);
-      queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
-    },
-    onError: (error: Error, _variables, context) => {
-      if (context?.previousStatus) {
-        queryClient.setQueryData(['printerStatus', printer.id], context.previousStatus);
-      }
-      showToast(error.message || t('printers.toast.failedToSendCommand'), 'error');
-    },
-  });
-
   const selectExtruderMutation = useMutation({
     mutationFn: (extruder: number) => api.selectExtruder(printer.id, extruder),
     onMutate: async (extruder) => {
@@ -2644,33 +2367,6 @@ function PrinterCard({
         queryClient.setQueryData(['printerStatus', printer.id], context.previousStatus);
       }
       showToast(error.message || t('printers.toast.failedToSendCommand'), 'error');
-    },
-  });
-
-  // Chamber light mutation with optimistic update
-  const chamberLightMutation = useMutation({
-    mutationFn: (on: boolean) => api.setChamberLight(printer.id, on),
-    onMutate: async (on) => {
-      // Cancel any outgoing refetches
-      await queryClient.cancelQueries({ queryKey: ['printerStatus', printer.id] });
-      // Snapshot the previous value
-      const previousStatus = queryClient.getQueryData(['printerStatus', printer.id]);
-      // Optimistically update
-      queryClient.setQueryData(['printerStatus', printer.id], (old: typeof status) => ({
-        ...old,
-        chamber_light: on,
-      }));
-      return { previousStatus };
-    },
-    onSuccess: (_, on) => {
-      showToast(`Chamber light ${on ? 'on' : 'off'}`);
-    },
-    onError: (error: Error, _, context) => {
-      // Rollback on error
-      if (context?.previousStatus) {
-        queryClient.setQueryData(['printerStatus', printer.id], context.previousStatus);
-      }
-      showToast(error.message || t('printers.toast.failedToControlChamberLight'), 'error');
     },
   });
 
@@ -2773,48 +2469,6 @@ function PrinterCard({
     },
     onError: (error: Error) => showToast(error.message || t('printers.toast.failedToUpdateSetting'), 'error'),
   });
-
-  // Maintenance mode = the service hold. The session and every manual verb stay
-  // up; the farm takes the printer out of dispatch, auto-eject, cooldown and the
-  // recovery drivers. Entering quiesces whatever is live first, which is why the
-  // verb needs a confirm when live status shows something to stop.
-  const [confirmEnterHold, setConfirmEnterHold] = useState(false);
-  const enterServiceHoldMutation = useMutation({
-    mutationFn: () => api.enterServiceHold(printer.id),
-    onSuccess: () => {
-      setConfirmEnterHold(false);
-      queryClient.invalidateQueries({ queryKey: ['printers'] });
-      queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
-      showToast(t('printers.maintenance.toastEntered', { name: printer.name }), 'success');
-    },
-    onError: (error: Error) => showToast(error.message || t('printers.toast.failedToSendCommand'), 'error'),
-  });
-
-  const exitServiceHoldMutation = useMutation({
-    mutationFn: () => api.exitServiceHold(printer.id),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['printers'] });
-      queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
-      showToast(t('printers.maintenance.toastExited', { name: printer.name }), 'success');
-    },
-    onError: (error: Error) => showToast(error.message || t('printers.toast.failedToSendCommand'), 'error'),
-  });
-
-  // What entering the hold will stop, read off live status — the dialog body IS
-  // this list, and an empty list is why an idle printer enters on one click.
-  // A RUNNING print is NOT on it: no mode verb ends a print (only Stop does),
-  // so a printer that is merely printing enters on one click too.
-  const serviceHoldEffects: string[] = [];
-  if (ejectClaim) serviceHoldEffects.push(t('printers.maintenance.confirmEffectEject'));
-  if (status?.eject_watch) serviceHoldEffects.push(t('printers.maintenance.confirmEffectCooldown'));
-
-  const handleEnterServiceHold = () => {
-    if (serviceHoldEffects.length > 0) {
-      setConfirmEnterHold(true);
-    } else {
-      enterServiceHoldMutation.mutate();
-    }
-  };
 
   // Query for printable objects (for skip functionality)
   // Fetch when printing with 2+ objects OR when modal is open
@@ -3624,17 +3278,17 @@ function PrinterCard({
                 : 'opacity-50 cursor-not-allowed'
             }`}
             disabled={
-              enterServiceHoldMutation.isPending ||
-              exitServiceHoldMutation.isPending ||
+              actions.enterMaintenance.isPending ||
+              actions.exitMaintenance.isPending ||
               !hasPermission('printers:control')
             }
             onClick={() => {
               if (!hasPermission('printers:control')) return;
               setShowMenu(false);
               if (serviceHold) {
-                exitServiceHoldMutation.mutate();
+                actions.exitMaintenance.mutate();
               } else {
-                handleEnterServiceHold();
+                actions.requestEnterMaintenance();
               }
             }}
             title={!hasPermission('printers:control') ? t('printers.permission.noControl') : undefined}
@@ -3656,11 +3310,11 @@ function PrinterCard({
                   ? 'hover:bg-bambu-dark-tertiary'
                   : 'opacity-50 cursor-not-allowed'
               }`}
-              disabled={recoverMutation.isPending || !hasPermission('printers:recover')}
+              disabled={actions.recover.isPending || !hasPermission('printers:recover')}
               onClick={() => {
                 if (!hasPermission('printers:recover')) return;
                 setShowMenu(false);
-                setShowRecoverConfirm(true);
+                actions.ask({ kind: 'recover' });
               }}
               title={!hasPermission('printers:recover') ? t('printers.permission.noControl') : undefined}
             >
@@ -3685,11 +3339,11 @@ function PrinterCard({
                   ? 'hover:bg-bambu-dark-tertiary'
                   : 'opacity-50 cursor-not-allowed'
               }`}
-              disabled={ejectPlate.isPending || !hasPermission('printers:control')}
+              disabled={actions.eject.isPending || !hasPermission('printers:control')}
               onClick={() => {
                 if (!hasPermission('printers:control')) return;
                 setShowMenu(false);
-                ejectPlate.eject({ declareOccupied: true });
+                actions.eject.eject({ declareOccupied: true });
               }}
               title={!hasPermission('printers:control') ? t('printers.permission.noControl') : undefined}
             >
@@ -3872,12 +3526,12 @@ function PrinterCard({
               {canRecover && (
                 <button
                   type="button"
-                  onClick={(e) => { e.stopPropagation(); setShowRecoverConfirm(true); }}
-                  disabled={!hasPermission('printers:recover') || recoverMutation.isPending}
+                  onClick={(e) => { e.stopPropagation(); actions.ask({ kind: 'recover' }); }}
+                  disabled={!hasPermission('printers:recover') || actions.recover.isPending}
                   title={!hasPermission('printers:recover') ? t('printers.permission.noControl') : t('printers.quarantine.recover')}
                   className="inline-flex items-center gap-1 rounded-md border border-red-400/40 bg-red-500/20 px-2 py-1 text-xs font-medium text-red-200 hover:bg-red-500/30 transition-colors disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400 focus-visible:ring-offset-2 focus-visible:ring-offset-bambu-dark"
                 >
-                  {recoverMutation.isPending ? (
+                  {actions.recover.isPending ? (
                     <Loader2 className="w-3.5 h-3.5 animate-spin" />
                   ) : null}
                   {t('printers.quarantine.recover')}
@@ -3886,12 +3540,12 @@ function PrinterCard({
               {needsPlateClear && (
                 <button
                   type="button"
-                  onClick={(e) => { e.stopPropagation(); clearPlateMutation.mutate(); }}
-                  disabled={!hasPermission('printers:clear_plate') || clearPlateMutation.isPending}
+                  onClick={(e) => { e.stopPropagation(); actions.clearPlate.mutate(); }}
+                  disabled={!hasPermission('printers:clear_plate') || actions.clearPlate.isPending}
                   title={!hasPermission('printers:clear_plate') ? t('printers.permission.noControl') : t('printers.quarantine.markPlateCleared')}
                   className="inline-flex items-center gap-1 rounded-md border border-bambu-dark-tertiary bg-bambu-dark px-2 py-1 text-xs font-medium text-bambu-gray hover:text-white hover:bg-bambu-dark-tertiary transition-colors disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-bambu-green focus-visible:ring-offset-2 focus-visible:ring-offset-bambu-dark"
                 >
-                  {clearPlateMutation.isPending ? (
+                  {actions.clearPlate.isPending ? (
                     <Loader2 className="w-3.5 h-3.5 animate-spin" />
                   ) : null}
                   {t('printers.quarantine.markPlateCleared')}
@@ -3910,47 +3564,19 @@ function PrinterCard({
             the operator's own doing — red is reserved for a farm-raised
             quarantine. Compact collapses to the badge row. */}
         {serviceHold && (
-          <div role="status" className="mb-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-2.5">
-            <div className="flex items-start gap-2">
-              <Wrench className="w-4 h-4 flex-shrink-0 mt-0.5 text-amber-400" />
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2">
-                  <span className="inline-flex items-center rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-300">
-                    {t('printers.maintenance.badge')}
-                  </span>
-                </div>
-                {viewMode === 'expanded' && (
-                  <p className="mt-1 text-xs text-amber-200/90">
-                    {t('printers.maintenance.since', {
-                      time: serviceHoldSince
-                        ? formatTimeOnly(serviceHoldSince, timeFormat)
-                        : t('time.unknown'),
-                    })}
-                  </p>
-                )}
-              </div>
-            </div>
-            {viewMode === 'expanded' && (
-              <div className="mt-2 flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  onClick={(e) => { e.stopPropagation(); exitServiceHoldMutation.mutate(); }}
-                  disabled={!hasPermission('printers:control') || exitServiceHoldMutation.isPending}
-                  title={
-                    !hasPermission('printers:control')
-                      ? t('printers.permission.noControl')
-                      : t('printers.maintenance.exitHint')
-                  }
-                  className="inline-flex items-center gap-1 rounded-md border border-amber-400/40 bg-amber-500/20 px-2 py-1 text-xs font-medium text-amber-200 hover:bg-amber-500/30 transition-colors disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 focus-visible:ring-offset-2 focus-visible:ring-offset-bambu-dark"
-                >
-                  {exitServiceHoldMutation.isPending ? (
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  ) : null}
-                  {t('printers.maintenance.exitButton')}
-                </button>
-              </div>
-            )}
-          </div>
+          <MaintenanceBanner
+            printerId={printer.id}
+            printerName={printer.name}
+            hold={serviceHold}
+            compact={viewMode !== 'expanded'}
+            canControl={hasPermission('printers:control')}
+            exitPending={actions.exitMaintenance.isPending}
+            onExit={() => actions.exitMaintenance.mutate()}
+            reschedulePending={actions.rescheduleMaintenance.isPending}
+            onReschedule={(releaseAt) => actions.rescheduleMaintenance.mutateAsync(releaseAt)}
+            dateFormat={dateFormat}
+            timeFormat={timeFormat}
+          />
         )}
         {/* Model-mismatch banner (farm device reconciliation) — the
             device self-reported a different model than the one declared here;
@@ -4027,13 +3653,13 @@ function PrinterCard({
                     <div className="flex flex-shrink-0 items-center gap-1">
                       <button
                         type="button"
-                        onClick={() => clearPlateMutation.mutate()}
-                        disabled={clearPlateMutation.isPending || !hasPermission('printers:clear_plate')}
+                        onClick={() => actions.clearPlate.mutate()}
+                        disabled={actions.clearPlate.isPending || !hasPermission('printers:clear_plate')}
                         aria-label={markClearedTitle(hasPermission('printers:clear_plate'))}
                         className="inline-flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-md bg-yellow-500/20 border border-yellow-400/40 text-yellow-400 hover:bg-yellow-500/30 transition-colors disabled:opacity-50"
                         title={markClearedTitle(hasPermission('printers:clear_plate'))}
                       >
-                        {clearPlateMutation.isPending ? (
+                        {actions.clearPlate.isPending ? (
                           <Loader2 className="w-3 h-3 animate-spin" />
                         ) : (
                           <PlateClearedIcon className="w-3 h-3" />
@@ -4045,13 +3671,13 @@ function PrinterCard({
                       {hasPermission('printers:control') && !isActivePrintState && (
                         <button
                           type="button"
-                          onClick={() => ejectPlate.eject({ declareOccupied: true })}
-                          disabled={ejectPlate.isPending}
+                          onClick={() => actions.eject.eject({ declareOccupied: true })}
+                          disabled={actions.eject.isPending}
                           aria-label={t('printers.eject.action')}
                           className="inline-flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-md bg-red-500/20 border border-red-400/40 text-red-300 hover:bg-red-500/30 transition-colors disabled:opacity-50"
                           title={t('printers.eject.action')}
                         >
-                          {ejectPlate.isPending ? (
+                          {actions.eject.isPending ? (
                             <Loader2 className="w-3 h-3 animate-spin" />
                           ) : (
                             <Wind className="w-3 h-3" />
@@ -4071,13 +3697,13 @@ function PrinterCard({
                       <div className="flex flex-shrink-0 items-center gap-1">
                         <button
                           type="button"
-                          onClick={() => ejectPlate.eject({ declareOccupied: true })}
-                          disabled={ejectPlate.isPending}
+                          onClick={() => actions.eject.eject({ declareOccupied: true })}
+                          disabled={actions.eject.isPending}
                           aria-label={t('printers.eject.action')}
                           className="inline-flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-md bg-red-500/20 border border-red-400/40 text-red-300 hover:bg-red-500/30 transition-colors disabled:opacity-50"
                           title={t('printers.eject.action')}
                         >
-                          {ejectPlate.isPending ? (
+                          {actions.eject.isPending ? (
                             <Loader2 className="w-3 h-3 animate-spin" />
                           ) : (
                             <Wind className="w-3 h-3" />
@@ -4931,10 +4557,15 @@ function PrinterCard({
                               unit="%"
                               customMin={0}
                               customMax={100}
-                              isPending={fanSpeedMutation.isPending}
+                              isPending={actions.fanSpeed.isPending}
                               options={buildPresetOptions(fanSpeedPresets, '%')}
                               onClose={() => setStatusControlMenu(null)}
-                              onSubmit={(speed) => fanSpeedMutation.mutate({ fan: key as 'part' | 'aux' | 'chamber', speed })}
+                              onSubmit={(speed) =>
+                                actions.fanSpeed.mutate(
+                                  { fan: key as 'part' | 'aux' | 'chamber', speed },
+                                  { onSuccess: () => setStatusControlMenu(null) },
+                                )
+                              }
                             />
                           )}
                         </div>
@@ -4980,8 +4611,8 @@ function PrinterCard({
                   <div className="mt-2 flex flex-wrap items-center gap-2">
                     <button
                       type="button"
-                      onClick={(e) => { e.stopPropagation(); setShowRecoverConfirm(true); }}
-                      disabled={!hasPermission('printers:recover') || recoverMutation.isPending}
+                      onClick={(e) => { e.stopPropagation(); actions.ask({ kind: 'recover' }); }}
+                      disabled={!hasPermission('printers:recover') || actions.recover.isPending}
                       title={
                         !hasPermission('printers:recover')
                           ? t('printers.permission.noControl')
@@ -4989,7 +4620,7 @@ function PrinterCard({
                       }
                       className="inline-flex items-center gap-1 rounded-md border border-red-400/40 bg-red-500/20 px-2 py-1 text-xs font-medium text-red-200 hover:bg-red-500/30 transition-colors disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400 focus-visible:ring-offset-2 focus-visible:ring-offset-bambu-dark"
                     >
-                      {recoverMutation.isPending ? (
+                      {actions.recover.isPending ? (
                         <Loader2 className="w-3.5 h-3.5 animate-spin" />
                       ) : null}
                       {t('printers.quarantine.recover')}
@@ -5012,12 +4643,12 @@ function PrinterCard({
               <div className="mt-2 flex gap-2">
                 <button
                   type="button"
-                  onClick={() => clearPlateMutation.mutate()}
-                  disabled={clearPlateMutation.isPending || !hasPermission('printers:clear_plate')}
+                  onClick={() => actions.clearPlate.mutate()}
+                  disabled={actions.clearPlate.isPending || !hasPermission('printers:clear_plate')}
                   className="flex-1 inline-flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg bg-yellow-500/20 border border-yellow-400/40 text-yellow-400 hover:bg-yellow-500/30 transition-colors text-xs font-medium disabled:opacity-50"
                   title={markClearedTitle(hasPermission('printers:clear_plate'))}
                 >
-                  {clearPlateMutation.isPending ? (
+                  {actions.clearPlate.isPending ? (
                     <Loader2 className="w-3 h-3 animate-spin" />
                   ) : (
                     <PlateClearedIcon className="w-4 h-4" />
@@ -5034,13 +4665,13 @@ function PrinterCard({
                 {hasPermission('printers:control') && !isActivePrintState && (
                   <button
                     type="button"
-                    onClick={() => ejectPlate.eject({ declareOccupied: true })}
-                    disabled={ejectPlate.isPending}
+                    onClick={() => actions.eject.eject({ declareOccupied: true })}
+                    disabled={actions.eject.isPending}
                     aria-label={t('printers.eject.action')}
                     className="flex-1 inline-flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg bg-red-500/20 border border-red-400/40 text-red-300 hover:bg-red-500/30 transition-colors text-xs font-medium disabled:opacity-50"
                     title={t('printers.eject.action')}
                   >
-                    {ejectPlate.isPending ? (
+                    {actions.eject.isPending ? (
                       <Loader2 className="w-3 h-3 animate-spin" />
                     ) : (
                       <Wind className="w-4 h-4" />
@@ -5057,7 +4688,7 @@ function PrinterCard({
               const isRunning = status.state === 'RUNNING';
               const isPaused = status.state === 'PAUSE';
               const isPrinting = isRunning || isPaused;
-              const isControlBusy = stopPrintMutation.isPending || pausePrintMutation.isPending || resumePrintMutation.isPending || ignoreResumeMutation.isPending;
+              const isControlBusy = actions.controlBusy;
               const unavailablePrintActionClass = 'bg-bambu-dark text-bambu-gray/50 cursor-not-allowed opacity-50';
               const iconControlClass = 'flex h-8 w-8 items-center justify-center rounded-lg text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed';
               // One shape for the print-control buttons: Pause/Resume and Stop share a
@@ -5081,8 +4712,8 @@ function PrinterCard({
                     {/* Left: Secondary controls */}
                     <div className="flex flex-wrap items-center gap-2 min-w-0">
                       <button
-                        onClick={() => chamberLightMutation.mutate(!status.chamber_light)}
-                        disabled={!status.connected || chamberLightMutation.isPending || !hasPermission('printers:control')}
+                        onClick={() => actions.chamberLight.mutate(!status.chamber_light)}
+                        disabled={!status.connected || actions.chamberLight.isPending || !hasPermission('printers:control')}
                         className={`${iconControlClass} ${
                           status.chamber_light
                             ? 'bg-yellow-500/10 text-yellow-400 hover:bg-yellow-500/20'
@@ -5405,7 +5036,7 @@ function PrinterCard({
                         return (
                           <button
                             type="button"
-                            onClick={() => setPendingIgnoreResume(plateCheckExit)}
+                            onClick={() => actions.ask({ kind: 'ignoreResume', exit: plateCheckExit })}
                             disabled={ignoreUnavailable}
                             className={`${printControlShape} whitespace-nowrap ${
                               ignoreUnavailable
@@ -5425,7 +5056,7 @@ function PrinterCard({
                           const pauseUnavailable = !isPrinting || isControlBusy || !hasPermission('printers:control');
                           return (
                         <button
-                          onClick={() => isPaused ? setShowResumeConfirm(true) : setShowPauseConfirm(true)}
+                          onClick={() => isPaused ? actions.ask({ kind: 'resume' }) : actions.ask({ kind: 'pause' })}
                           disabled={pauseUnavailable}
                           className={`
                             ${printControlClass}
@@ -5449,7 +5080,7 @@ function PrinterCard({
                           const stopUnavailable = !isPrinting || isControlBusy || !hasPermission('printers:control');
                           return (
                         <button
-                          onClick={() => setShowStopConfirm(true)}
+                          onClick={() => actions.ask({ kind: 'stop' })}
                           disabled={stopUnavailable}
                           className={`
                             ${printControlClass}
@@ -6905,14 +6536,20 @@ function PrinterCard({
                 </>
               ) : (
                 <>
-                  <div className={`p-3 rounded-lg ${plateCheckResult.is_empty ? 'bg-green-500/20 border border-green-500/50' : 'bg-yellow-500/20 border border-yellow-500/50'}`}>
-                    <p className={`font-medium ${plateCheckResult.is_empty ? 'text-green-400' : 'text-yellow-400'}`}>
-                      {plateCheckResult.is_empty ? t('printers.plateDetection.plateEmpty') : t('printers.plateDetection.objectsDetected')}
-                    </p>
-                    <p className="text-sm text-bambu-gray mt-1">
-                      {t('printers.plateDetection.confidence')}: {Math.round(plateCheckResult.confidence * 100)}% | {t('printers.plateDetection.difference')}: {plateCheckResult.difference_percent.toFixed(1)}%
-                    </p>
-                  </div>
+                  {plateCheckResult.verdict === 'unknown' ? (
+                    <div className="p-3 rounded-lg bg-bambu-dark-tertiary border border-bambu-gray/50">
+                      <p className="font-medium text-bambu-gray">{t('printers.plateDetection.inconclusive')}</p>
+                    </div>
+                  ) : (
+                    <div className={`p-3 rounded-lg ${plateCheckResult.is_empty ? 'bg-green-500/20 border border-green-500/50' : 'bg-yellow-500/20 border border-yellow-500/50'}`}>
+                      <p className={`font-medium ${plateCheckResult.is_empty ? 'text-green-400' : 'text-yellow-400'}`}>
+                        {plateCheckResult.is_empty ? t('printers.plateDetection.plateEmpty') : t('printers.plateDetection.objectsDetected')}
+                      </p>
+                      <p className="text-sm text-bambu-gray mt-1">
+                        {t('printers.plateDetection.confidence')}: {Math.round(plateCheckResult.confidence * 100)}% | {t('printers.plateDetection.difference')}: {plateCheckResult.difference_percent.toFixed(1)}%
+                      </p>
+                    </div>
+                  )}
                   {plateCheckResult.debug_image_url && (
                     <div>
                       <p className="text-sm text-bambu-gray mb-2">{t('printers.plateDetection.analysisPreview')}</p>
@@ -7003,7 +6640,7 @@ function PrinterCard({
                       <Button
                         variant="ghost"
                         size="sm"
-                        onClick={() => setEditingRoi(plateCheckResult.roi || { x: 0.15, y: 0.35, w: 0.70, h: 0.55 })}
+                        onClick={() => setEditingRoi(plateCheckResult.roi)}
                       >
                         <Pencil className="w-3 h-3 mr-1" />
                         {t('common.edit')}
@@ -7090,14 +6727,16 @@ function PrinterCard({
                     </div>
                   ) : (
                     <p className="text-xs text-bambu-gray">
-                      Current: X={Math.round((plateCheckResult.roi?.x || 0.15) * 100)}%, Y={Math.round((plateCheckResult.roi?.y || 0.35) * 100)}%,
-                      W={Math.round((plateCheckResult.roi?.w || 0.70) * 100)}%, H={Math.round((plateCheckResult.roi?.h || 0.55) * 100)}%
+                      Current: X={Math.round(plateCheckResult.roi.x * 100)}%, Y={Math.round(plateCheckResult.roi.y * 100)}%,
+                      W={Math.round(plateCheckResult.roi.w * 100)}%, H={Math.round(plateCheckResult.roi.h * 100)}%
                     </p>
                   )}
                 </div>
               )}
             </div>
-            <div className="flex justify-end gap-2 p-4">
+            <div className="flex justify-end items-center gap-2 p-4">
+              {/* Both calibrate buttons move the bed to the plate-check height before the capture. */}
+              <InfoHint text={t('printers.plateDetection.calibrateMovesBed')} />
               {plateCheckResult.needs_calibration ? (
                 <>
                   <Button variant="ghost" onClick={() => closePlateCheckModal()}>
@@ -7110,7 +6749,7 @@ function PrinterCard({
                     {isCalibrating ? (
                       <>
                         <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                        Calibrating...
+                        {t('printers.plateDetection.calibratingBed')}
                       </>
                     ) : (
                       'Calibrate Empty Plate'
@@ -7120,7 +6759,7 @@ function PrinterCard({
               ) : (
                 <>
                   <Button variant="ghost" onClick={() => handleCalibratePlate()} disabled={isCalibrating}>
-                    {isCalibrating ? 'Adding...' : `Add Reference (${plateReferences?.references.length || 0}/${plateReferences?.max_references || 5})`}
+                    {isCalibrating ? t('printers.plateDetection.calibratingBed') : `Add Reference (${plateReferences?.references.length || 0}/${plateReferences?.max_references || 5})`}
                   </Button>
                   <Button onClick={() => closePlateCheckModal()}>
                     Close
@@ -7131,84 +6770,14 @@ function PrinterCard({
         </Modal>
       )}
 
-      {/* Recover & resume confirmation (farm one-click recovery). The state-derived
-          lines are one per effect this printer actually has — a fixed list promised
-          a plate hold a printer held only by an escalated fault never had. The run
-          resume is NOT state-derived: `farm_policy.recover_printer` always attempts
-          it, so it is a consequence of the VERB and stays inline as a decision input
-          (never folded into RecoverEffect, which nothing could derive it from). */}
-      {showRecoverConfirm && (
-        <ConfirmModal
-          title={t('printers.quarantine.recoverTitle')}
-          message={
-            [
-              printer.quarantine_reason
-                ? t('printers.quarantine.recoverMessageWithReason', { name: printer.name, reason: printer.quarantine_reason })
-                : t('printers.quarantine.recoverMessage', { name: printer.name }),
-              [
-                ...recoverEffectList.map((effect) => t(RECOVER_EFFECT_COPY[effect])),
-                t('printers.quarantine.recoverEffectResume'),
-              ].join('\n'),
-            ].join('\n\n')
-          }
-          confirmText={t('printers.quarantine.recover')}
-          variant="warning"
-          isLoading={recoverMutation.isPending}
-          onConfirm={() => recoverMutation.mutate()}
-          onCancel={() => setShowRecoverConfirm(false)}
-        />
-      )}
-
-      {/* Hot-bed eject confirmation: the backend refused the eject because
-          the bed is above the release threshold — or because nothing (no eject
-          line, no chamber reading) says it is cool enough; the operator
-          explicitly confirms sweeping while hot, and we re-call with
-          allow_hot=true. Mirrors the recover-confirm's Esc/click-outside/Enter
-          semantics via the shared ConfirmModal. */}
-      {ejectPlate.hotConfirm && (
-        <ConfirmModal
-          title={t('printers.eject.confirmTitle')}
-          message={
-            ejectPlate.hotConfirm.thresholdC === null
-              ? t('printers.eject.confirmBodyNoLine', {
-                  bed: Math.round(ejectPlate.hotConfirm.bedC),
-                })
-              : t('printers.eject.confirmBody', {
-                  bed: Math.round(ejectPlate.hotConfirm.bedC),
-                  threshold: Math.round(ejectPlate.hotConfirm.thresholdC),
-                })
-          }
-          confirmText={t('printers.eject.confirm')}
-          cancelText={t('printers.eject.cancel')}
-          variant="danger"
-          isLoading={ejectPlate.isPending}
-          onConfirm={ejectPlate.confirmHot}
-          onCancel={ejectPlate.closeHotConfirm}
-        />
-      )}
-
-      {/* The one eject dialog. The backend answers `foreign_plate` whenever the
-          sweep needs operator input — a plate the farm never dispatched, a
-          plate the operator just declared occupied, or a farm unit worth an
-          eyeball — and the hook routes every one of those here rather than
-          into a dead-end toast. Confirm re-calls with the chosen profile and
-          height; a subsequent bed_hot 409 hands off to the hot-bed confirm. */}
-      {ejectPlate.dialog && (
-        <EjectPlateDialog
-          printerId={printer.id}
-          dialog={ejectPlate.dialog}
-          ejectProfiles={ejectPlate.ejectProfiles}
-          selectedProfileId={ejectPlate.selectedProfileId}
-          onSelectProfile={ejectPlate.setSelectedProfileId}
-          heightInput={ejectPlate.heightInput}
-          onHeightChange={ejectPlate.setHeightInput}
-          heightValid={ejectPlate.heightValid}
-          error={ejectPlate.dialogError}
-          isPending={ejectPlate.isPending}
-          onConfirm={ejectPlate.confirmDialog}
-          onClose={ejectPlate.closeDialog}
-        />
-      )}
+      {/* The shared verbs' prompts (stop, pause, resume, ignore and resume,
+          recover, enter maintenance, the eject flow): one copy with the touch view. */}
+      <PrinterActionPrompts
+        printer={printer}
+        actions={actions}
+        dateFormat={dateFormat}
+        timeFormat={timeFormat}
+      />
 
       {/* Power On Confirmation */}
       {showPowerOnConfirm && smartPlug && (
@@ -7222,22 +6791,6 @@ function PrinterCard({
             setShowPowerOnConfirm(false);
           }}
           onCancel={() => setShowPowerOnConfirm(false)}
-        />
-      )}
-
-      {/* Entering maintenance mode. The dialog exists only to show what the hold
-          will STOP, so it is raised only when live status shows something to
-          stop — an idle printer enters on one click. The body is that list and
-          nothing else; the consequences of each stop ride the bullets. */}
-      {confirmEnterHold && (
-        <ConfirmModal
-          title={t('printers.maintenance.confirmTitle', { name: printer.name })}
-          message={serviceHoldEffects.join('\n')}
-          confirmText={t('printers.maintenance.menuEnter')}
-          variant="warning"
-          isLoading={enterServiceHoldMutation.isPending}
-          onConfirm={() => enterServiceHoldMutation.mutate()}
-          onCancel={() => setConfirmEnterHold(false)}
         />
       )}
 
@@ -7279,42 +6832,6 @@ function PrinterCard({
         />
       )}
 
-      {/* Stop Print Confirmation. Farm-aware copy:
-          when the printing item belongs to a production run, spell out the
-          operator-stop consequence — no auto-retry, run holds this printer. */}
-      {showStopConfirm && (
-        <ConfirmModal
-          title={t('printers.confirm.stopTitle')}
-          message={
-            printingQueueItems?.[0]?.production_run_id != null
-              ? `${t('printers.confirm.stopMessage', { name: printer.name })}\n\n${t('queue.farm.stopConsequence')}`
-              : t('printers.confirm.stopMessage', { name: printer.name })
-          }
-          confirmText={t('printers.confirm.stopButton')}
-          variant="danger"
-          onConfirm={() => {
-            stopPrintMutation.mutate();
-            setShowStopConfirm(false);
-          }}
-          onCancel={() => setShowStopConfirm(false)}
-        />
-      )}
-
-      {/* Pause Print Confirmation */}
-      {showPauseConfirm && (
-        <ConfirmModal
-          title={t('printers.confirm.pauseTitle')}
-          message={t('printers.confirm.pauseMessage', { name: printer.name })}
-          confirmText={t('printers.confirm.pauseButton')}
-          variant="default"
-          onConfirm={() => {
-            pausePrintMutation.mutate();
-            setShowPauseConfirm(false);
-          }}
-          onCancel={() => setShowPauseConfirm(false)}
-        />
-      )}
-
       {/* Manual AMS command while a recovery driver is live — sending it ends the driver. */}
       {pendingAmsCommand !== null && (
         <ConfirmModal
@@ -7329,46 +6846,6 @@ function PrinterCard({
           onCancel={() => setPendingAmsCommand(null)}
         />
       )}
-
-      {/* Resume Print Confirmation */}
-      {showResumeConfirm && (
-        <ConfirmModal
-          title={t('printers.confirm.resumeTitle')}
-          message={t('printers.confirm.resumeMessage', { name: printer.name })}
-          confirmText={t('printers.confirm.resumeButton')}
-          variant="default"
-          onConfirm={() => {
-            resumePrintMutation.mutate();
-            setShowResumeConfirm(false);
-          }}
-          onCancel={() => setShowResumeConfirm(false)}
-        />
-      )}
-
-      {/* Plate check "Ignore and resume" confirmation. The consequence lives
-          here, never on the card; the deadline line names when the farm stops
-          the print if the window runs out. */}
-      {pendingIgnoreResume && (() => {
-        const deadline = parseUTCDate(pendingIgnoreResume.deadline_at);
-        const body = t('printers.plateCheck.confirmBody');
-        return (
-          <ConfirmModal
-            title={t('printers.plateCheck.confirmTitle')}
-            message={
-              deadline
-                ? `${body}\n\n${t('printers.plateCheck.confirmDeadline', { time: formatTimeOnly(deadline, timeFormat) })}`
-                : body
-            }
-            confirmText={t('printers.plateCheck.ignoreResume')}
-            variant="warning"
-            onConfirm={() => {
-              ignoreResumeMutation.mutate(pendingIgnoreResume);
-              setPendingIgnoreResume(null);
-            }}
-            onCancel={() => setPendingIgnoreResume(null)}
-          />
-        );
-      })()}
 
       {/* Bed Jog — not-homed warning (Studio-style) */}
       {showNotHomedModal && (
@@ -10036,6 +9513,7 @@ export function PrintersPage() {
                       spoolmanLoading={spoolmanSpoolsLoading || spoolmanAssignmentsLoading}
                       onUnassignSpoolmanSpool={(id) => unassignSpoolmanMutation.mutate(id)}
                       timeFormat={settings?.time_format || 'system'}
+                      dateFormat={asDateFormat(settings?.date_format)}
                       cameraViewMode={settings?.camera_view_mode || 'window'}
                       onOpenEmbeddedCamera={(id, name) => setEmbeddedCameraPrinters(prev => new Map(prev).set(id, { id, name }))}
                       checkPrinterFirmware={settings?.check_printer_firmware !== false}
@@ -10087,6 +9565,7 @@ export function PrintersPage() {
                 tempFair: Number(settings.ams_temp_fair) || 35,
               } : undefined}
               timeFormat={settings?.time_format || 'system'}
+              dateFormat={asDateFormat(settings?.date_format)}
               cameraViewMode={settings?.camera_view_mode || 'window'}
               onOpenEmbeddedCamera={(id, name) => setEmbeddedCameraPrinters(prev => new Map(prev).set(id, { id, name }))}
               checkPrinterFirmware={settings?.check_printer_firmware !== false}

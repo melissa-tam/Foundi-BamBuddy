@@ -46,7 +46,7 @@ import asyncio
 import logging
 from collections.abc import Callable, Coroutine
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast, get_args
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -56,11 +56,14 @@ from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.services.job_identity import same_job
 from backend.app.services.plate_occupancy import (
+    ORIGIN_UNKNOWN,
     CooldownEject,
     EscalationOnly,
     OccupancyPolicy,
     OccupancyView,
     PendingEject,
+    PlateOrigin,
+    PlateRefusal,
     plate_occupancy,
 )
 from backend.app.services.printer_manager import printer_manager
@@ -72,6 +75,21 @@ logger = logging.getLogger(__name__)
 # page is the last rung of the never-armless ladder (2026-07-18/07-21), reached only
 # after the core has already tried the escalation-only floor.
 _ESCALATION_SOURCE_DETAIL = "occupancy policy failed to arm"
+
+# The gate's ORIGIN is persisted with the gate it describes, in two columns: ``printers.plate_gate_origin``
+# (the value) and ``printers.plate_gate_origin_subtask_id`` (the gate source id it was written for). The
+# second is the point: a previous build (a rollback window) raises and releases gates without ever
+# writing either column, so an origin left behind by an earlier gate must not be read as the origin of
+# the gate that stands now (:func:`_hydrated_origin`).
+_ORIGINS: frozenset[str] = frozenset(get_args(PlateOrigin))
+
+
+def _hydrated_origin(origin: str | None, written_for: str | None, gate_subtask_id: str | None) -> PlateOrigin:
+    """The standing gate's origin as stored: the value when it names a known origin AND was written for
+    this gate's source id (``None`` for a source-less gate on both sides), else ``unknown`` (fail closed)."""
+    if origin not in _ORIGINS or written_for != gate_subtask_id:
+        return ORIGIN_UNKNOWN
+    return cast("PlateOrigin", origin)
 
 
 # ---------------------------------------------------------------------------
@@ -186,13 +204,20 @@ async def _hydrate_plates() -> int:
     try:
         async with async_session() as db:
             result = await db.execute(
-                select(Printer.id, Printer.plate_gate_subtask_id, Printer.quarantined).where(
-                    Printer.awaiting_plate_clear.is_(True)
-                )
+                select(
+                    Printer.id,
+                    Printer.plate_gate_subtask_id,
+                    Printer.quarantined,
+                    Printer.plate_gate_origin,
+                    Printer.plate_gate_origin_subtask_id,
+                ).where(Printer.awaiting_plate_clear.is_(True))
             )
-            for printer_id, gate_subtask_id, quarantined in result.all():
-                policy = await _startup_policy(db, printer_id, gate_subtask_id, bool(quarantined))
-                plate_occupancy.hydrate_plate(printer_id, source_subtask_id=gate_subtask_id, policy=policy)
+            for printer_id, gate_subtask_id, quarantined, stored_origin, written_for in result.all():
+                origin = _hydrated_origin(stored_origin, written_for, gate_subtask_id)
+                policy = await _startup_policy(db, printer_id, gate_subtask_id, bool(quarantined), origin)
+                plate_occupancy.hydrate_plate(
+                    printer_id, source_subtask_id=gate_subtask_id, policy=policy, origin=origin
+                )
                 hydrated.append(printer_id)
                 if isinstance(policy, CooldownEject):
                     cooldowns += 1
@@ -210,9 +235,15 @@ async def _hydrate_plates() -> int:
 
 
 async def _startup_policy(
-    db: AsyncSession, printer_id: int, gate_subtask_id: str | None, quarantined: bool
+    db: AsyncSession, printer_id: int, gate_subtask_id: str | None, quarantined: bool, origin: PlateOrigin
 ) -> OccupancyPolicy:
     """What happens next to a plate that survived a restart. The re-arm ladder.
+
+    A plate the printer's own plate check REFUSED tops it (its stored origin, ``plate_refused``):
+    the refusal is rebuilt — ``EscalationOnly(refusal=PlateRefusal(hydrated=True))``, without the printer's
+    words, which never survive a restart — so the plate stays a refused plate (human-clear, its hourly
+    reminder naming the refusal) instead of degrading to a generic deposit. ``hydrated`` arms its watch
+    silently: the refusal's page went out when the gate was raised, and every deploy restarts the farm.
 
     Ports ``monitor.rearm_on_startup``'s decision (``monitor.py:872-934``) into a
     policy, with :func:`~backend.app.services.eject.monitor.should_rearm` still the one
@@ -232,6 +263,10 @@ async def _startup_policy(
     the plate for inspection and the approval flow arms its own FA eject.
     """
     from backend.app.services.eject.monitor import should_rearm
+
+    if origin == "plate_refused":
+        logger.info("[occupancy-store] p%s gate is a REFUSED plate — refusal rebuilt, escalation-only", printer_id)
+        return EscalationOnly(refusal=PlateRefusal(hydrated=True))
 
     if quarantined:
         logger.info(
@@ -332,11 +367,13 @@ def persist_occupancy(printer_id: int, view: OccupancyView) -> None:
 
     plate_occupied = view.plate_occupied
     plate_source = view.plate_source_subtask_id
+    plate_origin = view.plate_origin
     _schedule(
         lambda: _write_occupancy(
             printer_id,
             plate_occupied=plate_occupied,
             plate_source_subtask_id=plate_source,
+            plate_origin=plate_origin,
             stamp=stamp,
         ),
         name=f"occupancy-persist-p{printer_id}",
@@ -348,6 +385,7 @@ async def _write_occupancy(
     *,
     plate_occupied: bool,
     plate_source_subtask_id: str | None,
+    plate_origin: PlateOrigin | None,
     stamp: tuple[int, datetime] | None,
 ) -> None:
     """The scheduled half of :func:`persist_occupancy`. Retried, and never fatal.
@@ -355,6 +393,10 @@ async def _write_occupancy(
     ``run_with_retry`` is the fork's SQLite single-writer cure (a fresh session per
     attempt); a failure is a WARNING and nothing else, because an occupancy fact that
     already happened must not be unwound by a DB hiccup.
+
+    THE one writer of ``printers.plate_gate_origin`` and ``plate_gate_origin_subtask_id``: the gate's
+    origin and the source id it was written for, in the same write as the gate; both NULL whenever the
+    gate is down.
     """
     from backend.app.core.database import run_with_retry
 
@@ -362,8 +404,11 @@ async def _write_occupancy(
         printer = await db.get(Printer, printer_id)
         if printer is not None:
             printer.awaiting_plate_clear = plate_occupied
-            # The gate's source is meaningful only while it is raised.
+            # The gate's source and origin are meaningful only while it is raised.
             printer.plate_gate_subtask_id = plate_source_subtask_id if plate_occupied else None
+            stamped = plate_occupied and plate_origin is not None
+            printer.plate_gate_origin = plate_origin if stamped else None
+            printer.plate_gate_origin_subtask_id = plate_source_subtask_id if stamped else None
         await _apply_eject_stamp(db, printer_id, stamp)
         await db.commit()
 

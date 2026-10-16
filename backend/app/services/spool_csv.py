@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.models.color_catalog import ColorCatalogEntry
 from backend.app.models.spool import Spool
 from backend.app.schemas.spool import SpoolCreate
+from backend.app.services.spool_defaults import default_label_weight_g, label_weight_for
 
 # Fixed CSV header, in output order. Round-trips cleanly: export writes these
 # columns, import expects them. `material` is the only required field; the rest
@@ -71,10 +72,6 @@ _FORMULA_INJECTION_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 # the field (falls back to the schema default / None).
 _INT_COLUMNS = {"label_weight", "nozzle_temp_min", "nozzle_temp_max", "low_stock_threshold_pct"}
 _FLOAT_COLUMNS = {"cost_per_kg", "weight_used"}
-
-# label_weight default, pulled from the schema so the weight_used bounds check
-# stays in sync if the schema default ever changes.
-_DEFAULT_LABEL_WEIGHT = SpoolCreate.model_fields["label_weight"].default
 
 
 class ImportRowResult(BaseModel):
@@ -306,6 +303,9 @@ async def parse_and_validate(raw_bytes: bytes, db: AsyncSession) -> ImportPrevie
     # issuing a SELECT per row.
     catalog = await _load_color_catalog(db)
     existing_keys = await _load_existing_spool_keys(db)
+    # A row with no label_weight cell imports at the default-weight setting — read once
+    # for the whole file, applied per row by the owner's rule.
+    default_label_g = await default_label_weight_g(db)
 
     def cell(row: list[str], field: str) -> str:
         idx = col_index.get(field)
@@ -375,13 +375,15 @@ async def parse_and_validate(raw_bytes: bytes, db: AsyncSession) -> ImportPrevie
                         row_error = f"{field} must be a number (got '{value}')"
                         break
 
+        if row_error is None:
+            data["label_weight"] = label_weight_for(data.get("label_weight"), default_g=default_label_g)
+
         # Bounds check: weight_used must be within [0, label_weight]. The schema
         # accepts any float, so a negative or over-full value would otherwise be
-        # imported silently. label_weight falls back to the schema default when
-        # the CSV omits it.
+        # imported silently.
         if row_error is None and "weight_used" in data:
             used = data["weight_used"]
-            label = data.get("label_weight", _DEFAULT_LABEL_WEIGHT)
+            label = data["label_weight"]
             if used < 0:
                 row_error = f"weight_used cannot be negative (got {used})"
             elif used > label:

@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom';
-import { Printer, Archive, ListOrdered, BarChart3, Cloud, Settings, Sun, Moon, Monitor, ChevronLeft, ChevronRight, Keyboard, Github, ArrowUpCircle, Wrench, FolderKanban, FolderOpen, X, Menu, Info, Plug, Bug, LogOut, Key, Loader2, Disc3, ShieldAlert, Globe, PackageOpen, Package, Factory, type LucideIcon } from 'lucide-react';
+import { Printer, Archive, ListOrdered, BarChart3, Cloud, Settings, Sun, Moon, Monitor, ChevronLeft, ChevronRight, Keyboard, Github, ArrowUpCircle, Wrench, FolderKanban, FolderOpen, X, Menu, Info, Plug, Bug, LogOut, Key, Loader2, Disc3, ShieldAlert, Globe, PackageOpen, Package, Factory, Tablet, type LucideIcon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useTheme } from '../contexts/ThemeContext';
 import { KeyboardShortcutsModal } from './KeyboardShortcutsModal';
@@ -11,11 +11,8 @@ import { api, supportApi, pendingUploadsApi, type Permission } from '../api/clie
 import { getIconByName } from './IconPicker';
 import { useIsSidebarCompact } from '../hooks/useIsSidebarCompact';
 import { useColorCatalogVersion } from '../hooks/useColorCatalogVersion';
-import { useUnknownTagPrompt } from '../hooks/useUnknownTagPrompt';
-import { useRespoolPrompt } from '../hooks/useRespoolPrompt';
-import { useTaglessFreshPrompt } from '../hooks/useTaglessFreshPrompt';
-import { usePendingPromptSync } from '../hooks/usePendingPromptSync';
-import { NewRollModal } from './NewRollModal';
+import { GlobalPrompts } from './GlobalPrompts';
+import { isTouchExit } from './touch/touchExit';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import { CardHeader, CardContent } from './Card';
@@ -42,6 +39,7 @@ interface NavItem {
 
 export const defaultNavItems: NavItem[] = [
   { id: 'printers', to: '/', icon: Printer, labelKey: 'nav.printers' },
+  { id: 'touch', to: '/touch', icon: Tablet, labelKey: 'touch.nav' },
   { id: 'inventory', to: '/inventory', icon: Disc3, labelKey: 'nav.inventory' },
   { id: 'archives', to: '/archives', icon: Archive, labelKey: 'nav.archives' },
   { id: 'queue', to: '/queue', icon: ListOrdered, labelKey: 'nav.queue' },
@@ -102,12 +100,6 @@ export function Layout() {
   const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<string | null>(() =>
     sessionStorage.getItem('dismissedUpdateVersion')
   );
-  const [plateDetectionAlert, setPlateDetectionAlert] = useState<{
-    printer_id: number;
-    printer_name: string;
-    message: string;
-  } | null>(null);
-
   // Check for updates
   const { data: versionInfo } = useQuery({
     queryKey: ['version'],
@@ -120,21 +112,6 @@ export function Layout() {
     queryFn: api.getSettings,
     staleTime: 5 * 60 * 1000, // 5 minutes
   });
-
-  // Unknown-spool prompt — raises a per-slot persistent toast when the AMS
-  // reports a tag with no inventory match (only when `auto_add_unknown_rfid` is
-  // off). Side-effect only; the hook owns its toasts.
-  useUnknownTagPrompt();
-  const respoolPrompt = useRespoolPrompt();
-  // Tagless fresh-roll prompt — raises a per-slot persistent toast when a
-  // non-RFID roll is consumed past half its label weight. Side-effect only;
-  // the hook owns its toasts, and its review modal is rendered below.
-  const taglessFreshPrompt = useTaglessFreshPrompt();
-  // Prompt recovery lane — replays every still-unanswered per-slot prompt on
-  // load and on each websocket reconnect, so a broadcast this tab was not
-  // connected for is not lost forever. Must sit AFTER the prompt hooks: it
-  // dispatches the very window events they listen for.
-  usePendingPromptSync();
 
   // Fetch default sidebar order via a public endpoint (no settings:read needed)
   const { data: defaultSidebarData } = useQuery({
@@ -300,6 +277,7 @@ export function Layout() {
     // every non-admin user even though the underlying API accepts their
     // request (#1755).
     const navPermissions: Record<string, Permission | Permission[]> = {
+      touch: 'printers:read',
       archives: ['archives:read', 'archives:read_own', 'archives:read_all'],
       queue: ['queue:read', 'queue:read_own', 'queue:read_all'],
       stats: 'stats:read',
@@ -379,8 +357,11 @@ export function Layout() {
     }
   };
 
-  // Redirect to default view on initial load
+  // Redirect to default view on initial load. Leaving the touch view through its
+  // Exit lands on the Printers page as asked, even when the touch view is the
+  // default view (`TOUCH_EXIT_STATE`).
   useEffect(() => {
+    if (isTouchExit(location.state)) hasRedirected.current = true;
     if (!hasRedirected.current && location.pathname === '/') {
       const defaultView = getDefaultView();
       if (defaultView !== '/') {
@@ -388,7 +369,7 @@ export function Layout() {
         navigate(defaultView, { replace: true });
       }
     }
-  }, [location.pathname, navigate]);
+  }, [location.pathname, location.state, navigate]);
 
   useEffect(() => {
     localStorage.setItem('sidebarExpanded', String(sidebarExpanded));
@@ -413,25 +394,6 @@ export function Layout() {
       setMobileDrawerOpen(false);
     }
   }, [location.pathname, isSidebarCompact]);
-
-  // Listen for plate detection warnings (objects on plate, print paused)
-  // Only show to users with printers:control permission
-  useEffect(() => {
-    const handlePlateNotEmpty = (event: Event) => {
-      // Only show alert to users who can control printers
-      if (!hasPermission('printers:control')) {
-        return;
-      }
-      const detail = (event as CustomEvent).detail;
-      setPlateDetectionAlert({
-        printer_id: detail.printer_id,
-        printer_name: detail.printer_name,
-        message: detail.message,
-      });
-    };
-    window.addEventListener('plate-not-empty', handlePlateNotEmpty);
-    return () => window.removeEventListener('plate-not-empty', handlePlateNotEmpty);
-  }, [hasPermission]);
 
   // Global keyboard shortcuts for navigation
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
@@ -923,18 +885,9 @@ export function Layout() {
         <Outlet />
       </main>
 
-      {/* One form, two prompt queues: each hook normalises its own WS payload
-          into the shared `NewRollContext`, so the dialog never learns which
-          question raised it. */}
-      <NewRollModal
-        context={respoolPrompt.activeContext}
-        onClose={respoolPrompt.closeModal}
-      />
-
-      <NewRollModal
-        context={taglessFreshPrompt.activeContext}
-        onClose={taglessFreshPrompt.closeModal}
-      />
+      {/* The app-wide prompts (spool prompts, new-roll dialogs, plate alert), one
+          owner shared with the touch view's shell. */}
+      <GlobalPrompts />
 
       {/* Keyboard Shortcuts Modal */}
       {showShortcuts && (
@@ -950,41 +903,6 @@ export function Layout() {
             }
           }).filter(Boolean) as { type: 'nav' | 'external'; label: string; labelKey?: string }[]}
         />
-      )}
-
-      {/* Plate Detection Alert Modal */}
-      {plateDetectionAlert && (
-        <Modal
-          onClose={() => setPlateDetectionAlert(null)}
-          labelledBy="plate-detection-alert-title"
-          size="sm"
-          closeOnOverlay={false}
-          overlayZIndex="z-[100]"
-          className="animate-in fade-in zoom-in duration-200"
-        >
-            <div className="p-6 text-center">
-              <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-yellow-500/20 flex items-center justify-center">
-                <svg className="w-10 h-10 text-yellow-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                </svg>
-              </div>
-              <h2 id="plate-detection-alert-title" className="text-xl font-bold text-yellow-400 mb-2">
-                {t('plateAlert.title')}
-              </h2>
-              <p className="text-lg text-white mb-2">
-                {plateDetectionAlert.printer_name}
-              </p>
-              <p className="text-bambu-gray mb-6">
-                {t('plateAlert.message')}
-              </p>
-              <button
-                onClick={() => setPlateDetectionAlert(null)}
-                className="w-full py-3 px-6 bg-yellow-500 hover:bg-yellow-600 text-black font-semibold rounded-lg transition-colors"
-              >
-                {t('plateAlert.understand')}
-              </button>
-            </div>
-        </Modal>
       )}
 
       {/* Change Password Modal */}

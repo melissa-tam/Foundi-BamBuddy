@@ -42,7 +42,12 @@ export interface SpoolFormData {
   spoolman_filament_id: number | null;
 }
 
-export const defaultFormData: SpoolFormData = {
+/**
+ * A blank Add spool form. `labelWeight` is the `default_spool_weight_g` setting
+ * (`hooks/useDefaultSpoolWeight`); 0 while it is unresolved, which the backend
+ * reads as "no figure" and fills from the same setting.
+ */
+export const newSpoolFormData = (labelWeight: number): SpoolFormData => ({
   material: '',
   subtype: '',
   brand: '',
@@ -50,7 +55,7 @@ export const defaultFormData: SpoolFormData = {
   rgba: '808080FF',
   extra_colors: '',
   effect_type: '',
-  label_weight: 1000,
+  label_weight: labelWeight,
   core_weight: 250,
   core_weight_catalog_id: null,
   weight_used: 0,
@@ -61,7 +66,7 @@ export const defaultFormData: SpoolFormData = {
   low_stock_threshold_pct: null,
   location_id: null,
   spoolman_filament_id: null,
-};
+});
 
 // Printer with calibrations type
 export interface PrinterWithCalibrations {

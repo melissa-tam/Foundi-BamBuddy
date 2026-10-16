@@ -908,6 +908,8 @@ def _disposition(**overrides):
         "source_subtask_id": "SUB-1",
         "evidence": _evidence(),
         "raise_gate": True,
+        "stop_verdict": None,
+        "reconciled": False,
     }
     kwargs.update(overrides)
     return terminal_disposition(**kwargs)
@@ -992,6 +994,47 @@ class TestTerminalDisposition:
         identity (the manual eject's matched lane would pair it with that unit)."""
         disposition = _disposition(refusal=PlateRefusal(messages=()), source_subtask_id="SUB-9")
         assert disposition.source_subtask_id is None
+
+
+class TestTheGateOrigin:
+    """WHY a terminal's gate stands (``plate_occupancy.PlateOrigin``), decided from the same resolved
+    inputs as its policy — most specific first. The auto plate-clear's eligibility reads it."""
+
+    @pytest.mark.parametrize(
+        ("overrides", "origin"),
+        [
+            ({}, "farm_deposit"),  # an id-confirmed farm unit with a profile: a cooldown eject is armed
+            ({"first_article": True}, "first_article"),
+            ({"eject_profile_id": None, "stop_verdict": "operator_ui"}, "operator_stop"),
+            ({"verdict": "foreign", "item_id": None, "stop_verdict": "operator_screen"}, "operator_stop"),
+            ({"verdict": "foreign", "item_id": None, "eject_profile_id": None}, "foreign"),
+            ({"verdict": "none", "item_id": None, "eject_profile_id": None}, "unattributed"),
+            ({"eject_profile_id": None}, "farm_unit"),
+            ({"verdict": "fallback"}, "farm_unit"),
+            ({"refusal": PlateRefusal(messages=())}, "plate_refused"),
+            ({"reconciled": True}, "restart"),
+            ({"reconciled": True, "refusal": PlateRefusal(messages=())}, "plate_refused"),
+            ({"verdict": "foreign", "item_id": None, "reconciled": True}, "restart"),
+        ],
+    )
+    def test_the_origin(self, overrides, origin):
+        assert _disposition(**overrides).origin == origin
+
+    def test_both_inputs_are_required(self):
+        """A caller that forgot whether the terminal was a restart's would read its deposit as a normal
+        leftover: there is no default."""
+        kwargs = {
+            "verdict": "foreign",
+            "item_id": None,
+            "eject_profile_id": None,
+            "first_article": False,
+            "batch_id": None,
+            "source_subtask_id": "F-1",
+            "evidence": _evidence(),
+            "raise_gate": True,
+        }
+        with pytest.raises(TypeError):
+            terminal_disposition(**kwargs)
 
 
 class TestUpgradeToForeignAutoEject:

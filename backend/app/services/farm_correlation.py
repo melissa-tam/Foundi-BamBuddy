@@ -94,6 +94,7 @@ from backend.app.services.plate_occupancy import (
     EscalationOnly,
     ForeignAutoEject,
     OccupancyPolicy,
+    PlateOrigin,
     PlateRefusal,
     TerminalDisposition,
     plate_occupancy,
@@ -220,6 +221,8 @@ def terminal_disposition(
     source_subtask_id: str | None,
     evidence: DepositEvidence,
     raise_gate: bool,
+    stop_verdict: str | None,
+    reconciled: bool,
     refusal: PlateRefusal | None = None,
 ) -> TerminalDisposition:
     """Classify one terminal into the single value the occupancy authority consumes.
@@ -258,6 +261,12 @@ def terminal_disposition(
     the job was stopped at its pre-print check, so there is no part of its to sweep
     against — carrying its id would let the manual eject's matched lane pair the plate
     with that unit and sweep what the printer refused.
+
+    The gate's ORIGIN (``plate_occupancy.PlateOrigin``) is decided here too, from the same
+    resolved inputs (:func:`_terminal_origin`): ``stop_verdict`` is the terminal's stop verdict
+    (``classify_stop``; ``None`` when nobody stopped it) and ``reconciled`` says the terminal is the
+    downtime reconcile's synthesis — a job nobody saw end, after a restart. Both are required: an
+    origin derived from an input a caller forgot would read a restart's deposit as a normal leftover.
     """
     policy: OccupancyPolicy
     if refusal is not None:
@@ -274,7 +283,46 @@ def terminal_disposition(
         evidence=evidence,
         policy=policy,
         raise_gate=raise_gate,
+        origin=_terminal_origin(
+            verdict=verdict,
+            item_id=item_id,
+            first_article=first_article,
+            stop_verdict=stop_verdict,
+            reconciled=reconciled,
+            refused=refusal is not None,
+            policy=policy,
+        ),
     )
+
+
+def _terminal_origin(
+    *,
+    verdict: str,
+    item_id: int | None,
+    first_article: bool,
+    stop_verdict: str | None,
+    reconciled: bool,
+    refused: bool,
+    policy: OccupancyPolicy,
+) -> PlateOrigin:
+    """WHY a terminal's gate stands, most specific first: the printer refused the plate; nobody saw
+    the job end (a restart); the farm armed a cooldown eject for its own unit; a first article; an
+    operator's stop; a print the farm did not dispatch; a deposit no unit owns; any other farm unit."""
+    if refused:
+        return "plate_refused"
+    if reconciled:
+        return "restart"
+    if isinstance(policy, CooldownEject):
+        return "farm_deposit"
+    if first_article and item_id is not None:
+        return "first_article"
+    if stop_verdict in OPERATOR_STOP_VERDICTS:
+        return "operator_stop"
+    if verdict == "foreign":
+        return "foreign"
+    if item_id is None:
+        return "unattributed"
+    return "farm_unit"
 
 
 def upgrade_to_foreign_auto_eject(printer_id: int, profile_id: int) -> bool:

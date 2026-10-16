@@ -411,6 +411,15 @@ class JobEvidence(JobExtent):
         )
 
 
+def _percent_of_label(grams: float, spool: Spool) -> int:
+    """A charge as a percent of the row's OWN label; 0 when the row has no label.
+
+    Never an invented label figure (``test_code_quality.TestSpoolLabelWeightOwnership``).
+    """
+    label = spool.label_weight or 0
+    return round(grams / label * 100) if label > 0 else 0
+
+
 def _spool_color_to_hex(rgba: str | None) -> str | None:
     """Normalise a ``Spool.rgba`` value (``RRGGBBAA`` hex, no ``#``) to the
     ``#RRGGBB`` form archives store in ``filament_color``.
@@ -2420,7 +2429,7 @@ async def _track_from_3mf(
                 spool.weight_used = (spool.weight_used or 0) + tray_grams
                 spool.last_used = datetime.now(timezone.utc)
 
-                percent = round(tray_grams / (spool.label_weight or 1000) * 100)
+                percent = _percent_of_label(tray_grams, spool)
 
                 cost = None
                 cost_per_kg = spool.cost_per_kg if spool.cost_per_kg is not None else default_filament_cost
@@ -2558,7 +2567,7 @@ async def _track_from_3mf(
         spool.weight_used = (spool.weight_used or 0) + weight_grams
         spool.last_used = datetime.now(timezone.utc)
 
-        percent = round(weight_grams / (spool.label_weight or 1000) * 100)
+        percent = _percent_of_label(weight_grams, spool)
 
         # Calculate cost for this usage
         cost = None

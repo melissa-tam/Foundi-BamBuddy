@@ -3908,6 +3908,13 @@ async def run_migrations(conn):
     # raised the current gate, so the cooldown monitor only auto-clears a gate it
     # can positively attribute to a farm eject job on restart.
     await _safe_execute(conn, "ALTER TABLE printers ADD COLUMN plate_gate_subtask_id VARCHAR(64)")
+    # Migration (2026-10-16, auto plate-clear): WHY the current gate was raised, and the gate source
+    # id that origin was written for (``plate_occupancy_store``). Additive, nullable, catalog-only on
+    # both dialects. A gate raised before them (or by the previous build after a rollback) carries no
+    # origin written for its source id and hydrates ``unknown`` — never a normal leftover — and the
+    # previous build ignores both columns.
+    await _safe_execute(conn, "ALTER TABLE printers ADD COLUMN plate_gate_origin VARCHAR(32)")
+    await _safe_execute(conn, "ALTER TABLE printers ADD COLUMN plate_gate_origin_subtask_id VARCHAR(64)")
 
     # Farm notification event toggles on notification providers.
     for _col, _sqlite_default, _pg_default in (
@@ -4738,6 +4745,12 @@ async def run_migrations(conn):
     # by the next witnessed clear or pause).
     await _safe_execute(conn, "ALTER TABLE printer_incident ADD COLUMN fault_layer INTEGER")
     await _safe_execute(conn, "ALTER TABLE printer_incident ADD COLUMN rearmed_at DATETIME")
+    # Migration (2026-10-16, scheduled return to service): a maintenance hold's ``release_at`` — when
+    # the scheduler's pass ends the hold through its one exit verb (``service_hold.release_due``).
+    # Additive, nullable, catalog-only: a row written before it reads NULL (no scheduled return; the
+    # hold ends on Exit, as before), and the previous build ignores the column on a rollback (a held
+    # printer stays held until Exit). DATETIME is valid on both dialects, like ``rearmed_at``.
+    await _safe_execute(conn, "ALTER TABLE printer_incident ADD COLUMN release_at DATETIME")
 
     # Migration (2026-09-23, 012-H2S shape 41): the recovery driver's STEP LEDGER, a 3NF
     # child of printer_incident. The wire cannot restate which verbs a driver already

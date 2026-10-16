@@ -45,9 +45,10 @@ class TestInventoryCsvExport:
     async def test_export_excludes_archived(self, async_client: AsyncClient, db_session: AsyncSession):
         from datetime import datetime, timezone
 
-        db_session.add(Spool(material="PLA", brand="Active", color_name="A", rgba="ffffffff"))
+        db_session.add(Spool(label_weight=1000, material="PLA", brand="Active", color_name="A", rgba="ffffffff"))
         db_session.add(
             Spool(
+                label_weight=1000,
                 material="PETG",
                 brand="Archived",
                 color_name="B",
@@ -281,7 +282,7 @@ class TestInventoryCsvReviewFollowups:
     async def test_export_neutralises_formula_injection(self, async_client: AsyncClient, db_session: AsyncSession):
         # A note starting with '=' must be prefixed with a quote on export so
         # spreadsheets don't evaluate it as a formula.
-        db_session.add(Spool(material="PLA", color_name="X", rgba="ffffffff", note="=SUM(A1:A9)"))
+        db_session.add(Spool(label_weight=1000, material="PLA", color_name="X", rgba="ffffffff", note="=SUM(A1:A9)"))
         await db_session.commit()
 
         response = await async_client.get("/api/v1/inventory/spools/export")
@@ -294,7 +295,7 @@ class TestInventoryCsvReviewFollowups:
     ):
         # The export quote-guard must be undone on import so a formula-looking
         # note survives export → import unchanged (no accumulating leading ').
-        db_session.add(Spool(material="PLA", color_name="X", rgba="ffffffff", note="=SUM(A1)"))
+        db_session.add(Spool(label_weight=1000, material="PLA", color_name="X", rgba="ffffffff", note="=SUM(A1)"))
         await db_session.commit()
 
         export = await async_client.get("/api/v1/inventory/spools/export")
@@ -452,6 +453,7 @@ class TestInventoryCsvExtraColumns:
         # export → import cycle (would otherwise be silently lost).
         db_session.add(
             Spool(
+                label_weight=1000,
                 material="PLA",
                 brand="Polymaker",
                 color_name="White",
@@ -496,7 +498,9 @@ class TestInventoryCsvDuplicateWarning:
     async def test_existing_spool_flags_duplicate_but_still_imports(
         self, async_client: AsyncClient, db_session: AsyncSession
     ):
-        db_session.add(Spool(material="PLA", brand="Polymaker", color_name="Jade White", rgba="e8e8e8ff"))
+        db_session.add(
+            Spool(label_weight=1000, material="PLA", brand="Polymaker", color_name="Jade White", rgba="e8e8e8ff")
+        )
         await db_session.commit()
 
         # Row 1 matches the existing spool (case-insensitively); row 2 is new.

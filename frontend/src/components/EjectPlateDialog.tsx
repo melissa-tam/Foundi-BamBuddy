@@ -43,6 +43,8 @@ interface EjectPlateDialogProps {
   isPending: boolean;
   onConfirm: () => void;
   onClose: () => void;
+  /** Touch sizing (the touch view): a wider sheet, 56 px fields and 64 px buttons. */
+  touch?: boolean;
 }
 
 export function EjectPlateDialog({
@@ -58,8 +60,11 @@ export function EjectPlateDialog({
   isPending,
   onConfirm,
   onClose,
+  touch = false,
 }: EjectPlateDialogProps) {
   const { t } = useTranslation();
+  const fieldSize = touch ? 'min-h-[56px] text-base' : 'text-sm';
+  const buttonSize = touch ? 'min-h-[64px] text-base' : 'py-2 text-xs';
   const titleId = `eject-dialog-title-${printerId}`;
   const profileId = `eject-dialog-profile-${printerId}`;
   const printName = dialog.printName || t('printers.eject.foreignUnknownPrint');
@@ -75,7 +80,7 @@ export function EjectPlateDialog({
     <Modal
       onClose={onClose}
       labelledBy={titleId}
-      widthClass="max-w-md"
+      widthClass={touch ? 'max-w-xl' : 'max-w-md'}
       closeOnOverlay={!isPending}
       dismissDisabled={isPending}
       className="p-5"
@@ -119,7 +124,7 @@ export function EjectPlateDialog({
               value={heightInput}
               onChange={(e) => onHeightChange(e.target.value)}
               disabled={isPending}
-              className="text-sm disabled:opacity-50"
+              className={`${fieldSize} disabled:opacity-50`}
             />
             <span className="text-xs text-bambu-gray flex-shrink-0">mm</span>
           </div>
@@ -134,7 +139,7 @@ export function EjectPlateDialog({
           value={selectedProfileId ?? ''}
           onChange={(e) => onSelectProfile(e.target.value ? Number(e.target.value) : null)}
           disabled={isPending || ejectProfiles.length === 0}
-          className="w-full px-3 py-2 rounded-lg text-sm bg-bambu-dark border border-bambu-dark-tertiary text-white focus:outline-none focus:border-bambu-green disabled:opacity-50"
+          className={`w-full px-3 py-2 rounded-lg ${fieldSize} bg-bambu-dark border border-bambu-dark-tertiary text-white focus:outline-none focus:border-bambu-green disabled:opacity-50`}
         >
           {ejectProfiles.length === 0 ? (
             <option value="">{t('printers.eject.foreignNoProfiles')}</option>
@@ -160,7 +165,7 @@ export function EjectPlateDialog({
           type="button"
           onClick={onClose}
           disabled={isPending}
-          className="flex-1 px-3 py-2 rounded-lg text-xs font-medium bg-bambu-dark text-bambu-gray hover:bg-bambu-dark-tertiary transition-colors disabled:opacity-50"
+          className={`flex-1 px-3 ${buttonSize} rounded-lg font-medium bg-bambu-dark text-bambu-gray hover:bg-bambu-dark-tertiary transition-colors disabled:opacity-50`}
         >
           {t('printers.eject.cancel')}
         </button>
@@ -168,7 +173,7 @@ export function EjectPlateDialog({
           type="button"
           onClick={onConfirm}
           disabled={isPending || selectedProfileId === null || !heightValid}
-          className="flex-1 inline-flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-medium bg-red-500/20 border border-red-400/40 text-red-300 hover:bg-red-500/30 transition-colors disabled:opacity-50"
+          className={`flex-1 inline-flex items-center justify-center gap-2 px-3 ${buttonSize} rounded-lg font-medium bg-red-500/20 border border-red-400/40 text-red-300 hover:bg-red-500/30 transition-colors disabled:opacity-50`}
         >
           {isPending ? (
             <Loader2 className="w-3 h-3 animate-spin" />

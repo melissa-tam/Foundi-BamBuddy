@@ -230,7 +230,7 @@ def reset_printer_manager_process_state():
     if a ``wired*`` fixture is ever made module-scoped this will wipe it
     between that module's tests.
     """
-    from backend.app.services import printer_action, spool_recovery
+    from backend.app.services import camera_stills, plate_autoclear, printer_action, spool_recovery
     from backend.app.services.printer_manager import printer_manager
 
     # The record's per-printer process memory (outstanding actions, the last operator AMS command,
@@ -238,13 +238,19 @@ def reset_printer_manager_process_state():
     # driver slots, the sampler's edges, the resume tasks (``spool_recovery._reset_state`` resets the
     # store with it) — are keyed by the same restarting printer ids: an open row one file left for
     # printer 1 makes ``printer_incidents.hold_blocks_dispatch(1)`` refuse a LATER file's dispatch.
+    # The camera still cache (its per-printer locks are bound to the loop that first awaited them)
+    # and the auto plate-clear's episodes are keyed the same way.
     _reset_printer_manager(printer_manager)
     printer_action._reset_state()
     spool_recovery._reset_state()
+    camera_stills._reset_state()
+    plate_autoclear._reset_state()
     yield
     _reset_printer_manager(printer_manager)
     printer_action._reset_state()
     spool_recovery._reset_state()
+    camera_stills._reset_state()
+    plate_autoclear._reset_state()
 
 
 @pytest.fixture(autouse=True)

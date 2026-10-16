@@ -56,6 +56,14 @@ class Printer(Base):
     # or a pre-migration NULL) never auto-clears — it waits for a human. NULLed
     # whenever the gate is cleared.
     plate_gate_subtask_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # WHY the current gate was raised (a ``plate_occupancy.PlateOrigin`` value), and the gate's
+    # source subtask id that origin was written FOR (NULL for a source-less gate). Written only by
+    # the occupancy store's persist (``plate_occupancy_store._write_occupancy``), both in the same
+    # write as the gate, and NULLed with it on release. At hydration an origin that is missing, not
+    # in the vocabulary, or written for another source id than ``plate_gate_subtask_id`` (a gate a
+    # previous build raised without writing these columns) reads ``unknown``.
+    plate_gate_origin: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    plate_gate_origin_subtask_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Farm failure policy: when a printer racks up N consecutive
     # terminal failures on farm jobs it is quarantined — excluded from ALL
     # dispatch until an operator clears it. quarantine_reason holds the

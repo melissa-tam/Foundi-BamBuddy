@@ -305,7 +305,7 @@ describe('SettingsPage', () => {
 
       expect(localStorage.setItem).toHaveBeenCalledWith(
         SIDEBAR_ORDER_KEY,
-        JSON.stringify(['ext-7', 'printers', 'inventory', 'archives', 'queue', 'projects', 'files', 'makerworld', 'profiles', 'eject-profiles', 'skus', 'production-runs', 'maintenance', 'stats', 'settings']),
+        JSON.stringify(['ext-7', 'printers', 'touch', 'inventory', 'archives', 'queue', 'projects', 'files', 'makerworld', 'profiles', 'eject-profiles', 'skus', 'production-runs', 'maintenance', 'stats', 'settings']),
       );
     });
 
@@ -347,7 +347,7 @@ describe('SettingsPage', () => {
       expect(localStorage.setItem).toHaveBeenCalledWith(SIDEBAR_HIDDEN_SYSTEM_ITEMS_KEY, JSON.stringify([]));
       expect(localStorage.setItem).toHaveBeenCalledWith(
         SIDEBAR_ORDER_KEY,
-        JSON.stringify(['printers', 'inventory', 'archives', 'queue', 'projects', 'files', 'makerworld', 'profiles', 'eject-profiles', 'skus', 'production-runs', 'maintenance', 'stats', 'settings', 'ext-7']),
+        JSON.stringify(['printers', 'touch', 'inventory', 'archives', 'queue', 'projects', 'files', 'makerworld', 'profiles', 'eject-profiles', 'skus', 'production-runs', 'maintenance', 'stats', 'settings', 'ext-7']),
       );
 
       const settingsRow = screen.getAllByText('Settings')
@@ -409,6 +409,7 @@ describe('SettingsPage', () => {
       expect(JSON.parse(defaultSidebarOrderPayload!)).toEqual({
         order: [
           'printers',
+          'touch',
           'inventory',
           'archives',
           'queue',
@@ -1590,6 +1591,48 @@ describe('SettingsPage', () => {
       await waitFor(() => {
         expect(screen.getByText('Farm Production')).toBeInTheDocument();
       });
+    });
+  });
+
+  describe('Farm tab — automatic plate clear', () => {
+    const openFarmTab = async (user: ReturnType<typeof userEvent.setup>) => {
+      await waitFor(() => {
+        expect(screen.getByText('Farm')).toBeInTheDocument();
+      });
+      await user.click(screen.getByText('Farm'));
+    };
+
+    it('renders off by default with one label and the mechanism in its tooltip', async () => {
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await openFarmTab(user);
+
+      const toggle = (await screen.findByRole('checkbox', {
+        name: en.settings.farmPlateAutoclear,
+      })) as HTMLInputElement;
+      // mockSettings omits the key: the backend default (off) shows.
+      expect(toggle.checked).toBe(false);
+
+      const help = en.settings.farmPlateAutoclearHelp;
+      await user.click(screen.getByRole('button', { name: help }));
+      expect(await screen.findByRole('tooltip')).toHaveTextContent(help);
+    });
+
+    it('saves the switch turned on', async () => {
+      const bodies: Array<Record<string, unknown>> = [];
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          const body = (await request.json()) as Record<string, unknown>;
+          bodies.push(body);
+          return HttpResponse.json({ ...mockSettings, ...body });
+        }),
+      );
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await openFarmTab(user);
+
+      await user.click(await screen.findByRole('checkbox', { name: en.settings.farmPlateAutoclear }));
+      await waitFor(() => expect(bodies.at(-1)?.farm_plate_autoclear_enabled).toBe(true), { timeout: 5000 });
     });
   });
 

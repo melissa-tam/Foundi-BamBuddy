@@ -22,12 +22,12 @@ import { render, screen, fireEvent } from '@testing-library/react';
 import { I18nextProvider } from 'react-i18next';
 import i18n from '../../../i18n';
 import { ColorSection } from '../../../components/spool-form/ColorSection';
-import { defaultFormData } from '../../../components/spool-form/types';
+import { newSpoolFormData } from '../../../components/spool-form/types';
 
-type FormData = typeof defaultFormData;
+type FormData = ReturnType<typeof newSpoolFormData>;
 
 function renderWithFormData(initial: Partial<FormData>) {
-  const formData = { ...defaultFormData, ...initial };
+  const formData = { ...newSpoolFormData(1000), ...initial };
   const updateField = vi.fn();
 
   const { rerender } = render(
@@ -50,7 +50,7 @@ function renderWithFormData(initial: Partial<FormData>) {
      * record after the modal mounts.
      */
     updateFormData: (next: Partial<FormData>) => {
-      const merged = { ...defaultFormData, ...initial, ...next };
+      const merged = { ...newSpoolFormData(1000), ...initial, ...next };
       rerender(
         <I18nextProvider i18n={i18n}>
           <ColorSection

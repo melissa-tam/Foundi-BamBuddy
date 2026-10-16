@@ -42,6 +42,9 @@ import { SpoolBuddySettingsPage } from './pages/spoolbuddy/SpoolBuddySettingsPag
 import { SpoolBuddyCalibrationPage } from './pages/spoolbuddy/SpoolBuddyCalibrationPage';
 import { SpoolBuddyWriteTagPage } from './pages/spoolbuddy/SpoolBuddyWriteTagPage';
 import { SpoolBuddyInventoryPage } from './pages/spoolbuddy/SpoolBuddyInventoryPage';
+import { TouchLayout } from './components/touch/TouchLayout';
+import { TouchCameraView } from './components/touch/TouchCameraView';
+import { TouchPage } from './pages/TouchPage';
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null; errorInfo: ErrorInfo | null }> {
   state = { error: null as Error | null, errorInfo: null as ErrorInfo | null };
 
@@ -185,6 +188,13 @@ function App() {
 
                 {/* Stream overlay page - standalone for OBS/streaming embeds, no auth required */}
                 <Route path="/overlay/:printerId" element={<StreamOverlayPage />} />
+
+                {/* Touch view: full screen, no sidebar (the SpoolBuddy kiosk precedent),
+                    gated by the read permission the Printers page's data needs. */}
+                <Route element={<ProtectedRoute><WebSocketProvider><PermissionRoute permission="printers:read"><TouchLayout /></PermissionRoute></WebSocketProvider></ProtectedRoute>}>
+                  <Route path="touch" element={<TouchPage />} />
+                  <Route path="touch/camera/:printerId" element={<TouchCameraView />} />
+                </Route>
 
                 {/* SpoolBuddy kiosk UI */}
                 <Route element={<ProtectedRoute><WebSocketProvider><SpoolBuddyLayout /></WebSocketProvider></ProtectedRoute>}>

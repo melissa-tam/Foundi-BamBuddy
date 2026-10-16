@@ -29,6 +29,8 @@ interface ConfirmModalProps {
   // used for opt-in checkboxes (e.g. the "Also remove from statistics"
   // toggle in the archive delete confirmation, #1343).
   children?: ReactNode;
+  /** Touch sizing (the touch view): a wider sheet, larger copy and 64 px buttons. */
+  touch?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -46,6 +48,7 @@ export function ConfirmModal({
   loadingText,
   confirmDisabled = false,
   children,
+  touch = false,
   onConfirm,
   onCancel,
 }: ConfirmModalProps) {
@@ -71,11 +74,14 @@ export function ConfirmModal({
   };
 
   const styles = variantStyles[variant];
+  // Button's own sizes reset the touch floor at `md:`, so the touch floor is restated there.
+  const buttonSize = touch ? 'min-h-[64px] md:min-h-[64px] text-base' : '';
 
   return (
     <Modal
       onClose={onCancel}
       size="sm"
+      widthClass={touch ? 'max-w-xl' : undefined}
       className={cardClassName}
       overlayZIndex={overlayZIndex}
       dismissDisabled={isLoading}
@@ -87,8 +93,8 @@ export function ConfirmModal({
             <AlertTriangle className="w-6 h-6" />
           </div>
           <div className="flex-1">
-            <h3 id={titleId} className="text-lg font-semibold text-white mb-2">{title}</h3>
-            <p className="text-bambu-gray text-sm whitespace-pre-line">{message}</p>
+            <h3 id={titleId} className={`${touch ? 'text-xl' : 'text-lg'} font-semibold text-white mb-2`}>{title}</h3>
+            <p className={`text-bambu-gray ${touch ? 'text-base' : 'text-sm'} whitespace-pre-line`}>{message}</p>
             {children && <div className="mt-4">{children}</div>}
           </div>
         </div>
@@ -96,14 +102,14 @@ export function ConfirmModal({
           <Button
             variant={cancelVariant ?? 'secondary'}
             onClick={onCancel}
-            className="flex-1"
+            className={`flex-1 ${buttonSize}`}
             disabled={isLoading}
           >
             {resolvedCancelText}
           </Button>
           <Button
             onClick={onConfirm}
-            className={`flex-1 ${styles.button}`}
+            className={`flex-1 ${buttonSize} ${styles.button}`}
             disabled={isLoading || confirmDisabled}
           >
             {isLoading ? (

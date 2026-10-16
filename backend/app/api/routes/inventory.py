@@ -61,6 +61,7 @@ from backend.app.services.spool_csv import (
     parse_and_validate,
     serialize,
 )
+from backend.app.services.spool_defaults import resolve_label_weight
 from backend.app.services.spoolman import SpoolmanClient, get_spoolman_client, init_spoolman_client
 from backend.app.services.tray_fields import parse_int_field, tray_presence_from_dict, tray_presence_map
 from backend.app.utils.tag_normalization import normalize_tag_uid, normalize_tray_uuid
@@ -927,7 +928,10 @@ async def import_spools_csv(
     created = 0
     for row in preview.rows:
         if row.status == "valid" and row.spool is not None:
-            db.add(Spool(**row.spool))
+            # ``parse_and_validate`` filled every valid row's label (a CSV figure, else the
+            # default-weight setting); the construction names it.
+            fields = dict(row.spool)
+            db.add(Spool(label_weight=fields.pop("label_weight"), **fields))
             created += 1
 
     if created:
@@ -1007,10 +1011,12 @@ async def create_spool(
 ):
     """Create a new spool."""
     try:
-        payload = await prepare_internal_spool_payload(db, spool_data.model_dump(), set(spool_data.model_fields_set))
+        payload = await prepare_internal_spool_payload(
+            db, spool_data.model_dump(exclude={"label_weight"}), set(spool_data.model_fields_set)
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    spool = Spool(**payload)
+    spool = Spool(**payload, label_weight=await resolve_label_weight(db, spool_data.label_weight))
     db.add(spool)
     await db.commit()
     await db.refresh(spool)
@@ -1029,11 +1035,12 @@ async def bulk_create_spools(
     spools = []
     fields_set = set(data.spool.model_fields_set)
     try:
-        payload = await prepare_internal_spool_payload(db, data.spool.model_dump(), fields_set)
+        payload = await prepare_internal_spool_payload(db, data.spool.model_dump(exclude={"label_weight"}), fields_set)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    label_weight = await resolve_label_weight(db, data.spool.label_weight)
     for _ in range(data.quantity):
-        spool = Spool(**payload)
+        spool = Spool(**payload, label_weight=label_weight)
         db.add(spool)
         spools.append(spool)
     await db.commit()
@@ -2356,7 +2363,13 @@ async def sync_weights_from_ams(
             skipped += 1
             continue
 
-        lw = spool.label_weight or 1000
+        # A remain% scales the row's OWN label; a row with no label has nothing to scale
+        # (never an invented figure — ``TestSpoolLabelWeightOwnership``).
+        lw = spool.label_weight or 0
+        if lw <= 0:
+            logger.info("AMS weight sync: spool %d has no label weight — skipping", spool.id)
+            skipped += 1
+            continue
         new_used = round(lw * (100 - remain_val) / 100.0, 1)
         old_used = spool.weight_used or 0
 

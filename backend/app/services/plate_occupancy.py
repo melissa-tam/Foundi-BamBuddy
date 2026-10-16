@@ -185,6 +185,41 @@ EjectPurpose = Literal["fa", "production", "manual"]
 
 EjectOutcome = Literal["completed", "unverified"]
 
+# WHY a gate was raised — the gate's ORIGIN (2026-10-16). Set at every construction of a
+# :class:`PlateOccupied` (no default: each raiser states it), carried for the gate's whole life
+# (a policy change — a first-article approval, a foreign plate identified, a repair to the
+# escalation floor — never changes WHY the plate is occupied), persisted with the gate by the
+# store (``printers.plate_gate_origin``) and read back at hydration. The vocabulary is closed:
+# the auto plate-clear's eligibility table (``services/plate_autoclear``) has one line per value,
+# and a value it does not name raises there.
+PlateOrigin = Literal[
+    # A print the farm did not dispatch left a deposit (screen, Studio, LAN — correlation ``foreign``).
+    "foreign",
+    # An operator stopped a print (UI or screen) and the job had deposited.
+    "operator_stop",
+    # A deposit no unit owns (correlation ``none``).
+    "unattributed",
+    # The operator's "Mark plate occupied" (and the eject verb's declaration on a gate-down printer).
+    "operator_declared",
+    # A farm unit's part awaiting the eject the farm armed for it (a cooldown eject).
+    "farm_deposit",
+    # A first article held for inspection.
+    "first_article",
+    # Any other farm unit's deposit: a failure, a unit with no eject profile, a fallback attribution.
+    "farm_unit",
+    # The printer's own plate check refused the plate (a ``plate_refused`` terminal).
+    "plate_refused",
+    # An eject the watchdog stopped, or one whose terminal could not be verified.
+    "eject_unverified",
+    # An eject the printer never started.
+    "eject_never_started",
+    # A terminal nobody saw: the downtime reconcile synthesised it after a restart.
+    "restart",
+    # A gate rebuilt at startup whose stored origin is missing or names another gate.
+    "unknown",
+]
+ORIGIN_UNKNOWN: PlateOrigin = "unknown"
+
 
 # ---------------------------------------------------------------------------
 # Value types
@@ -376,12 +411,19 @@ class PlateRefusal:
     words for the check, recorded on the hold row when it tripped — the stop that ended
     the job wiped them off the printer, so this is the only place they survive.
 
-    MEMORY-ONLY by design: the plate record's durable mirror is the gate flag and the
-    source id, so after a restart the gate stands (fail closed) without its cause and
-    the escalation page falls back to the generic sentence.
+    The refusal survives a restart through the gate's ORIGIN (``plate_refused``, persisted
+    with the gate): the startup ladder rebuilds ``EscalationOnly(refusal=PlateRefusal(hydrated=True))``,
+    so the hourly reminder still names a refusal. The printer's WORDS do not survive — ``messages`` is
+    memory-only, and a rebuilt refusal carries none.
+
+    ``hydrated`` marks a refusal rebuilt at startup rather than raised by a terminal — provenance, as
+    on :class:`PendingEject`. Its page went out when the gate was first raised, so its watch arms
+    SILENTLY (``eject.monitor.watch_gate_escalation_only``): every deploy restarts the farm, and a page
+    per restart per standing refused plate would be noise. The hourly reminder keeps paging it.
     """
 
     messages: tuple[PrinterMessage, ...] = ()
+    hydrated: bool = False
 
 
 @dataclass(frozen=True)
@@ -513,11 +555,15 @@ class PlateOccupied:
     (see :meth:`PlateOccupancy._fan_out`) rewrites it to :class:`EscalationOnly`
     IN PLACE, because a repair must not re-enter the transition machinery it is
     running inside.
+
+    ``origin`` is WHY the gate was raised (:data:`PlateOrigin`) — required, so every
+    construction states it; never changed by a policy change.
     """
 
     source_subtask_id: str | None
     policy: OccupancyPolicy
     since: datetime
+    origin: PlateOrigin
 
 
 @dataclass(frozen=True)
@@ -528,6 +574,7 @@ class TerminalDisposition:
     ``require_plate_clear`` / farm-involvement raise guard); only the type lives
     here, so the core stays free of the correlation lane. ``raise_gate`` carries
     that guard: a non-farm terminal with the toggle off still raises nothing.
+    ``origin`` is the gate's :data:`PlateOrigin` should this terminal raise one.
     """
 
     queue_item_id: int | None
@@ -535,6 +582,7 @@ class TerminalDisposition:
     evidence: DepositEvidence
     policy: OccupancyPolicy
     raise_gate: bool
+    origin: PlateOrigin
 
 
 @dataclass
@@ -573,6 +621,9 @@ class OccupancyView:
     plate_source_subtask_id: str | None
     plate_policy: OccupancyPolicy | None
     plate_since: datetime | None
+    # WHY the gate stands (:data:`PlateOrigin`), None on a clear plate. Carried so the store
+    # persists it with the gate and the auto plate-clear reads it off the same view.
+    plate_origin: PlateOrigin | None
     lease_unit_id: int | None
     lease_active: bool | None
     lease_age_s: float | None
@@ -751,17 +802,28 @@ class PlateOccupancy:
 
     # -- startup hydration --------------------------------------------------
 
-    def hydrate_plate(self, printer_id: int, source_subtask_id: str | None, policy: OccupancyPolicy) -> None:
+    def hydrate_plate(
+        self,
+        printer_id: int,
+        source_subtask_id: str | None,
+        policy: OccupancyPolicy,
+        *,
+        origin: PlateOrigin = ORIGIN_UNKNOWN,
+    ) -> None:
         """Rebuild an occupied plate from the durable columns at startup.
 
         Not a transition: it asserts a fact that was already true before this
         process existed, so it must not be persisted back or broadcast, and above
         all must not kick the scheduler. The policy driver still runs — the whole
         point of rebuilding the plate is to re-arm what happens to it.
+
+        ``origin`` is the gate's stored origin as the store read it back (bound to the gate's
+        source id; ``plate_occupancy_store``). Its default is the fail-closed ``unknown``: a gate
+        whose origin nobody can vouch for is never one a lane may treat as a normal leftover.
         """
         before = self._view(printer_id, None)
         record = self._record(printer_id)
-        record.plate = PlateOccupied(source_subtask_id=source_subtask_id, policy=policy, since=_now())
+        record.plate = PlateOccupied(source_subtask_id=source_subtask_id, policy=policy, since=_now(), origin=origin)
         self._notify(printer_id, before, self._view(printer_id, None), HYDRATE_CAUSE)
 
     def hydrate_eject(self, printer_id: int, pending: PendingEject) -> None:
@@ -925,6 +987,7 @@ class PlateOccupancy:
                 source_subtask_id=disposition.source_subtask_id,
                 policy=disposition.policy,
                 since=_now(),
+                origin=disposition.origin,
             )
             changed = True
 
@@ -967,7 +1030,9 @@ class PlateOccupancy:
             return None
 
         before = self._view(printer_id, None)
-        record.plate = PlateOccupied(source_subtask_id=None, policy=EscalationOnly(), since=_now())
+        record.plate = PlateOccupied(
+            source_subtask_id=None, policy=EscalationOnly(), since=_now(), origin="operator_declared"
+        )
         self._notify(printer_id, before, self._view(printer_id, None), "declare_occupied")
         self.revoke_lease(printer_id, "an operator declared the plate occupied")
         return None
@@ -1130,7 +1195,7 @@ class PlateOccupancy:
             self._notify(printer_id, before, self._view(printer_id, None), "eject_completed")
             return None
 
-        record.plate = self._escalation_plate(record.plate)
+        record.plate = self._escalation_plate(record.plate, "eject_unverified")
         self._notify(printer_id, before, self._view(printer_id, None), "eject_unverified")
         return None
 
@@ -1168,7 +1233,7 @@ class PlateOccupancy:
             record.eject.dispatched_at,
         )
         record.eject = None
-        record.plate = self._escalation_plate(record.plate)
+        record.plate = self._escalation_plate(record.plate, "eject_never_started")
         self._notify(printer_id, before, self._view(printer_id, None), "eject_never_started")
         return True
 
@@ -1401,6 +1466,10 @@ class PlateOccupancy:
         record = self._records.get(printer_id)
         return record is not None and record.plate is not None
 
+    def occupied_printers(self) -> list[int]:
+        """Every printer whose gate is up — the auto plate-clear pass's subjects. O(n) in memory."""
+        return [printer_id for printer_id, record in list(self._records.items()) if record.plate is not None]
+
     def pending_eject_view(self, printer_id: int) -> PendingEject | None:
         """The FULL pending eject this printer holds, or None. A read-only peek.
 
@@ -1485,17 +1554,21 @@ class PlateOccupancy:
         return False
 
     @staticmethod
-    def _escalation_plate(plate: PlateOccupied | None) -> PlateOccupied:
+    def _escalation_plate(plate: PlateOccupied | None, origin: PlateOrigin) -> PlateOccupied:
         """An escalation-only plate, keeping an existing gate's source id and ``since``.
 
         The two eject retirements that leave a part behind (an unverified terminal, a
         sweep that never started) must not invent a new occupancy: if the gate was
         already up, the plate has carried this deposit since then and the source id
-        still names the job that produced it.
+        still names the job that produced it. The ORIGIN is the retirement's own
+        (``eject_unverified`` / ``eject_never_started``): after a failed sweep the part may be
+        anywhere on the bed, whatever first put it there.
         """
         if plate is None:
-            return PlateOccupied(source_subtask_id=None, policy=EscalationOnly(), since=_now())
-        return PlateOccupied(source_subtask_id=plate.source_subtask_id, policy=EscalationOnly(), since=plate.since)
+            return PlateOccupied(source_subtask_id=None, policy=EscalationOnly(), since=_now(), origin=origin)
+        return PlateOccupied(
+            source_subtask_id=plate.source_subtask_id, policy=EscalationOnly(), since=plate.since, origin=origin
+        )
 
     def _view(self, printer_id: int, ev: Evidence | None) -> OccupancyView:
         """Project the record (settled against *ev*) into an immutable snapshot."""
@@ -1524,6 +1597,7 @@ class PlateOccupancy:
             plate_source_subtask_id=plate.source_subtask_id if plate is not None else None,
             plate_policy=plate.policy if plate is not None else None,
             plate_since=plate.since if plate is not None else None,
+            plate_origin=plate.origin if plate is not None else None,
             lease_unit_id=lease.unit_id if lease is not None else None,
             lease_active=lease_in_flight if ev is not None else None,
             lease_age_s=(now_mono - lease.minted_at_mono) if lease is not None else None,

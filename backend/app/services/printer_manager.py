@@ -1340,7 +1340,9 @@ def hms_errors_payload(state: PrinterState, plate_check_exit: dict | None) -> li
 
 
 def service_hold_payload(printer_id: int | None) -> dict | None:
-    """Maintenance mode as ``{"since": iso}``, or None when the printer is not held.
+    """Maintenance mode as ``{"since": iso, "release_at": iso | None}``, or None when the
+    printer is not held. ``release_at`` is the hold's scheduled return to service (the row's
+    column, carried on the same projection), ``None`` when the hold ends only on Exit.
 
     ONE builder for all four construction sites (the WS serializer below, both REST
     ``/status`` branches and the printer-list serializer), for the same reason
@@ -1363,7 +1365,7 @@ def service_hold_payload(printer_id: int | None) -> dict | None:
     # ``created_at`` somehow reads null must still project the hold — dropping the
     # object over a missing number would hide maintenance mode from the card that gates
     # every operator affordance on it.
-    return {"since": row.get("created_at")}
+    return {"since": row.get("created_at"), "release_at": row.get("release_at")}
 
 
 def printer_state_to_dict(

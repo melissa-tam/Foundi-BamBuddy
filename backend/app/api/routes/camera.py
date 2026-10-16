@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import os
 import subprocess
 import sys
 from collections.abc import AsyncGenerator
@@ -22,7 +21,6 @@ from backend.app.core.permissions import Permission
 from backend.app.models.printer import Printer
 from backend.app.models.user import User
 from backend.app.services.camera import (
-    capture_camera_frame,
     create_tls_proxy,
     generate_chamber_image_stream,
     get_camera_port,
@@ -99,6 +97,22 @@ def is_stream_active(printer_id: int) -> bool:
     return any(k.startswith(f"{printer_id}-") for k in _active_streams) or any(
         k.startswith(f"{printer_id}-") for k in _active_chamber_streams
     )
+
+
+def live_buffered_frame(printer_id: int) -> tuple[bytes, float | None] | None:
+    """The live stream's buffered frame WITH the wall time it was buffered (``time.time()``, None when
+    none was recorded), or None.
+
+    Answers only while a stream is registered for the printer (:func:`is_stream_active`) and has
+    buffered a frame — the still owner (``services/camera_stills``) judges from the time whether a
+    plate reading may use the frame; a viewer is served it whatever its age.
+    """
+    if not is_stream_active(printer_id):
+        return None
+    frame = _last_frames.get(printer_id)
+    if frame is None:
+        return None
+    return frame, _last_frame_times.get(printer_id)
 
 
 def try_get_active_buffered_frame(printer_id: int) -> bytes | None:
@@ -871,88 +885,39 @@ async def camera_snapshot(
     Returns a JPEG image.
 
     Requires a stream token query param (?token=xxx) when auth is enabled.
+
+    A frame taken NOW, through the still owner's one capture under its VIEW policy
+    (``services/camera_stills``): the external camera when it is enabled with a URL (no fallback to
+    the built-in one); the fan-out broadcaster's buffered frame while a viewer is watching, whatever its
+    age (#1271) — and never a second socket beside a stream that has no frame yet (#1348: 503);
+    otherwise one fresh capture.
     """
-    import tempfile
-    from pathlib import Path
+    from datetime import datetime, timezone
+
+    from backend.app.services import camera_stills
 
     printer = await get_printer_or_404(printer_id, db)
-
-    # Check for external camera first
-    if printer.external_camera_enabled and printer.external_camera_url:
-        from backend.app.services.external_camera import capture_frame
-
-        frame_data = await capture_frame(
-            printer.external_camera_url,
-            printer.external_camera_type,
-            timeout=15,
-            snapshot_url=printer.external_camera_snapshot_url,
+    source = camera_stills.CameraSource.of(printer)
+    still = await camera_stills.latest_still(
+        printer_id, policy=camera_stills.VIEW, not_before=datetime.now(timezone.utc), source=source
+    )
+    if isinstance(still, camera_stills.NoStill):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Failed to capture frame from external camera."
+                if source.external_for(camera_stills.VIEW) is not None
+                else "Failed to capture camera frame. Ensure printer is on and camera is enabled."
+            ),
         )
-        if not frame_data:
-            raise HTTPException(
-                status_code=503,
-                detail="Failed to capture frame from external camera.",
-            )
-        return Response(
-            content=frame_data,
-            media_type="image/jpeg",
-            headers={
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Content-Disposition": f'inline; filename="snapshot_{printer_id}.jpg"',
-            },
-        )
-
-    # Reuse the fan-out broadcaster's buffered frame when a viewer is already
-    # watching — avoids opening a second concurrent RTSP socket on printers
-    # that allow only one camera connection (e.g. X2D firmware 01.01.00.00;
-    # see #1271). Buffered frame is <1s old while a viewer is connected.
-    buffered = try_get_active_buffered_frame(printer_id)
-    if buffered:
-        return Response(
-            content=buffered,
-            media_type="image/jpeg",
-            headers={
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Content-Disposition": f'inline; filename="snapshot_{printer_id}.jpg"',
-            },
-        )
-
-    # Create temporary file for the snapshot (0600 so only the app user can read it)
-    fd, tmp_name = tempfile.mkstemp(suffix=".jpg")
-    os.close(fd)
-    temp_path = Path(tmp_name)
-    temp_path.chmod(0o600)
-
-    try:
-        success = await capture_camera_frame(
-            ip_address=printer.ip_address,
-            access_code=printer.access_code,
-            model=printer.model,
-            output_path=temp_path,
-            timeout=15,
-        )
-
-        if not success:
-            raise HTTPException(
-                status_code=503,
-                detail="Failed to capture camera frame. Ensure printer is on and camera is enabled.",
-            )
-
-        # Read and return the image
-        with open(temp_path, "rb") as f:
-            image_data = f.read()
-
-        return Response(
-            content=image_data,
-            media_type="image/jpeg",
-            headers={
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Content-Disposition": f'inline; filename="snapshot_{printer_id}.jpg"',
-            },
-        )
-    finally:
-        # Clean up temp file
-        if temp_path.exists():
-            temp_path.unlink()
+    return Response(
+        content=still.jpeg,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Content-Disposition": f'inline; filename="snapshot_{printer_id}.jpg"',
+        },
+    )
 
 
 @router.get("/{printer_id}/camera/test")
@@ -1130,26 +1095,28 @@ async def check_plate_empty(
 
     Returns:
         Dict with detection results:
-        - is_empty: bool - Whether plate appears empty
+        - verdict: "empty" | "occupied" | "unknown" - the reading (unknown carries ``reason``)
+        - reason: why the reading is unknown (uncalibrated, capture_failed, ...), else null
+        - is_empty: bool - verdict == "empty"
         - confidence: float - Confidence level (0.0 to 1.0)
         - difference_percent: float - How different from calibration reference
         - message: str - Human-readable result message
         - needs_calibration: bool - True if calibration is required
         - light_warning: bool - True if chamber light is off
+        - roi: the compared area in use (the printer's own, else the whole-frame default)
     """
+    from datetime import datetime, timezone
+
     from backend.app.services.plate_detection import (
+        DEFAULT_ROI,
         check_plate_empty as do_check,
         is_plate_detection_available,
+        roi_of,
     )
     from backend.app.services.printer_manager import printer_manager
 
     # Check printer exists first (before OpenCV check)
     printer = await get_printer_or_404(printer_id, db)
-
-    if use_external is None:
-        use_external = bool(
-            printer.external_camera_enabled and printer.external_camera_url and printer.external_camera_type
-        )
 
     if not is_plate_detection_available():
         raise HTTPException(
@@ -1165,35 +1132,13 @@ async def check_plate_empty(
 
     from backend.app.services.plate_detection import PlateDetector
 
-    # Build ROI tuple from printer settings if available
-    roi = None
-    if all(
-        [
-            printer.plate_detection_roi_x is not None,
-            printer.plate_detection_roi_y is not None,
-            printer.plate_detection_roi_w is not None,
-            printer.plate_detection_roi_h is not None,
-        ]
-    ):
-        roi = (
-            printer.plate_detection_roi_x,
-            printer.plate_detection_roi_y,
-            printer.plate_detection_roi_w,
-            printer.plate_detection_roi_h,
-        )
-
+    # A person's check reads a frame taken NOW (anchored at the request), never a cached still.
+    # ``use_external`` None takes the printer's own camera setting (#1359), as at print start.
     result = await do_check(
-        printer_id=printer.id,
-        ip_address=printer.ip_address,
-        access_code=printer.access_code,
-        model=printer.model,
-        plate_type=plate_type,
-        include_debug_image=include_debug_image,
-        external_camera_url=printer.external_camera_url if printer.external_camera_enabled else None,
-        external_camera_type=printer.external_camera_type if printer.external_camera_enabled else None,
+        printer,
         use_external=use_external,
-        roi=roi,
-        external_camera_snapshot_url=printer.external_camera_snapshot_url if printer.external_camera_enabled else None,
+        not_before=datetime.now(timezone.utc),
+        include_debug_image=include_debug_image,
     )
 
     # Get reference count for the response
@@ -1204,12 +1149,9 @@ async def check_plate_empty(
     response["light_warning"] = light_warning
     response["reference_count"] = ref_count
     response["max_references"] = detector.MAX_REFERENCES
-    # Include current ROI in response
-    if roi:
-        response["roi"] = {"x": roi[0], "y": roi[1], "w": roi[2], "h": roi[3]}
-    else:
-        # Return default ROI
-        response["roi"] = {"x": 0.15, "y": 0.35, "w": 0.70, "h": 0.55}
+    # The compared area in use: the printer's own, else the named whole-frame default.
+    x, y, w, h = roi_of(printer) or DEFAULT_ROI
+    response["roi"] = {"x": x, "y": y, "w": w, "h": h}
 
     # If debug image requested and available, encode as base64 data URL
     if include_debug_image and result.debug_image:
@@ -1237,6 +1179,9 @@ async def calibrate_plate_detection(
     Supports up to 5 reference images per printer. When adding a 6th, the oldest
     is automatically removed.
 
+    The bed moves to the held-bed position first (a claimed farm bed motion — the height the auto
+    plate-clear reads from); a motion refused for a busy printer refuses the calibration.
+
     IMPORTANT: Chamber light should be ON for calibration.
 
     Args:
@@ -1262,11 +1207,6 @@ async def calibrate_plate_detection(
     # Check printer exists first (before OpenCV check)
     printer = await get_printer_or_404(printer_id, db)
 
-    if use_external is None:
-        use_external = bool(
-            printer.external_camera_enabled and printer.external_camera_url and printer.external_camera_type
-        )
-
     if not is_plate_detection_available():
         raise HTTPException(
             status_code=503,
@@ -1277,17 +1217,9 @@ async def calibrate_plate_detection(
     state = printer_manager.get_status(printer_id)
     light_warning = state and not state.chamber_light
 
-    success, message, index = await calibrate_plate(
-        printer_id=printer.id,
-        ip_address=printer.ip_address,
-        access_code=printer.access_code,
-        model=printer.model,
-        label=label,
-        external_camera_url=printer.external_camera_url if printer.external_camera_enabled else None,
-        external_camera_type=printer.external_camera_type if printer.external_camera_enabled else None,
-        use_external=use_external,
-        external_camera_snapshot_url=printer.external_camera_snapshot_url if printer.external_camera_enabled else None,
-    )
+    # ``use_external`` None takes the printer's own camera setting (#1359) — the still owner's
+    # ``CameraSource.of``, the one origin of that rule.
+    success, message, index = await calibrate_plate(db, printer, label=label, use_external=use_external)
 
     if light_warning and success:
         message += " (Warning: Chamber light was off)"

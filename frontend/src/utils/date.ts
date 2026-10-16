@@ -9,6 +9,13 @@
 export type TimeFormat = 'system' | '12h' | '24h';
 export type DateFormat = 'system' | 'us' | 'eu' | 'iso';
 
+const DATE_FORMATS: readonly DateFormat[] = ['system', 'us', 'eu', 'iso'];
+
+/** A stored `date_format` preference (a free string on `/settings/ui-preferences`) as a `DateFormat`; `system` for anything else. */
+export function asDateFormat(value: string | null | undefined): DateFormat {
+  return DATE_FORMATS.find((format) => format === value) ?? 'system';
+}
+
 /**
  * Get the date input placeholder based on format setting.
  */

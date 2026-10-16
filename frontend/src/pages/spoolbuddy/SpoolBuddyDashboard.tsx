@@ -6,6 +6,7 @@ import type { SpoolBuddyOutletContext } from '../../components/spoolbuddy/SpoolB
 import { api, type InventorySpool, type Printer, type PrinterStatus } from '../../api/client';
 import type { MatchedSpool } from '../../hooks/useSpoolBuddyState';
 import { useToast } from '../../contexts/ToastContext';
+import { useDefaultSpoolWeight } from '../../hooks/useDefaultSpoolWeight';
 import { SpoolIcon } from '../../components/spoolbuddy/SpoolIcon';
 import { SpoolInfoCard, UnknownTagCard } from '../../components/spoolbuddy/SpoolInfoCard';
 import { AssignToAmsModal } from '../../components/spoolbuddy/AssignToAmsModal';
@@ -147,6 +148,7 @@ export function SpoolBuddyDashboard() {
     staleTime: 5 * 60 * 1000,
   });
   const spoolmanMode = spoolmanSettings?.spoolman_enabled === 'true' && !!spoolmanSettings?.spoolman_url;
+  const defaultSpoolWeight = useDefaultSpoolWeight();
 
   // Fetch spools for stats, tag lookup, and untagged list
   const { data: spools = [], refetch: refetchSpools } = useQuery({
@@ -430,7 +432,9 @@ export function SpoolBuddyDashboard() {
           extra_colors: null,
           effect_type: null,
           brand: null,
-          label_weight: 1000,
+          // The default-weight setting; 0 (not yet resolved) is "no figure", which the
+          // backend fills from the same setting.
+          label_weight: defaultSpoolWeight ?? 0,
           core_weight: 250,
           core_weight_catalog_id: null,
           weight_used: 0,

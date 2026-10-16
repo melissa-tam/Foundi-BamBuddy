@@ -3,7 +3,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { screen } from '@testing-library/react';
 import { render } from '../utils';
 import { AdditionalSection } from '../../components/spool-form/AdditionalSection';
-import { defaultFormData } from '../../components/spool-form/types';
+import { newSpoolFormData } from '../../components/spool-form/types';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -12,7 +12,7 @@ vi.mock('react-i18next', () => ({
 }));
 
 const baseProps = {
-  formData: defaultFormData,
+  formData: newSpoolFormData(1000),
   updateField: vi.fn(),
   spoolCatalog: [],
   currencySymbol: '$',

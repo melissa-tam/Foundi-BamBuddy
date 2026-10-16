@@ -8,7 +8,8 @@ import { Button } from './Button';
 import { Modal } from './ui/Modal';
 import { useToast } from '../contexts/ToastContext';
 import type { SpoolFormData, PrinterWithCalibrations, ColorPreset } from './spool-form/types';
-import { defaultFormData, validateForm, SPOOLMAN_LINKED_FIELDS } from './spool-form/types';
+import { newSpoolFormData, validateForm, SPOOLMAN_LINKED_FIELDS } from './spool-form/types';
+import { useDefaultSpoolWeight } from '../hooks/useDefaultSpoolWeight';
 import { buildFilamentOptions, extractBrandsFromPresets, findPresetOption, loadRecentColors, parsePresetName, saveRecentColor } from './spool-form/utils';
 import { MATERIALS } from './spool-form/constants';
 import { FilamentSection } from './spool-form/FilamentSection';
@@ -64,7 +65,9 @@ export function SpoolFormModal({
   const isCopying = mode === 'copy';
 
   // Form state
-  const [formData, setFormData] = useState<SpoolFormData>(defaultFormData);
+  const defaultSpoolWeight = useDefaultSpoolWeight(isOpen);
+  // 0 = "no figure yet": the fill effect below writes the setting once it resolves.
+  const [formData, setFormData] = useState<SpoolFormData>(() => newSpoolFormData(0));
   const [errors, setErrors] = useState<Partial<Record<keyof SpoolFormData, string>>>({});
   const [activeTab, setActiveTab] = useState<TabId>('filament');
   const [weightTouched, setWeightTouched] = useState(false);
@@ -361,7 +364,7 @@ export function SpoolFormModal({
           rgba: validRgba,
           extra_colors: spool.extra_colors || '',
           effect_type: spool.effect_type || '',
-          label_weight: spool.label_weight || 1000,
+          label_weight: spool.label_weight,
           core_weight: spool.core_weight || 250,
           core_weight_catalog_id: spool.core_weight_catalog_id ?? null,
           weight_used: isCopying ? 0 : spool.weight_used || 0,
@@ -388,7 +391,7 @@ export function SpoolFormModal({
           setSelectedProfiles(new Set());
         }
       } else {
-        setFormData(defaultFormData);
+        setFormData(newSpoolFormData(0));
         setPresetInputValue('');
         setSelectedProfiles(new Set());
         setQuickAdd(false);
@@ -400,6 +403,14 @@ export function SpoolFormModal({
       setLocationIdTouched(false);
     }
   }, [isOpen, spool, mode, isCopying]);
+
+  // A new spool starts from the default-weight setting. Runs after the reset above
+  // and fills only a label nothing has stated yet (0), so a late-resolving settings
+  // query never overwrites a figure the operator typed.
+  useEffect(() => {
+    if (!isOpen || spool || defaultSpoolWeight === undefined) return;
+    setFormData((prev) => (prev.label_weight > 0 ? prev : { ...prev, label_weight: defaultSpoolWeight }));
+  }, [isOpen, spool, defaultSpoolWeight]);
 
   // Legacy rows may have storage_location text but no location_id yet — link when catalog loads.
   useEffect(() => {

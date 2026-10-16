@@ -35,9 +35,11 @@ interface InfoHintProps {
   text: string;
   /** Optional extra classes for the inline wrapper (e.g. spacing). */
   className?: string;
+  /** Touch sizing (the touch view): the same icon with a 56 px hit area around it. */
+  touch?: boolean;
 }
 
-export function InfoHint({ text, className }: InfoHintProps) {
+export function InfoHint({ text, className, touch = false }: InfoHintProps) {
   const [hovered, setHovered] = useState(false);
   const [focused, setFocused] = useState(false);
   const [tapped, setTapped] = useState(false);
@@ -106,7 +108,9 @@ export function InfoHint({ text, className }: InfoHintProps) {
             closeAll();
           }
         }}
-        className="inline-flex items-center text-bambu-gray/60 hover:text-bambu-gray transition-colors cursor-help rounded focus:outline-none focus-visible:ring-2 focus-visible:ring-bambu-green/50"
+        className={`inline-flex items-center text-bambu-gray/60 hover:text-bambu-gray transition-colors cursor-help rounded focus:outline-none focus-visible:ring-2 focus-visible:ring-bambu-green/50${
+          touch ? " relative before:absolute before:-inset-[21px] before:content-['']" : ''
+        }`}
       >
         <Info className="w-3.5 h-3.5" aria-hidden="true" />
       </button>

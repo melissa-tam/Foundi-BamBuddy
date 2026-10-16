@@ -86,7 +86,7 @@ _MINIMAL_ROW: dict[str, dict] = {
     "projects": {"name": "probe-project"},
     "printers": {"name": "probe", "serial_number": "SN-probe", "ip_address": "10.0.0.9", "access_code": "ccc"},
     "smart_plugs": {"name": "probe-plug"},
-    "spool": {"material": "PETG"},
+    "spool": {"material": "PETG", "label_weight": 1000},
     "library_files": {"filename": "p.3mf", "file_path": "/lib/p.3mf", "file_type": "3mf", "file_size": 1},
     "print_archives": {"filename": "p.3mf", "file_path": "/arch/p.3mf", "file_size": 1},
     "eject_profiles": {"name": "probe-profile"},
@@ -123,7 +123,7 @@ async def _seed(conn):
         conn, "printers", id=2, name="unit-002", serial_number="SN002", ip_address="10.0.0.2", access_code="bbb"
     )
     await _insert(conn, "smart_plugs", id=25, name="plug-001", printer_id=1)
-    await _insert(conn, "spool", id=26, material="PETG", location_id=None)
+    await _insert(conn, "spool", id=26, material="PETG", label_weight=1000, location_id=None)
     await _insert(
         conn,
         "library_files",

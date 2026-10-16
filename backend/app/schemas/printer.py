@@ -190,9 +190,14 @@ class ServiceHoldState(BaseModel):
 
     ``since`` is nullable for one reason only: the OBJECT is the hold, so a row with no
     readable timestamp must still project as held rather than vanish into ``None``.
+
+    ``release_at`` is the hold's scheduled return to service (ISO, naive UTC), or ``None`` when
+    the hold ends only on "Exit maintenance mode": the scheduler's pass ends it at that time
+    through the same exit (``service_hold.release_due``).
     """
 
     since: str | None = None
+    release_at: str | None = None
 
 
 class PrinterMessageInfo(BaseModel):
@@ -305,6 +310,34 @@ class ServiceHoldEnterResponse(BaseModel):
     already_held: bool
     eject_stopped: bool
     lease_revoked: bool
+    #: The hold's scheduled return to service after this call (naive UTC), or None.
+    release_at: datetime | None = None
+
+
+class ServiceHoldEnterRequest(BaseModel):
+    """``POST /printers/{id}/service-hold`` body — optional; no body enters with no return time.
+
+    ``release_at``: the scheduled return to service. An aware time is converted to UTC; a naive
+    one is read as UTC. A time that is not in the future is a 422.
+    """
+
+    release_at: datetime | None = None
+
+
+class ServiceHoldRescheduleRequest(BaseModel):
+    """``PATCH /printers/{id}/service-hold``: set, change or clear the return to service.
+
+    ``release_at`` is REQUIRED and nullable: ``null`` clears the schedule (the hold then ends only
+    on Exit), so an empty body is a 422 rather than a silent clear.
+    """
+
+    release_at: datetime | None
+
+
+class ServiceHoldRescheduleResponse(BaseModel):
+    """``PATCH /printers/{id}/service-hold``: the hold's return to service after the call."""
+
+    release_at: datetime | None
 
 
 class ServiceHoldExitResponse(BaseModel):

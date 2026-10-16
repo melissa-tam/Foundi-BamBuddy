@@ -65,7 +65,7 @@ from backend.app.services.bambu_mqtt import DIALOG_RESUME_ACTIONS, DIALOG_UNANSW
 from backend.app.services.eject.monitor import eject_cooldown_monitor
 from backend.app.services.hms_actions import HMSAction
 from backend.app.services.hms_errors import PLATE_CHECK_HMS_CODES, printer_message_from_full_code
-from backend.app.services.pause_recovery import human_dialog_action, on_plate_cleared
+from backend.app.services.pause_recovery import human_dialog_action
 from backend.app.services.plate_occupancy import Evidence, plate_occupancy
 from backend.app.services.print_control import stop_as_operator
 from backend.app.services.printer_diagnostic import run_connection_diagnostic
@@ -3031,7 +3031,16 @@ async def clear_plate(
             f"Printer is not awaiting plate-clear acknowledgment (state={state.state if state else 'unknown'})",
         )
 
-    refusal = plate_occupancy.clear_plate(printer_id)
+    # The person's clear is ONE verb (``farm_policy.operator_clear_plate``): the plate transition,
+    # then — only when it cleared — the holds whose resolution IS a human's act (a Z reference lost
+    # to a reboot, 2026-09-04 fleet outage). A paused plate check is answered by resuming or
+    # stopping its job, wire-resolved holds by their own lanes, and a filament-path hold needs
+    # Recover, not this. What it closed is reported rather than swallowed: an operator whose click
+    # ended nothing must be able to see that.
+    from backend.app.services.farm_policy import operator_clear_plate
+
+    cleared = await operator_clear_plate(printer_id)
+    refusal = cleared.refusal
     if refusal == "eject_in_flight":
         # The gate IS that sweep's completion signal. Clearing it under the sweep would
         # release the printer into a dispatch landing on a plate the toolhead is still
@@ -3049,17 +3058,10 @@ async def clear_plate(
         # printer is sitting on a terminal state). Same 400 shape it has always had.
         raise HTTPException(400, "Printer is not awaiting plate-clear acknowledgment")
 
-    # The operator's clear IS the resolution of the hold a human owns — a Z reference
-    # lost to a reboot (2026-09-04 fleet outage). A paused plate check is answered
-    # by resuming or stopping its job, wire-resolved holds by their own lanes, and a
-    # filament-path hold needs Recover, not this. What it DID close is reported rather
-    # than swallowed: an operator whose click ended nothing must be able to see that.
-    closed = await on_plate_cleared(printer_id)
-
     return ClearPlateResult(
         success=True,
         message="Plate cleared, next print will start shortly",
-        incidents_closed=[kind for _id, kind in closed],
+        incidents_closed=list(cleared.incidents_closed),
     )
 
 

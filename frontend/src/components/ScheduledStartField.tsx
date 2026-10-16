@@ -6,7 +6,9 @@
  * `Z`) for a future time, or `null` for ASAP; past/invalid entries are rejected
  * inline and reported via `onValidityChange` so the host dialog can block submit.
  *
- * One shared home for both the create dialog and the reschedule dialog.
+ * One shared home for the production-run create and reschedule dialogs and the
+ * maintenance-mode return time (`components/maintenance`). The toggle's wording
+ * is the host's (`labels`); the mechanics are this component's alone.
  */
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -23,6 +25,19 @@ import {
   type TimeFormat,
 } from '../utils/date';
 
+/** The host's wording for the toggle. Defaults to the production-run copy. */
+export interface ScheduledStartLabels {
+  /** Caption of the toggle group. */
+  heading: string;
+  /** The "no time" choice (emits `null`). */
+  asap: string;
+  /** The "at a set time" choice. */
+  later: string;
+  /** Line under the field per mode; omitted when absent. */
+  helpAsap?: string;
+  helpScheduled?: string;
+}
+
 export interface ScheduledStartFieldProps {
   /** Current start time as a UTC ISO string (with `Z`), or `null` = start ASAP. */
   value: string | null;
@@ -34,6 +49,8 @@ export interface ScheduledStartFieldProps {
   timeFormat?: TimeFormat;
   /** Namespaces the input ids so two instances (create + reschedule) don't collide. */
   idPrefix?: string;
+  /** The toggle's wording; the production-run copy when omitted. */
+  labels?: ScheduledStartLabels;
 }
 
 /** A sensible default deferred start: the next whole hour, one hour out. */
@@ -50,8 +67,16 @@ export function ScheduledStartField({
   dateFormat = 'system',
   timeFormat = 'system',
   idPrefix = 'run-schedule',
+  labels,
 }: ScheduledStartFieldProps) {
   const { t } = useTranslation();
+  const copy: ScheduledStartLabels = labels ?? {
+    heading: t('productionRuns.schedule.whenToStart'),
+    asap: t('productionRuns.schedule.asap'),
+    later: t('productionRuns.schedule.later'),
+    helpAsap: t('productionRuns.schedule.helpAsap'),
+    helpScheduled: t('productionRuns.schedule.helpScheduled'),
+  };
   const [scheduled, setScheduled] = useState(value != null);
   const [dateValue, setDateValue] = useState('');
   const [timeValue, setTimeValue] = useState('');
@@ -144,15 +169,15 @@ export function ScheduledStartField({
   return (
     <div className="space-y-3">
       <div>
-        <span className="block text-sm text-bambu-gray mb-2">{t('productionRuns.schedule.whenToStart')}</span>
-        <div className="flex gap-2" role="group" aria-label={t('productionRuns.schedule.whenToStart')}>
+        <span className="block text-sm text-bambu-gray mb-2">{copy.heading}</span>
+        <div className="flex gap-2" role="group" aria-label={copy.heading}>
           <button type="button" className={toggleBtn(!scheduled)} aria-pressed={!scheduled} onClick={chooseAsap}>
             <Clock className="w-4 h-4" aria-hidden="true" />
-            {t('productionRuns.schedule.asap')}
+            {copy.asap}
           </button>
           <button type="button" className={toggleBtn(scheduled)} aria-pressed={scheduled} onClick={chooseScheduled}>
             <CalendarClock className="w-4 h-4" aria-hidden="true" />
-            {t('productionRuns.schedule.later')}
+            {copy.later}
           </button>
         </div>
       </div>
@@ -221,9 +246,9 @@ export function ScheduledStartField({
         </div>
       )}
 
-      <p className="text-xs text-bambu-gray">
-        {scheduled ? t('productionRuns.schedule.helpScheduled') : t('productionRuns.schedule.helpAsap')}
-      </p>
+      {(scheduled ? copy.helpScheduled : copy.helpAsap) && (
+        <p className="text-xs text-bambu-gray">{scheduled ? copy.helpScheduled : copy.helpAsap}</p>
+      )}
     </div>
   );
 }

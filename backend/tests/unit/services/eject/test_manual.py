@@ -476,6 +476,8 @@ class TestManualEjectItemResolution:
                     final_status="cancelled", is_dry_run=False, peaks_reliable=True, last_layer_num=0, last_progress=0
                 ),
                 raise_gate=True,
+                stop_verdict=None,
+                reconciled=False,
                 refusal=PlateRefusal(messages=()),
             ),
         )

@@ -274,6 +274,66 @@ async def test_respool_label_weight_override_and_weight_used_zero(db_session, pr
     assert new_spool.weight_used == 0
 
 
+# -- the respool fallback reads the default-weight setting (Part 2, 2026-10-16) ----------------------
+
+
+async def _set_default_weight(db, grams: int) -> None:
+    from backend.app.api.routes.settings import set_setting
+
+    await set_setting(db, "default_spool_weight_g", str(grams))
+    await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_respool_with_no_figure_anywhere_mints_at_the_default_weight_setting(
+    db_session, printer_factory, monkeypatch
+):
+    """No operator figure, no donor, and a tag stating ``tray_weight="0"`` → the setting, never a literal."""
+    await _set_default_weight(db_session, 1100)
+    printer = await printer_factory()
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray(tray_weight="0")))
+
+    new_spool = await respool_tag(db_session, printer_id=printer.id, ams_id=0, tray_id=0, brand="eSun")
+
+    assert new_spool.label_weight == 1100
+
+
+@pytest.mark.asyncio
+async def test_respool_with_no_donor_mints_at_the_tags_figure(db_session, printer_factory, monkeypatch):
+    await _set_default_weight(db_session, 1100)
+    printer = await printer_factory()
+    _patch_pm(monkeypatch, _make_state(0, 0, _tray(tray_weight="750")))
+
+    new_spool = await respool_tag(db_session, printer_id=printer.id, ams_id=0, tray_id=0, brand="eSun")
+
+    assert new_spool.label_weight == 750
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("tray_weight", "prefill"), [("750", 750), ("0", 1000)])
+async def test_the_respool_prompt_prefills_the_tag_figure_else_the_donor_label(
+    db_session, printer_factory, monkeypatch, tray_weight, prefill
+):
+    """The prompt's label prefill: the tag's positive figure, else the donor's own label. A
+    ``"0"`` tag used to prefill 0 g (a truthy string parsed to zero)."""
+    from backend.app.api.routes.settings import set_setting
+
+    await _set_default_weight(db_session, 1100)
+    await set_setting(db_session, "respool_last_brand", "")
+    await set_setting(db_session, "tagless_default_filament", "")
+    printer = await printer_factory()
+    donor = await _make_donor(db_session, spent=True)
+    await db_session.commit()
+    tray = _tray(state=11, tray_weight=tray_weight)
+    _patch_pm(monkeypatch, _make_state(0, 0, tray))
+    broadcasts = _spy_broadcast(monkeypatch)
+
+    await maybe_auto_or_prompt_respool(db_session, printer.id, 0, 0, tray, donor)
+
+    prompts = [b for b in broadcasts if b["type"] == "respool_prompt"]
+    assert [p["label_weight_prefill"] for p in prompts] == [prefill]
+
+
 @pytest.mark.asyncio
 async def test_respool_copies_k_profiles(db_session, printer_factory, monkeypatch):
     """Donor K-profiles are copied onto the fresh spool."""

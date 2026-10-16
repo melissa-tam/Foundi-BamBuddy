@@ -18,7 +18,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen, waitFor, fireEvent } from '@testing-library/react';
 import { render } from '../utils';
 import { SpoolFormModal } from '../../components/SpoolFormModal';
-import { validateForm, defaultFormData } from '../../components/spool-form/types';
+import { validateForm, newSpoolFormData } from '../../components/spool-form/types';
 import type { InventorySpool } from '../../api/client';
 
 // Mock the API client
@@ -90,20 +90,20 @@ const existingSpool: InventorySpool = {
 
 describe('validateForm with quickAdd', () => {
   it('requires only material in quick-add mode', () => {
-    const result = validateForm({ ...defaultFormData, material: 'PLA' }, true);
+    const result = validateForm({ ...newSpoolFormData(1000), material: 'PLA' }, true);
     expect(result.isValid).toBe(true);
     expect(result.errors).toEqual({});
   });
 
   it('rejects empty material in quick-add mode', () => {
-    const result = validateForm({ ...defaultFormData, material: '' }, true);
+    const result = validateForm({ ...newSpoolFormData(1000), material: '' }, true);
     expect(result.isValid).toBe(false);
     expect(result.errors.material).toBeDefined();
   });
 
   it('does not require slicer_filament in quick-add mode', () => {
     const result = validateForm(
-      { ...defaultFormData, material: 'PETG', slicer_filament: '' },
+      { ...newSpoolFormData(1000), material: 'PETG', slicer_filament: '' },
       true,
     );
     expect(result.isValid).toBe(true);
@@ -111,7 +111,7 @@ describe('validateForm with quickAdd', () => {
 
   it('does not require brand in quick-add mode', () => {
     const result = validateForm(
-      { ...defaultFormData, material: 'ABS', brand: '' },
+      { ...newSpoolFormData(1000), material: 'ABS', brand: '' },
       true,
     );
     expect(result.isValid).toBe(true);
@@ -119,14 +119,14 @@ describe('validateForm with quickAdd', () => {
 
   it('does not require subtype in quick-add mode', () => {
     const result = validateForm(
-      { ...defaultFormData, material: 'TPU', subtype: '' },
+      { ...newSpoolFormData(1000), material: 'TPU', subtype: '' },
       true,
     );
     expect(result.isValid).toBe(true);
   });
 
   it('requires all fields in full mode (quickAdd=false)', () => {
-    const result = validateForm(defaultFormData, false);
+    const result = validateForm(newSpoolFormData(1000), false);
     expect(result.isValid).toBe(false);
     expect(result.errors.material).toBeDefined();
     expect(result.errors.slicer_filament).toBeDefined();

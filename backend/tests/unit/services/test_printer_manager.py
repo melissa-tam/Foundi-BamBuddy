@@ -2234,7 +2234,31 @@ class TestServiceHoldProjection:
             },
         )
 
-        assert printer_state_to_dict(self._state(), printer_id=7)["service_hold"] == {"since": "2026-09-12T03:02:28"}
+        # A hold with no scheduled return to service projects ``release_at`` as None.
+        assert printer_state_to_dict(self._state(), printer_id=7)["service_hold"] == {
+            "since": "2026-09-12T03:02:28",
+            "release_at": None,
+        }
+
+    def test_a_held_printer_with_a_return_time_renders_it(self):
+        self._seed(
+            7,
+            {
+                9: {
+                    "id": 9,
+                    "kind": "service_hold",
+                    "status": "escalated",
+                    "slot_desc": None,
+                    "created_at": "2026-09-12T03:02:28",
+                    "release_at": "2026-09-12T07:00:00",
+                }
+            },
+        )
+
+        assert printer_state_to_dict(self._state(), printer_id=7)["service_hold"] == {
+            "since": "2026-09-12T03:02:28",
+            "release_at": "2026-09-12T07:00:00",
+        }
 
     def test_a_fault_alone_does_not_read_as_a_hold(self):
         self._seed(
@@ -2281,7 +2305,7 @@ class TestServiceHoldProjection:
         # The chip names the FAULT (service_hold sorts last in KIND_PRECEDENCE on
         # purpose), and the hold is still reported in full on its own field.
         assert frame["open_incident"]["kind"] == "runout"
-        assert frame["service_hold"] == {"since": "2026-09-12T03:02:28"}
+        assert frame["service_hold"] == {"since": "2026-09-12T03:02:28", "release_at": None}
 
 
 class TestOccupancyProjection:

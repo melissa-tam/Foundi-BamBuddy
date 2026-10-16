@@ -28,7 +28,10 @@ class Spool(Base):
     # glow, matte. Purely a rendering hint — does not affect MQTT/firmware.
     effect_type: Mapped[str | None] = mapped_column(String(20))
     brand: Mapped[str | None] = mapped_column(String(100))  # "Polymaker"
-    label_weight: Mapped[int] = mapped_column(Integer, default=1000)  # Advertised net weight (g)
+    # Advertised net weight (g). NO Python default on purpose: every construction names its
+    # label (a tag figure, an operator figure, or ``spool_defaults``' setting), so a path that
+    # forgets it fails NOT NULL instead of minting a silent literal.
+    label_weight: Mapped[int] = mapped_column(Integer)
     core_weight: Mapped[int] = mapped_column(Integer, default=250)  # Empty spool weight (g)
     core_weight_catalog_id: Mapped[int | None] = mapped_column(
         Integer

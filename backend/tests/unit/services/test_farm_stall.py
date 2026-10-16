@@ -1149,6 +1149,8 @@ def _refuse_plate(printer_id: int):
                 final_status="cancelled", is_dry_run=False, peaks_reliable=True, last_layer_num=0, last_progress=0
             ),
             raise_gate=True,
+            stop_verdict=None,
+            reconciled=False,
             refusal=refusal,
         ),
     )
@@ -1230,6 +1232,60 @@ class TestRefusedPlateReminders:
             await farm_stall.check_attention_reminders(db_session, manager=mgr, now=now)
 
         assert pages == []
+
+    @staticmethod
+    async def _arm_watches(printer_id):
+        """Let the monitor's armed watch run its first tick (where a refusal is paged)."""
+        import asyncio
+
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    async def test_a_refusal_raised_by_its_terminal_pages_when_its_watch_arms(self, db_session, pages):
+        """The control for the restart case below: a live refusal is paged at once (ruling 2026-09-29)."""
+        from backend.app.services.eject.monitor import eject_cooldown_monitor
+        from backend.app.services.plate_occupancy import plate_occupancy
+
+        printer = await _add_printer(db_session, "007-H2S")
+        plate_occupancy.configure(policy_driver=eject_cooldown_monitor.on_occupancy_change)
+        try:
+            refusal = _refuse_plate(printer.id)
+            await self._arm_watches(printer.id)
+            assert pages == [(printer.id, self._sentence(refusal))]
+        finally:
+            eject_cooldown_monitor.stand_down(printer.id, "test teardown")
+
+    async def test_a_refusal_rebuilt_at_startup_arms_silently_and_the_reminder_still_names_it(
+        self, db_session, own_session_factory, monkeypatch, pages
+    ):
+        """Every deploy restarts the farm. A refused gate rebuilt from its stored origin arms its watch
+        WITHOUT a page — the page went out when the gate was raised — and the hourly reminder keeps
+        paging it, naming the refusal."""
+        from backend.app.services import plate_occupancy_store as store
+        from backend.app.services.eject.monitor import eject_cooldown_monitor
+        from backend.app.services.plate_occupancy import EscalationOnly, PlateRefusal, plate_occupancy
+
+        printer = await _add_printer(db_session, "008-H2S")
+        printer.awaiting_plate_clear = True
+        printer.plate_gate_origin = "plate_refused"  # a refused gate is source-less
+        await db_session.commit()
+        monkeypatch.setattr("backend.app.core.database.async_session", own_session_factory)
+        plate_occupancy.configure(policy_driver=eject_cooldown_monitor.on_occupancy_change)
+        try:
+            await store.hydrate()
+            rebuilt = PlateRefusal(hydrated=True)
+            assert plate_occupancy.snapshot(printer.id).plate_policy == EscalationOnly(refusal=rebuilt)
+            await self._arm_watches(printer.id)
+            assert pages == []  # no page at arm
+        finally:
+            eject_cooldown_monitor.stand_down(printer.id, "test teardown")
+
+        mgr = _FakeManager({printer.id: True}, {printer.id: _FakeState("IDLE")})
+        await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)  # seeds
+        assert pages == []
+        await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+        assert pages == [(printer.id, self._sentence(rebuilt))]
+        assert "plate check refused the plate" in pages[0][1]
 
     async def test_a_disconnected_printer_is_not_nagged_and_not_tracked(self, db_session, pages):
         printer = await _add_printer(db_session, "006-H2S")
