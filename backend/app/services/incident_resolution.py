@@ -85,7 +85,7 @@ from backend.app.models.printer_incident import (
 from backend.app.services import printer_incidents
 from backend.app.services.bambu_mqtt import PrinterState, ams_mid_filament_change
 from backend.app.services.command_outcome import Answer
-from backend.app.services.feed_state import FeedPhase, FeedReading
+from backend.app.services.feed_state import FeedReading
 from backend.app.services.hms_errors import (
     fault_tokens,
     fingerprint_tokens,
@@ -300,11 +300,6 @@ def running_without_eject(state: PrinterState | None, printer_id: int) -> bool:
     return _live_state(state).upper() == "RUNNING" and plate_occupancy.eject_identity(printer_id) is None
 
 
-# The feed state's phases in which filament reaches the nozzle: fed from a feeder, or a drained
-# roll's tail still feeding (``feed_state.FeedPhase``, invariant 16).
-_FED_PHASES: frozenset[FeedPhase] = frozenset({FeedPhase.FED, FeedPhase.TAIL})
-
-
 def feeding_through_path(state: PrinterState | None, printer_id: int, feed: FeedReading | None) -> bool:
     """Is a print FEEDING through the AMS path right now — :func:`running_without_eject`, AND
     the toolhead's feed state FED or TAIL (``feed_state``, invariant 16) from an AMS feeder?
@@ -327,7 +322,7 @@ def feeding_through_path(state: PrinterState | None, printer_id: int, feed: Feed
     return (
         running_without_eject(state, printer_id)
         and feed is not None
-        and feed.phase in _FED_PHASES
+        and feed.toolhead_fed
         and valid_feeder(feed.feeder) is not None
     )
 
@@ -1027,7 +1022,7 @@ def _job_pause_startup(row: PrinterIncident, ctx: Context) -> Verdict:
 def _toolhead_fed(feed: FeedReading | None) -> bool:
     """Does the toolhead's feed state read FED or TAIL (``feed_state``, invariant 16) — from an AMS
     feeder or the external holder alike: this class's question is only "is it printing air"."""
-    return feed is not None and feed.phase in _FED_PHASES
+    return feed is not None and feed.toolhead_fed
 
 
 def _toolhead_running_edge(_row: PrinterIncident, ctx: Context) -> Verdict:

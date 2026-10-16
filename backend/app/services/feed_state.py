@@ -85,6 +85,26 @@ class FeedPhase(str, Enum):
     UNKNOWN = "unknown"
 
 
+# THE two phase sets every reader asks through :class:`FeedReading` (``toolhead_fed`` /
+# ``firmware_owns_motion``) — one origin each (2026-10-16): no module outside this leaf spells a set of
+# phases (``test_code_quality.TestFeedPhaseSetOwnership``; a total dict keyed by phase is a table, not a set).
+#
+# * ``FED_PHASES`` — filament reaches the nozzle: fed from a feeder, or a drained roll's tail still
+#   feeding. Also the phases a HELD feeder belongs to (the classifier's ``_Facts.held``).
+# * ``FIRMWARE_SEQUENCE`` — the printer runs its OWN sequence and owns the toolhead's next motion: a
+#   filament change (``CHANGING``, every :class:`ChangeCause` — its posture after a farm load or resume,
+#   its runout switch, a runout resume, a tool change), its runout hold (``RUNOUT_HELD``), the drained roll's
+#   tail before the switch (``TAIL``, the switch's first 2.5–4.7 min, shape 47), the start block before
+#   layer 1 (``START_BLOCK``) and the end-of-print retract at the last layer (``END_RETRACT``). The farm
+#   never acts on a clock inside one (operator approval 2026-10-16, the 0-of-70 evidence: no farm pause of a
+#   running printer inside its own sequence ever freed a stuck change); it waits for the printer's event.
+#   ``TAIL`` is in both sets: the tail feeds AND the switch that follows is the firmware's.
+FED_PHASES: frozenset[FeedPhase] = frozenset({FeedPhase.FED, FeedPhase.TAIL})
+FIRMWARE_SEQUENCE: frozenset[FeedPhase] = frozenset(
+    {FeedPhase.CHANGING, FeedPhase.RUNOUT_HELD, FeedPhase.TAIL, FeedPhase.START_BLOCK, FeedPhase.END_RETRACT}
+)
+
+
 class ChangeCause(str, Enum):
     """Why the firmware owns the next motion (a ``CHANGING`` phase). Every cause has the SAME exit
     to AIR — a layer advance while empty — so a false or missed TAIL can never hide air to the
@@ -363,6 +383,19 @@ class FeedReading:
     def extruder(self, extruder_id: int) -> ExtruderReading:
         """One extruder's record; an empty one for an extruder this job never read."""
         return next((e for e in self.extruders if e.extruder == extruder_id), _NO_EXTRUDER)
+
+    @property
+    def toolhead_fed(self) -> bool:
+        """Does filament reach the nozzle — the phase in :data:`FED_PHASES` (a feeder, or a drained
+        roll's tail)? THE reading of "the toolhead is fed" over the feed state."""
+        return self.phase in FED_PHASES
+
+    @property
+    def firmware_owns_motion(self) -> bool:
+        """Is the printer running its OWN sequence — the phase in :data:`FIRMWARE_SEQUENCE` (a change,
+        a runout hold, a tail, the start block, the end-of-print retract)? The farm never acts on a
+        clock while this reads True: it waits for the printer's event."""
+        return self.phase in FIRMWARE_SEQUENCE
 
     @property
     def tray_change_log(self) -> tuple[tuple[int, int], ...]:
@@ -659,9 +692,8 @@ def _classify(frame: FeedFrame, facts: _Facts) -> FeedSignal:
     return FeedSignal.UNREADABLE
 
 
-# The phases an empty episode runs through, and the phases a held feeder belongs to.
+# The phases an empty episode runs through (a held feeder belongs to :data:`FED_PHASES`).
 _EPISODE_PHASES = frozenset({FeedPhase.EMPTY_UNCONFIRMED, FeedPhase.CHANGING, FeedPhase.AIR})
-_HOLDING_PHASES = frozenset({FeedPhase.FED, FeedPhase.TAIL})
 
 
 class FeedTracker:
@@ -730,7 +762,7 @@ class FeedTracker:
             self._reseed(frame.epoch)
         facts = _Facts(
             active_extruder=self._active,
-            held=self._prev_feeder if self._phase.phase in _HOLDING_PHASES else None,
+            held=self._prev_feeder if self._phase.phase in FED_PHASES else None,
             episode=self._episode,
         )
         signal = _classify(frame, facts)

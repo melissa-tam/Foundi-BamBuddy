@@ -778,6 +778,63 @@ class TestTheTable:
         assert reading.tray_change_log == ()
 
 
+class TestTheReadingsTwoQuestions:
+    """F6 (2026-10-16): "the toolhead is fed" and "the firmware owns the next motion" are the leaf's two
+    phase sets, asked as properties of the reading — every reader asks these, never a set of its own."""
+
+    def test_the_sets_are_the_phases_the_printer_feeds_in_and_runs_its_own_sequence_in(self):
+        assert {FED, TAIL} == feed_state.FED_PHASES
+        assert {CHANGING, RUNOUT_HELD, TAIL, START_BLOCK, END_RETRACT} == feed_state.FIRMWARE_SEQUENCE
+        # Air, an empty pause and an unconfirmed empty run are never the firmware's sequence: no layer,
+        # no change posture, no runout word — the farm's own readers (the air stop, the kept 009 arm) own them.
+        assert {AIR, EMPTY_PAUSED, EMPTY_UNCONFIRMED, IDLE, UNKNOWN, FED}.isdisjoint(feed_state.FIRMWARE_SEQUENCE)
+
+    def test_each_reading_answers_by_its_phase(self):
+        """Every phase a real tracker reaches, asked through the reading."""
+        reached: dict[FeedPhase, FeedReading] = {}
+        p = _Printer()
+        reached[UNKNOWN] = p.tracker.reading
+        p.start(1)
+        reached[p.phase] = p.last  # START_BLOCK
+        _fed_to(p, 1, 3)
+        reached[p.phase] = p.last  # FED
+        p.push(1, layer=4, absent={1})
+        reached[p.phase] = p.last  # TAIL
+        p.push(255, layer=4, absent={1})
+        reached[p.phase] = p.last  # CHANGING (the runout switch)
+        p.push(255, layer=5, absent={1})
+        reached[p.phase] = p.last  # AIR (a layer advanced empty)
+        q = _Printer()
+        q.start(1)
+        _fed_to(q, 1, 3)
+        q.push(255, layer=3)
+        reached[q.phase] = q.last  # EMPTY_UNCONFIRMED
+        q.push(255, layer=3, gcode="PAUSE")
+        reached[q.phase] = q.last  # EMPTY_PAUSED
+        q.push(255, layer=3, gcode="PAUSE", held=True)
+        reached[q.phase] = q.last  # RUNOUT_HELD
+        r = _Printer()
+        r.start(1)
+        _fed_to(r, 1, 3)
+        r.push(1, layer=_TOTAL)
+        reached[r.phase] = r.last  # END_RETRACT
+        assert {
+            START_BLOCK,
+            FED,
+            TAIL,
+            CHANGING,
+            AIR,
+            EMPTY_UNCONFIRMED,
+            EMPTY_PAUSED,
+            RUNOUT_HELD,
+            END_RETRACT,
+        } <= set(reached)
+        for phase, reading in reached.items():
+            assert reading.phase is phase
+            assert reading.toolhead_fed is (phase in feed_state.FED_PHASES), phase
+            assert reading.firmware_owns_motion is (phase in feed_state.FIRMWARE_SEQUENCE), phase
+
+
 # --- the frame, read off a real printer state ----------------------------------------------------------
 
 

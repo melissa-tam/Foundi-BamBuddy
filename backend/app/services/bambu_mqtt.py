@@ -24,7 +24,7 @@ import paho.mqtt.client as mqtt
 
 from backend.app.services.feed_state import FeedEvent, FeedFrame, FeedReading, FeedTracker, JobBoundary
 from backend.app.services.hms_actions import HMSAction, get_actions_for_error_code
-from backend.app.services.hms_errors import hms_severity, print_error_dialog
+from backend.app.services.hms_errors import hms_severity, hms_short_code, print_error_dialog, print_error_short_code
 from backend.app.services.live_reading import is_fresh, reads_live
 from backend.app.services.tray_fields import (
     TRAY_NOW_EXTERNAL_SPOOL,
@@ -247,6 +247,40 @@ DIALOG_RESUME_ACTIONS: frozenset[str] = frozenset(
         HMSAction.DONT_REMIND_NEXT_TIME,
     }
 )
+
+
+# Bambu's "Problem solved, resume" — the two catalog spellings of ONE button (``command_hms_resume``:
+# the resume frame with the dialog's decimal ``err``, which acknowledges the error the print paused on).
+# The only buttons the FARM presses to answer a fault pause (2026-10-16, operator-approved): never an
+# Ignore (it skips the printer's own re-check), never CONTINUE (``ams_control resume`` — the release
+# ladder's third rung, unchanged). Members of :data:`DIALOG_RESUME_ACTIONS`.
+_PROBLEM_SOLVED_BUTTONS: frozenset[str] = frozenset(
+    {HMSAction.PROBLEM_SOLVED_RESUME, HMSAction.RESUME_PRINTING_PROBELM_SOLVED}
+)
+
+
+def dialog_resume_button(state: object) -> str | None:
+    """The printer's own "Problem solved, resume" button for the fault dialog standing on ``state`` — or
+    ``None`` (a plain resume). THE chooser of the farm's answer to a fault pause (2026-10-16): the dialog
+    is the 32-bit ``print_error`` (a dialog word, ``hms_errors.print_error_dialog``), and its buttons are
+    the vendored catalog's actions the parse already attached to that code's ``HMSError`` (matched by
+    short code: the ``hms[]`` lane's entry carries them when both lanes name the code) — no second catalog
+    read. A button is returned only from :data:`_PROBLEM_SOLVED_BUTTONS`, in the catalog's order; a dialog
+    whose catalog lists none (a feeder-stall's CONTINUE / CHECK_ASSISTANT, an Ignore-only dialog) answers
+    ``None``. 0300_801E (extruder overloaded) lists ``RESUME_PRINTING_PROBELM_SOLVED`` on every model the
+    catalog names it for. Pure; never raises (a malformed state answers ``None``)."""
+    try:
+        print_error = print_error_dialog(int(getattr(state, "print_error", 0) or 0) & 0xFFFFFFFF)
+        if not print_error:
+            return None
+        short = print_error_short_code(print_error)
+        for error in getattr(state, "hms_errors", None) or []:
+            if hms_short_code(error.attr, error.code) != short:
+                continue
+            return next((action for action in error.actions or () if action in _PROBLEM_SOLVED_BUTTONS), None)
+    except Exception:  # noqa: BLE001 — a chooser that errors must never press a button
+        return None
+    return None
 
 
 def _decimal_dialog_err(print_error: object) -> str | None:

@@ -61,6 +61,7 @@ from sqlalchemy import select
 from backend.app.core.websocket import broadcast_production_run_changed
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer_incident import (
+    AMS_FAULT_KINDS,
     KIND_JAM,
     KIND_PHYSICAL,
     KIND_PLATE_VISION,
@@ -1342,7 +1343,10 @@ async def check_waiting_on_printers(db: AsyncSession, *, manager=printer_manager
       2026-10-10 ruling: "One page goes out if it has not run 10 min after the send"; production paged at
       600 s). A command with no echo by design is never outstanding, so it is never paged.
     * The LEVELS (one in-memory read per connected printer): a print RUNNING inside a firmware filament
-      change past the bound (the 009 hang); a print RUNNING with nothing fed and no firmware sequence past
+      change past the bound (the 009 hang); a print RUNNING in its end-of-print sequence at the last layer
+      past the bound; a print RUNNING in its start sequence past the bound while an AMS row is open on the
+      printer (2026-10-16: the farm never acts inside the printer's own sequences, it waits for their
+      event — a sequence that never ends is paged, never acted on); a print RUNNING with nothing fed and no firmware sequence past
       :data:`_NOTHING_FED_PAGE_S`; an unreadable feed while a job is on the printer; a print that resumed
       at its plate check and has not reached layer 1; a unit held on a stalled upload (one query); a
       cooldown running long (``eject.monitor.cooldown_waits``); a plate only a person may clear (the plate
@@ -1407,7 +1411,8 @@ async def check_waiting_on_printers(db: AsyncSession, *, manager=printer_manager
             state = manager.get_status(pid) if manager.is_connected(pid) else None
             live = (getattr(state, "state", None) or "").upper() if state is not None else ""
             client = manager.get_client(pid) if state is not None else None
-            phase = client.feed().phase if client is not None else None
+            reading = client.feed() if client is not None else None
+            phase = reading.phase if reading is not None else None
             running = live == "RUNNING"
 
             since = _level(("changing", pid), running and phase is FeedPhase.CHANGING, now)
@@ -1419,6 +1424,40 @@ async def check_waiting_on_printers(db: AsyncSession, *, manager=printer_manager
                     f"changing:{pid}:{int(since)}",
                     f"The printer has been RUNNING inside a filament change for {int((now - since) // 60)} min "
                     "with no layer printed. Check the AMS and the toolhead.",
+                    now,
+                )
+            # The printer's own END-OF-PRINT retract (at the last layer) and its START sequence (before
+            # layer 1) are its sequences: the farm never acts inside one on a clock (2026-10-16) and waits
+            # for the printer's event — so one that never ends is a person's to hear about (F9,
+            # operator-approved): the retract as a bare level; the start sequence only while an AMS row is
+            # open on the printer (a start block runs minutes on every healthy print). The END_RETRACT phase
+            # spans printing the whole last layer, so the retract's level is anchored on the end-of-print
+            # unload: the active extruder reads EMPTY (no feeder) — a last layer still printing fed never
+            # starts it, however long it takes.
+            retracting = (
+                running and reading is not None and reading.phase is FeedPhase.END_RETRACT and reading.feeder is None
+            )
+            since = _level(("end_retract", pid), retracting, now)
+            if since is not None and now - since >= bound_s:
+                await _page_waiting(
+                    db,
+                    notif,
+                    pid,
+                    f"end_retract:{pid}:{int(since)}",
+                    f"The printer has been RUNNING in its end-of-print retract at the last layer for "
+                    f"{int((now - since) // 60)} min. Check the toolhead.",
+                    now,
+                )
+            ams_hold = bool(printer_incidents.open_kinds(pid) & AMS_FAULT_KINDS)
+            since = _level(("start_block", pid), running and phase is FeedPhase.START_BLOCK and ams_hold, now)
+            if since is not None and now - since >= bound_s:
+                await _page_waiting(
+                    db,
+                    notif,
+                    pid,
+                    f"start_block:{pid}:{int(since)}",
+                    f"The printer has been RUNNING in its start sequence for {int((now - since) // 60)} min with "
+                    "an AMS hold open and no layer printed. Check the AMS and the toolhead.",
                     now,
                 )
             since = _level(("nothing_fed", pid), running and phase is FeedPhase.EMPTY_UNCONFIRMED, now)
