@@ -8,6 +8,7 @@ that could cause runtime errors but aren't caught by normal tests.
 import ast
 import importlib.util
 import re
+import typing
 from pathlib import Path
 
 import pytest
@@ -2222,6 +2223,119 @@ class TestFeedStateOwnership:
     def test_the_feed_state_is_its_own_module(self):
         """The leaf exists where the pins above expect it (a rename would empty them)."""
         assert BACKEND_DIR.joinpath(*_FEED_STATE).is_file()
+
+
+def _feed_phase_member(node: ast.AST) -> bool:
+    """``FeedPhase.<MEMBER>`` (the enum spelled through its class name)."""
+    return isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "FeedPhase"
+
+
+def _scan_feed_phase_sets(tree: ast.Module) -> list[tuple[int, str]]:
+    """Every SET of feed phases a module spells: a set / tuple / list literal holding a ``FeedPhase`` member
+    (``frozenset({...})``, ``(FeedPhase.A, FeedPhase.B)``, ``dict.fromkeys((...))``), and every ``in`` /
+    ``not in`` test against such a literal. A dict literal keyed by phase is a TABLE (total, one cell per
+    phase) and is exempt."""
+    hits: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Set, ast.Tuple, ast.List)) and any(_feed_phase_member(e) for e in node.elts):
+            hits.append((node.lineno, ast.unparse(node)))
+    return hits
+
+
+class TestFeedPhaseSetOwnership:
+    """F6 (2026-10-16): "the firmware owns the next motion" and "the toolhead is fed" have ONE owner — the
+    leaf ``feed_state`` (``FIRMWARE_SEQUENCE`` / ``FED_PHASES``, asked as ``FeedReading.firmware_owns_motion``
+    / ``toolhead_fed``). Three copies of ``{FED, TAIL}`` (spool_recovery, hold_chip, incident_resolution) and a
+    private "the firmware runs its runout" set (``spool_recovery._firmware_runs_its_runout``) had drifted
+    apart: the 2026-10-12 restriction covered the runout causes and missed the post-swap load, the end-of-print
+    retract and the start block, which the farm then paused on a clock (014-H2S #619/#620, 004-H2S #621).
+    SOURCE pin, like its neighbours: a second phase set is a well-formed line every behaviour test passes."""
+
+    def test_no_module_but_the_leaf_spells_a_set_of_feed_phases(self):
+        strays = [
+            f"  - {'/'.join(parts)}:{line} {text}"
+            for parts, tree in _app_trees()
+            if parts != _FEED_STATE
+            for line, text in _scan_feed_phase_sets(tree)
+        ]
+        assert not strays, (
+            "A set of FeedPhase members is spelled outside feed_state — ask the reading "
+            "(FeedReading.toolhead_fed / firmware_owns_motion) or add the set to the leaf:\n" + "\n".join(strays)
+        )
+
+    def test_the_leaf_owns_both_sets(self):
+        """Liveness: the leaf still spells both sets, so the pin cannot pass on a leaf that dropped them."""
+        (tree,) = [t for parts, t in _app_trees() if parts == _FEED_STATE]
+        assigned = {
+            target.id
+            for node in tree.body
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+            if isinstance(target, ast.Name)
+        }
+        assert {"FED_PHASES", "FIRMWARE_SEQUENCE"} <= assigned
+        assert _scan_feed_phase_sets(tree)  # the leaf's own literals are what the scan sees
+
+    @pytest.mark.parametrize(
+        ("source", "flagged"),
+        [
+            pytest.param("X = frozenset({FeedPhase.FED, FeedPhase.TAIL})\n", True, id="frozenset"),
+            pytest.param("def f(r):\n    return r.phase in (FeedPhase.TAIL, FeedPhase.RUNOUT_HELD)\n", True, id="in"),
+            pytest.param("X = dict.fromkeys([FeedPhase.AIR], 1)\n", True, id="fromkeys"),
+            pytest.param("X = {FeedPhase.FED: 'fed', FeedPhase.TAIL: 'fed'}\n", False, id="a_total_table"),
+            pytest.param("def f(r):\n    return r.phase is FeedPhase.CHANGING\n", False, id="one_phase"),
+            pytest.param("def f(r):\n    return r.toolhead_fed\n", False, id="the_reading"),
+        ],
+    )
+    def test_the_scan_sees_every_shape(self, source, flagged):
+        assert bool(_scan_feed_phase_sets(ast.parse(source))) is flagged
+
+    def test_the_deleted_copies_stay_deleted(self):
+        from backend.app.services import hold_chip, incident_resolution, spool_recovery
+
+        for module in (hold_chip, incident_resolution, spool_recovery):
+            assert not hasattr(module, "_FED_PHASES"), module.__name__
+        for gone in ("_firmware_runs_its_runout", "_FIRMWARE_RUNOUT_CAUSES", "_switch_seq"):
+            assert not hasattr(spool_recovery, gone), gone
+
+    def test_the_phase_sets_agree_with_the_tables_that_map_every_phase(self):
+        """Consistency with the two total tables keyed by phase: no phase the firmware owns is ever a
+        refill owed (``refill_verdict._PHASE_REASON``) or air in the refill episode's resume read
+        (``spool_recovery._RESUMED_FEED``); the fed phases read ``fed`` in both. ``TAIL`` is in both sets (its
+        tail feeds; the switch after it is the firmware's), so it reads ``fed`` there; ``RUNOUT_HELD`` is a
+        PAUSE-only phase, answered ``paused``; every other firmware phase is the row's closers' (``closers``)
+        — never ``fed`` (nothing reaches the nozzle) and never ``paused`` (the printer RUNS it).
+
+        DIVERGENCE from the fold's wording ("not fed/paused in ``_RESUMED_FEED``"), recorded in the run's
+        report: that wording cannot hold for ``TAIL`` (fed by definition) or ``RUNOUT_HELD`` (a PAUSE-only
+        phase); the pin states the property that does."""
+        from backend.app.services import refill_verdict, spool_recovery
+        from backend.app.services.feed_state import FED_PHASES, FIRMWARE_SEQUENCE, FeedPhase
+
+        triggers = typing.get_args(refill_verdict.RefillTrigger)
+        for phase in FIRMWARE_SEQUENCE:
+            for trigger in triggers:
+                assert refill_verdict._PHASE_REASON[(phase, trigger)] != "owed", (phase, trigger)
+            resumed = spool_recovery._RESUMED_FEED[phase]
+            assert resumed != "air", phase
+            if phase in FED_PHASES:
+                assert resumed == "fed", phase
+            elif phase is FeedPhase.RUNOUT_HELD:
+                assert resumed == "paused", phase
+            else:
+                assert resumed == "closers", phase
+        for phase in FED_PHASES:
+            assert {refill_verdict._PHASE_REASON[(phase, t)] for t in triggers} == {"fed"}, phase
+            assert spool_recovery._RESUMED_FEED[phase] == "fed", phase
+        # And the reading's two questions are the sets, nothing else.
+        assert {FeedPhase.FED, FeedPhase.TAIL} == FED_PHASES
+        assert {
+            FeedPhase.CHANGING,
+            FeedPhase.RUNOUT_HELD,
+            FeedPhase.TAIL,
+            FeedPhase.START_BLOCK,
+            FeedPhase.END_RETRACT,
+        } == FIRMWARE_SEQUENCE
 
 
 # The lanes that ASK the feed state for a fact it composes — the firmware's switch, a roll that

@@ -30,17 +30,21 @@ _NOW = 1_800_000_000.0
 
 
 class _Client:
-    def __init__(self, phase):
+    def __init__(self, phase, feeder=None):
         self._phase = phase
+        self._feeder = feeder
 
     def feed(self):
-        return SimpleNamespace(phase=self._phase)
+        """The two fields the attention owner reads off ``FeedReading``: the phase and the effective feeder
+        of the active extruder (``None`` — nothing fed)."""
+        return SimpleNamespace(phase=self._phase, feeder=self._feeder)
 
 
 class _Manager:
-    def __init__(self, states=None, phases=None, *, connected=True):
+    def __init__(self, states=None, phases=None, *, connected=True, feeders=None):
         self._states = states or {}
         self._phases = phases or {}
+        self._feeders = feeders or {}
         self._connected = connected
 
     def is_connected(self, pid):
@@ -50,7 +54,7 @@ class _Manager:
         return self._states.get(pid)
 
     def get_client(self, pid):
-        return _Client(self._phases.get(pid, FeedPhase.FED))
+        return _Client(self._phases.get(pid, FeedPhase.FED), self._feeders.get(pid))
 
 
 def _state(state="PAUSE", *, ams_status_main=0, layer_num=5, connected=True):
@@ -282,6 +286,98 @@ class TestTheLevels:
 
         waiting_page.assert_awaited_once()
         assert waiting_page.await_args.args[2].startswith("The printer is RUNNING with the toolhead empty")
+
+    async def test_an_end_of_print_retract_that_never_ends_pages_as_a_bare_level(
+        self, db_session, printer_factory, waiting_page
+    ):
+        """F9 (2026-10-16, operator-approved): the printer's own END-OF-PRINT retract — RUNNING at the last
+        layer (the feed state's END_RETRACT) with the active extruder EMPTY (the end unload has begun) — is never
+        acted on by the farm; one that never ends is a person's to hear about past the page bound, ONCE — a bare
+        level, no hold required (004-H2S #621: the farm paused it three times at 167/167 instead). The episode
+        begins at the first EMPTY sighting: the fed last layer before it counts for nothing."""
+        printer = await printer_factory()
+        printing = _Manager(
+            {printer.id: _state("RUNNING")}, {printer.id: FeedPhase.END_RETRACT}, feeders={printer.id: 0}
+        )
+        retracting = _Manager({printer.id: _state("RUNNING")}, {printer.id: FeedPhase.END_RETRACT})
+
+        await farm_stall.check_waiting_on_printers(db_session, manager=printing, now=_NOW - _BOUND_S)
+        await farm_stall.check_waiting_on_printers(db_session, manager=retracting, now=_NOW)
+        await farm_stall.check_waiting_on_printers(db_session, manager=retracting, now=_NOW + _BOUND_S - 1)
+        waiting_page.assert_not_awaited()
+
+        await farm_stall.check_waiting_on_printers(db_session, manager=retracting, now=_NOW + _BOUND_S)
+        await farm_stall.check_waiting_on_printers(db_session, manager=retracting, now=_NOW + _BOUND_S + 60)
+        waiting_page.assert_awaited_once()
+        assert waiting_page.await_args.args[2] == (
+            "The printer has been RUNNING in its end-of-print retract at the last layer for 10 min. Check the toolhead."
+        )
+
+    async def test_a_long_last_layer_still_printing_fed_pages_nothing(self, db_session, printer_factory, waiting_page):
+        """END_RETRACT spans printing the whole last layer: a healthy last layer printing FED (a feeder at the
+        active extruder) for longer than the bound never starts the level."""
+        printer = await printer_factory()
+        printing = _Manager(
+            {printer.id: _state("RUNNING")}, {printer.id: FeedPhase.END_RETRACT}, feeders={printer.id: 2}
+        )
+
+        for offset in (0, _BOUND_S, 3 * _BOUND_S):
+            await farm_stall.check_waiting_on_printers(db_session, manager=printing, now=_NOW + offset)
+
+        waiting_page.assert_not_awaited()
+
+    async def test_a_finish_clears_the_retract_level(self, db_session, printer_factory, waiting_page):
+        """The job's FINISH ends the episode: a retract that finishes inside the bound pages nothing, and a new
+        retract on a later job starts a new episode from its own first sighting."""
+        printer = await printer_factory()
+        retracting = _Manager({printer.id: _state("RUNNING")}, {printer.id: FeedPhase.END_RETRACT})
+        finished = _Manager({printer.id: _state("FINISH")}, {printer.id: FeedPhase.IDLE})
+
+        await farm_stall.check_waiting_on_printers(db_session, manager=retracting, now=_NOW)
+        await farm_stall.check_waiting_on_printers(db_session, manager=finished, now=_NOW + _BOUND_S - 30)
+        await farm_stall.check_waiting_on_printers(db_session, manager=finished, now=_NOW + _BOUND_S)
+        await farm_stall.check_waiting_on_printers(db_session, manager=retracting, now=_NOW + 2 * _BOUND_S)
+        await farm_stall.check_waiting_on_printers(db_session, manager=retracting, now=_NOW + 3 * _BOUND_S - 1)
+
+        waiting_page.assert_not_awaited()
+
+    async def test_a_start_sequence_that_never_ends_pages_only_while_an_ams_row_is_open(
+        self, db_session, printer_factory, monkeypatch, waiting_page
+    ):
+        """F9: the start sequence (START_BLOCK, before layer 1) runs minutes on every healthy print, so it
+        pages only while an AMS row is open on that printer — the farm waits for the printer's event there and
+        never pauses it. Without one: nothing, however long."""
+        printer = await printer_factory()
+        manager = _Manager({printer.id: _state("RUNNING", layer_num=0)}, {printer.id: FeedPhase.START_BLOCK})
+
+        await farm_stall.check_waiting_on_printers(db_session, manager=manager, now=_NOW)
+        await farm_stall.check_waiting_on_printers(db_session, manager=manager, now=_NOW + 3 * _BOUND_S)
+        waiting_page.assert_not_awaited()  # no AMS row: a long start block is no wait the farm owns
+
+        monkeypatch.setattr(printer_incidents, "open_kinds", lambda pid: frozenset({"jam"}))
+        await farm_stall.check_waiting_on_printers(db_session, manager=manager, now=_NOW + 4 * _BOUND_S)
+        waiting_page.assert_not_awaited()  # the episode begins at the first sighting WITH the row
+        await farm_stall.check_waiting_on_printers(db_session, manager=manager, now=_NOW + 5 * _BOUND_S)
+
+        waiting_page.assert_awaited_once()
+        assert waiting_page.await_args.args[2] == (
+            "The printer has been RUNNING in its start sequence for 10 min with an AMS hold open and no layer "
+            "printed. Check the AMS and the toolhead."
+        )
+
+    async def test_a_paused_start_block_or_retract_pages_nothing(
+        self, db_session, printer_factory, monkeypatch, waiting_page
+    ):
+        """The levels are the printer RUNNING its own sequence: a PAUSE is the hold's (its own pages)."""
+        printer = await printer_factory()
+        monkeypatch.setattr(printer_incidents, "open_kinds", lambda pid: frozenset({"jam"}))
+        for phase in (FeedPhase.START_BLOCK, FeedPhase.END_RETRACT):
+            farm_stall._reset_state()
+            manager = _Manager({printer.id: _state("PAUSE")}, {printer.id: phase})
+            await farm_stall.check_waiting_on_printers(db_session, manager=manager, now=_NOW)
+            await farm_stall.check_waiting_on_printers(db_session, manager=manager, now=_NOW + 2 * _BOUND_S)
+
+        waiting_page.assert_not_awaited()
 
     async def test_an_unreadable_feed_pages_past_the_bound(self, db_session, printer_factory, waiting_page):
         printer = await printer_factory()

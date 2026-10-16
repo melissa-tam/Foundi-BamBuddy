@@ -96,7 +96,10 @@ RefillTrigger = Literal["T2", "T3", "T4"]
 #                            load is still to come and a 255 there is not air (012-H2S 2026-10-10:
 #                            paused at layer 0 at the plate-marker dialog).
 # * ``last_layer``         — ``END_RETRACT``: a RUNNING job AT its last layer reads empty because of the
-#                            end-of-print retract, never air.
+#                            end-of-print retract, never air; and a job PAUSEd on an open AMS row that
+#                            faulted AT its last layer (``printer_incidents.faulted_at_last_layer`` — the
+#                            row's durable ``fault_layer``, 2026-10-16): the fault stood in the end-of-print
+#                            sequence, nothing is left to print, so no refill load (004-H2S incident 621).
 # * ``unconfirmed``        — ``EMPTY_UNCONFIRMED``: RUNNING with nothing fed and no firmware sequence
 #                            YET — the first frame of an auto-switch reads exactly like this, so the
 #                            farm acts on nothing until the phase moves on (to ``CHANGING``, or to
@@ -220,4 +223,11 @@ def refill_owed(printer_id: int, state, *, trigger: RefillTrigger, reading: Feed
         return RefillOwed(trigger, "maintenance")
     if trigger == "T2" and KIND_PHYSICAL in open_kinds:
         return RefillOwed(trigger, "physical")
+    if answer == "owed" and printer_incidents.faulted_at_last_layer(
+        printer_id, tray_fields.parse_int_field(getattr(state, "total_layers", None)) or 0
+    ):
+        # The end of print (item 6 of 2026-10-16): an AMS row that faulted AT the job's last layer stood in
+        # the end-of-print sequence — nothing is left to print, and the printer's own end unload is what
+        # emptied the toolhead. No refill load; a resume lets the printer finish.
+        return RefillOwed(trigger, "last_layer")
     return RefillOwed(trigger, answer)

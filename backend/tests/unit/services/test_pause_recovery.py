@@ -3202,8 +3202,10 @@ class TestPlateCheckSelfHeal:
         self, monkeypatch, db_session, caplog, online
     ):
         """No event by the bound: the re-check FAILED (production's verdict) — rung 2 decides the retry, the
-        stop is taken, and the terminal requeues the unit silently. The press's action carries
-        ``bound_passed_at``; the ACK it already had stays its answer on the ledger."""
+        stop is taken, and the terminal requeues the unit silently. The ACK the press already had stays its
+        answer on the ledger — and, the press being ANSWERED, its action carries NO ``bound_passed_at`` (F13,
+        2026-10-16: that column means "answered late" to its readers; the lane's line says
+        ``passed (answered: reached)``, never "unanswered")."""
         from backend.app.services.plate_occupancy import DepositEvidence
         from backend.app.services.terminal_outcome import farm_retries
 
@@ -3229,12 +3231,13 @@ class TestPlateCheckSelfHeal:
             ("stop", PLATE_CHECK_RETRY_STOP, "taken"),
         ]
         assert "re-check failed (still paused 120s online after the press (the dialog standing" in caplog.text
-        assert "lane=plate-check re-check bound=_RECHECK_SELF_HEAL" in caplog.text
-        assert await _bound_passed_at(db_session, await _press_action(db_session, row.id)) is not None
+        assert "lane=plate-check re-check bound=_RECHECK_SELF_HEAL passed (answered: reached)" in caplog.text
+        item_id = item.id  # read before the poll below expires the session's objects
+        assert await _bound_passed_at(db_session, await _press_action(db_session, row.id)) is None
         page.assert_not_awaited()
         # Liveness: the stop's terminal reads the recorded retry and requeues the unit.
         facts = await pause_recovery.plate_check_facts(pid, printer_incidents.snapshots(pid), "task-1")
-        assert (facts.item_id, facts.stop_action) == (item.id, "reached")
+        assert (facts.item_id, facts.stop_action) == (item_id, "reached")
         assert farm_retries(facts, evidence=DepositEvidence.recorded("clear")) is True
 
     async def test_r1_bound_a_pause_with_no_dialog_is_handed_over_as_production_did(

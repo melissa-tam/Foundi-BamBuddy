@@ -75,7 +75,7 @@ from backend.app.core.tasks import spawn_background_task
 from backend.app.models.printer_action import PrinterAction
 from backend.app.schemas.printer import AmsCommandOutcome
 from backend.app.services import command_outcome, live_reading, printer_events, printer_incidents
-from backend.app.services.bambu_mqtt import CommandAck
+from backend.app.services.bambu_mqtt import CommandAck, dialog_resume_button
 from backend.app.services.command_outcome import (
     ACTOR_FARM,
     ACTOR_OPERATOR,
@@ -147,9 +147,32 @@ class Command:
         return command_outcome.spec_of(self.name).family
 
 
-def resume() -> Command:
-    """The plain ``print.resume`` of a paused print."""
-    return Command("resume", lambda client, seq: client.resume_print(sequence_id=seq))
+def resume(*, answer_dialog: bool = False) -> Command:
+    """The ``print.resume`` of a paused print — plain by default (the card's Resume, the K9 verb).
+
+    ``answer_dialog`` (the recovery driver's resume rung and the swap round's resume, 2026-10-16): when the
+    fault dialog standing on the printer AT THE PUBLISH lists Bambu's "Problem solved, resume"
+    (``bambu_mqtt.dialog_resume_button`` over the client's own state — 0300_801E does), the resume IS that
+    button: ``execute_hms_action`` (the one dialog-frame builder) with the dialog's ``print_error`` and the
+    paused job's ``subtask_id`` — the frame the plate-check ladder's press sends, measured accepted on H2S —
+    under this action's id. Otherwise the plain resume. Either way the record's command stays ``resume``
+    (family RESUME, answered by RUNNING; a ``fail`` ACK is ``refused``): the answer's readers never branch
+    on the frame. Never an Ignore, never CONTINUE (the chooser returns neither)."""
+    if not answer_dialog:
+        return Command("resume", lambda client, seq: client.resume_print(sequence_id=seq))
+    return Command(
+        "resume",
+        lambda client, seq: (
+            client.execute_hms_action(
+                f"{int(getattr(client.state, 'print_error', 0) or 0) & 0xFFFFFFFF:08X}",
+                button,
+                getattr(client.state, "subtask_id", None) or "",
+                sequence_id=seq,
+            )
+            if (button := dialog_resume_button(getattr(client, "state", None))) is not None
+            else client.resume_print(sequence_id=seq)
+        ),
+    )
 
 
 def power_loss_resume() -> Command:
@@ -1111,7 +1134,25 @@ def note_bound_passed(printer_id: int, bound: SelfHealBound, *, lane: str, actio
     """A lane's non-action bound (:func:`bound_due`) passed: the one ``[self-heal]`` line, naming the lane,
     and — for an action it names — ``bound_passed_at`` (written once) and the action marked passed, so the
     attention owner leaves it to the lane's own hand-over and its bounded waiters get :class:`Unanswered`.
-    Publishes nothing: the lane acts itself."""
+    Publishes nothing: the lane acts itself.
+
+    An action the printer already ANSWERED (no longer outstanding — 2026-10-16, F13) is no unanswered
+    command: the line says ``bound passed (answered: X)`` and ``bound_passed_at`` is NOT written, because that
+    column means "answered late" to its readers (``dispatch_claim``: a start answered after its bound touches
+    no claim). 014-H2S 2026-10-15 logged a resume the printer had answered ``reached`` 90 s earlier as
+    "unanswered after 90s"."""
+    if action_id is not None and _outstanding.get(printer_id, {}).get(action_id) is None:
+        answered = _recent_answers.get(action_id)
+        logger.warning(
+            "[self-heal] action %s printer=%s lane=%s bound=%s passed (answered: %s) after %.0fs online",
+            action_id,
+            printer_id,
+            lane,
+            bound.name,
+            answered.value if answered is not None else "not outstanding",
+            bound.seconds,
+        )
+        return
     logger.warning(
         "[self-heal] action %s printer=%s lane=%s bound=%s unanswered after %.0fs online (witness: %s)",
         action_id if action_id is not None else "-",
