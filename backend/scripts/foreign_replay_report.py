@@ -3,7 +3,7 @@
 
 Prints what ``repair_foreign_replay_20260925`` WOULD do: the counts, then one line per action
 and per skip, each with its before-values. That is the same text the migration logs row by row
-when it applies. Run it on the farm PC right before the /ship that carries the migration, and
+when it applies. Run it on the farm PC right before the /deploy run that carries the migration, and
 compare it against the log-evidenced damage.
 
 Usage (the embedded Python has SQLAlchemy; nothing from the app is imported)::
